@@ -10,12 +10,15 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+authors = ["Shreya Thale <shreyasthale54@gmail.com>"]
+repository = "https://github.com/ShreyasT123/steelui"
+homepage = "https://github.com/ShreyasT123/steelui"
 
 [workspace.dependencies]
 steelui = { path = "crates/steelui" }
 
 # Graphics, Windowing & Math
-wgpu = "30.0"
+wgpu = { version = "30.0", default-features = false, features = ["dx12", "metal", "vulkan", "std", "parking_lot", "wgsl"] }
 winit = "0.30"
 bytemuck = { version = "1.25", features = ["derive"] }
 

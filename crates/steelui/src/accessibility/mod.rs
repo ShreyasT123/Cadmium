@@ -61,8 +61,12 @@ pub fn build_tree_update(
                 (rec.bounds.y + rec.bounds.height) as f64,
             ));
             if !rec.children.is_empty() {
-                let child_ids: Vec<NodeId> =
-                    rec.children.iter().copied().map(widget_to_a11y_id).collect();
+                let child_ids: Vec<NodeId> = rec
+                    .children
+                    .iter()
+                    .copied()
+                    .map(widget_to_a11y_id)
+                    .collect();
                 node.set_children(child_ids);
             }
             (widget_to_a11y_id(rec.id), node)

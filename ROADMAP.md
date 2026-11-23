@@ -46,24 +46,30 @@ This document outlines the phased development roadmap for SteelUI and its custom
 
 ---
 
-### Phase 3: Core Desktop Controls & Input Subsystems (In Progress)
-- [ ] **Unified `Material` System in Magnum:**
+### Phase 3: Core Desktop Controls & Input Subsystems (Completed)
+- [x] **Unified `Material` System in Magnum:**
   - Consolidate surface styling into `Material::Classic`, `Material::Frosted`, and `Material::Liquid`.
   - Support setting material polymorphically on any container, card, or button.
-- [ ] **Hardware Scissor Clipping & `ScrollView`:**
+- [x] **Hardware Scissor Clipping & `ScrollView`:**
   - Viewport scissor rect clipping (`wgpu::RenderPass::set_scissor_rect`).
   - Mouse wheel delta listener (`WindowEvent::MouseWheel`) with inertia spring damping.
   - Dynamic scroll boundary calculation and customizable scrollbar indicators.
-- [ ] **Desktop `TextInput` Engine:**
+- [x] **Desktop `TextInput` Engine:**
   - Single-line text input with blinking caret pulse (sleeping when idle).
   - Keyboard navigation: Left/Right arrows, Home/End, word jumps (`Ctrl`/`Cmd` + Arrow).
   - Text selection range and highlight box rendering.
   - Backspace, Delete, and clipboard copy/cut/paste integration (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`).
   - Placeholder text and disabled states.
+- [x] **Core Interactive Controls:** `Tabs`, `Dropdown`, and `TrafficLights`.
 - [ ] **Floating Overlays & Portals:**
   - `Portal` layer rendering floating elements outside parent clipping hierarchies.
-  - `Dropdown` / `Select` input widget.
   - Context menu and tooltip system.
+
+### Next (Planned)
+- [ ] Live `AccessKit` adapter wiring: publish incremental updates, route semantic actions, and synchronize focus/bounds.
+- [ ] Dynamic vector paths via `lyon`: animated Bezier paths, splines, charts, and node wires.
+- [ ] `CustomGpuSurface`: embed custom `wgpu` render passes inside rounded, clipped layouts.
+- [ ] IME and multiline `TextArea`: composition strings, candidate placement, wrapped editing, and undo/redo.
 
 ---
 

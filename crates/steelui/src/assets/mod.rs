@@ -22,8 +22,8 @@ pub fn rasterize_svg(svg: &str, width: u32, height: u32) -> Result<DecodedImage,
     let width = width.max(1);
     let height = height.max(1);
     let opt = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_str(svg, &opt)
-        .map_err(|e| SteelError::Svg(e.to_string()))?;
+    let tree =
+        resvg::usvg::Tree::from_str(svg, &opt).map_err(|e| SteelError::Svg(e.to_string()))?;
 
     let svg_size = tree.size();
     let sx = width as f32 / svg_size.width().max(1.0);
@@ -39,7 +39,7 @@ pub fn rasterize_svg(svg: &str, width: u32, height: u32) -> Result<DecodedImage,
 
     // Convert premultiplied tiny-skia RGBA to straight RGBA8
     let mut rgba = pixmap.take();
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         let a = px[3];
         if a > 0 && a < 255 {
             let af = a as f32 / 255.0;

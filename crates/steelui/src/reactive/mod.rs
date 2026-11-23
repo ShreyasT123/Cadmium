@@ -2,15 +2,18 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
-use std::sync::mpsc::Sender;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
 new_key_type! {
     pub struct SignalId;
     pub struct EffectId;
 }
+
+type SignalCell = Rc<RefCell<Box<dyn Any>>>;
 
 struct EffectEntry {
     func: Option<Box<dyn FnMut()>>,
@@ -18,7 +21,7 @@ struct EffectEntry {
 }
 
 struct ReactiveRuntime {
-    signals: SlotMap<SignalId, Box<dyn Any>>,
+    signals: SlotMap<SignalId, SignalCell>,
     subscribers: HashMap<SignalId, HashSet<EffectId>>,
     effects: SlotMap<EffectId, EffectEntry>,
     tracking_stack: Vec<EffectId>,
@@ -42,11 +45,14 @@ impl ReactiveRuntime {
 
     fn record_read(&mut self, sig: SignalId) {
         if let Some(&eff) = self.tracking_stack.last() {
+            if !self.effects.contains_key(eff) {
+                return;
+            }
             self.subscribers.entry(sig).or_default().insert(eff);
-            if let Some(entry) = self.effects.get_mut(eff) {
-                if !entry.deps.contains(&sig) {
-                    entry.deps.push(sig);
-                }
+            if let Some(entry) = self.effects.get_mut(eff)
+                && !entry.deps.contains(&sig)
+            {
+                entry.deps.push(sig);
             }
         }
     }
@@ -107,14 +113,20 @@ impl<T: 'static> Signal<T> {
         self.with(|v| v.clone())
     }
 
-    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
-        RUNTIME.with(|rt| {
+    pub fn try_with<R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        // Acquire and immediately drop RUNTIME borrow so `f` can read/write other signals freely
+        let cell = RUNTIME.with(|rt| {
             let mut rt = rt.borrow_mut();
             rt.record_read(self.id);
-            let boxed = rt.signals.get(self.id).expect("Signal accessed after disposal");
-            let val = boxed.downcast_ref::<T>().expect("Signal type mismatch");
-            f(val)
-        })
+            rt.signals.get(self.id).cloned()
+        })?;
+        let borrowed = cell.borrow();
+        let val = borrowed.downcast_ref::<T>().expect("Signal type mismatch");
+        Some(f(val))
+    }
+
+    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
+        self.try_with(f).expect("Signal accessed after disposal")
     }
 
     pub fn set(self, value: T) {
@@ -122,14 +134,17 @@ impl<T: 'static> Signal<T> {
     }
 
     pub fn update(self, f: impl FnOnce(&mut T)) {
-        RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            if let Some(boxed) = rt.signals.get_mut(self.id) {
-                let val = boxed.downcast_mut::<T>().expect("Signal type mismatch");
+        let cell = RUNTIME.with(|rt| rt.borrow().signals.get(self.id).cloned());
+        if let Some(cell) = cell {
+            {
+                let mut borrowed = cell.borrow_mut();
+                let val = borrowed.downcast_mut::<T>().expect("Signal type mismatch");
                 f(val);
-                rt.notify_write(self.id);
             }
-        });
+            RUNTIME.with(|rt| {
+                rt.borrow_mut().notify_write(self.id);
+            });
+        }
     }
 
     pub fn dispose(self) {
@@ -142,7 +157,8 @@ impl<T: 'static> Signal<T> {
 }
 
 pub fn create_signal<T: 'static>(initial: T) -> Signal<T> {
-    let id = RUNTIME.with(|rt| rt.borrow_mut().signals.insert(Box::new(initial)));
+    let cell: SignalCell = Rc::new(RefCell::new(Box::new(initial)));
+    let id = RUNTIME.with(|rt| rt.borrow_mut().signals.insert(cell));
     Signal {
         id,
         _marker: PhantomData,
@@ -166,12 +182,39 @@ pub fn dispose_effect(id: EffectId) {
         rt.detach_deps(id);
         rt.effects.remove(id);
         rt.dirty_set.remove(&id);
+        rt.dirty_effects.retain(|&e| e != id);
     });
 }
 
+struct EffectRunGuard {
+    id: EffectId,
+    func: Option<Box<dyn FnMut()>>,
+}
+
+impl Drop for EffectRunGuard {
+    fn drop(&mut self) {
+        let func = self.func.take();
+        let id = self.id;
+        let _ = RUNTIME.try_with(|rt| {
+            let mut rt = rt.borrow_mut();
+            if rt.tracking_stack.last() == Some(&id) {
+                rt.tracking_stack.pop();
+            } else {
+                rt.tracking_stack.retain(|&e| e != id);
+            }
+            if let Some(entry) = rt.effects.get_mut(id) {
+                entry.func = func;
+            }
+        });
+    }
+}
+
 fn run_effect(id: EffectId) {
-    let mut func = RUNTIME.with(|rt| {
+    let func = RUNTIME.with(|rt| {
         let mut rt = rt.borrow_mut();
+        if !rt.effects.contains_key(id) {
+            return None;
+        }
         rt.detach_deps(id);
         let func = rt.effects.get_mut(id).and_then(|e| e.func.take());
         if func.is_some() {
@@ -180,32 +223,43 @@ fn run_effect(id: EffectId) {
         func
     });
 
-    if let Some(mut f) = func.take() {
-        f();
-        RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            rt.tracking_stack.pop();
-            if let Some(entry) = rt.effects.get_mut(id) {
-                entry.func = Some(f);
-            }
-        });
+    if let Some(f) = func {
+        let mut guard = EffectRunGuard { id, func: Some(f) };
+        if let Some(cb) = guard.func.as_mut() {
+            cb();
+        }
+        // Normal exit & unwinding both restore `tracking_stack` and `func` via `EffectRunGuard::drop`
     }
 }
 
 pub fn flush_effects() -> usize {
     let mut executed = 0;
-    for _ in 0..64 {
+    for wave in 0..64 {
         let batch: Vec<EffectId> = RUNTIME.with(|rt| {
             let mut rt = rt.borrow_mut();
             rt.dirty_set.clear();
             std::mem::take(&mut rt.dirty_effects)
         });
         if batch.is_empty() {
-            break;
+            return executed;
         }
         for id in batch {
             executed += 1;
             run_effect(id);
+        }
+        if wave == 63 {
+            let remaining = RUNTIME.with(|rt| {
+                let mut rt = rt.borrow_mut();
+                let count = rt.dirty_effects.len();
+                rt.dirty_effects.clear();
+                rt.dirty_set.clear();
+                count
+            });
+            if remaining > 0 {
+                tracing::error!(
+                    "Reactive effect cycle detected after 64 waves; dropped {remaining} pending effects"
+                );
+            }
         }
     }
     executed
@@ -236,7 +290,6 @@ impl UiDispatcher {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::rc::Rc;
 
     #[test]
     fn signal_tracks_and_reruns_effects() {
@@ -259,5 +312,48 @@ mod tests {
         assert_eq!(flush_effects(), 0);
         assert_eq!(observed.get(), 40);
         count.dispose();
+    }
+
+    #[test]
+    fn nested_reads_inside_update_and_with_do_not_panic() {
+        let a = create_signal(5);
+        let b = create_signal(10);
+        a.update(|v| *v += b.get());
+        assert_eq!(a.get(), 15);
+
+        let sum = a.with(|av| *av + b.get());
+        assert_eq!(sum, 25);
+        a.dispose();
+        b.dispose();
+    }
+
+    #[test]
+    fn effect_panic_restores_tracking_stack() {
+        let trigger = create_signal(0);
+        let clean_sig = create_signal(1);
+        let observed = Rc::new(Cell::new(0));
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_effect(move || {
+                let _ = trigger.get();
+                panic!("boom inside effect");
+            });
+        }));
+        assert!(res.is_err());
+
+        let obs = observed.clone();
+        let eff = create_effect(move || {
+            obs.set(clean_sig.get());
+        });
+        assert_eq!(observed.get(), 1);
+
+        // Mutating trigger must not attribute clean_sig reads to the panicked effect
+        clean_sig.set(7);
+        flush_effects();
+        assert_eq!(observed.get(), 7);
+
+        dispose_effect(eff);
+        trigger.dispose();
+        clean_sig.dispose();
     }
 }

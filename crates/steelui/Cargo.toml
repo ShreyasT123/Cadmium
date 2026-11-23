@@ -3,6 +3,13 @@ name = "steelui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+description = "A cross-platform Rust UI framework inspired by macOS design."
+keywords = ["gui", "ui", "graphics", "cross-platform"]
+categories = ["gui"]
 
 [dependencies]
 wgpu.workspace = true

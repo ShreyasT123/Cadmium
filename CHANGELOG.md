@@ -10,16 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Planned
-- **Unified `Material` System in Magnum:** First-class enum supporting `Material::Classic` (solid/gradient + hairlines), `Material::Frosted` (Dual-Kawase 9-tap Gaussian diffusion), and `Material::Liquid` (monotonic convex bezel refraction, chromatic aberration, and specular catchlights) across all containers and interactive elements.
-- **Hardware Scissor Clipping & `ScrollView`:** Viewport clipping via `wgpu::RenderPass::set_scissor_rect`, mouse-wheel scroll delta listener, momentum spring physics, and fading scrollbar indicators.
-- **Desktop `TextInput` Engine:** Single-line text input with blinking caret pulse, keyboard cursor navigation (Left/Right, Home/End, word jumps), text selection highlighting, clipboard copy/paste (`arboard`), and placeholder rendering.
-- **Extended Interactive Components:** Floating portals, tooltips, dropdown menus, and modal sheets.
+- **Live `AccessKit` Adapter Wiring:** Publish incremental `TreeUpdate`s, route semantic actions, and synchronize focus/bounds with native screen readers.
+- **Dynamic Vector Paths (`lyon`):** Tessellate animated Bezier paths, splines, charts, and node wires into cached GPU geometry.
+- **`CustomGpuSurface`:** Embed application-owned `wgpu` render passes inside rounded, clipped SteelUI layouts.
+- **IME & Multiline `TextArea`:** Composition strings, OS candidate-window placement, wrapped vertical editing, and undo/redo stacks.
 
 ---
 
 ## [0.1.0] - 2026-11-23
 
 ### Added
+- **Unified `Material` System in Magnum:** First-class enum supporting `Material::Classic`, `Material::Frosted`, and `Material::Liquid` across containers and interactive elements.
+- **Hardware Scissor Clipping & `ScrollView`:** Viewport clipping via `wgpu::RenderPass::set_scissor_rect`, mouse-wheel scroll delta listener, momentum spring physics, and fading scrollbar indicators.
+- **Desktop `TextInput` Engine:** Single-line text input with blinking caret pulse, keyboard cursor navigation, text selection highlighting, clipboard copy/paste (`arboard`), and placeholder rendering.
+- **Core Interactive Components:** `Tabs`, `Dropdown`, and `TrafficLights`.
 - **Magnum GPU Rendering Engine:**
   - Custom 2D rendering pipeline written from scratch on `wgpu` 30 and WGSL.
   - Multi-window architecture with a process-wide `GpuContext` (device, pipelines, caches) and per-window canonical `Rgba8UnormSrgb` render targets blitted to swapchains.

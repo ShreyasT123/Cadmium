@@ -1,10 +1,11 @@
-struct Globals {
-    viewport_size: vec2<f32>,
-    _pad: vec2<f32>,
-}
+    struct Globals {
+        viewport_size: vec2<f32>,
+        _pad: vec2<f32>,
+    }
 
-@group(0) @binding(0)
-var<uniform> globals: Globals;
+    @group(0) @binding(0)
+    var<uniform> globals: Globals;
+
 
 struct InstanceIn {
     @location(0) rect: vec4<f32>,
@@ -12,10 +13,9 @@ struct InstanceIn {
     @location(2) fill_color: vec4<f32>,
     @location(3) fill_color_end: vec4<f32>,
     @location(4) border_color: vec4<f32>,
-    @location(5) border_width: f32,
-    @location(6) gradient_dir: vec2<f32>,
-    @location(7) shadow_color: vec4<f32>,
-    @location(8) shadow_params: vec3<f32>,
+    @location(5) border_and_grad: vec4<f32>, // x: border_width, y: grad_x, z: grad_y, w: rotation
+    @location(6) shadow_color: vec4<f32>,
+    @location(7) shadow_params: vec3<f32>,
 }
 
 struct VertexOut {
@@ -46,88 +46,95 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, inst: InstanceIn) -> Vertex
     );
     let pad = max(1.0, shadow_reach + 2.0);
 
-    let origin = inst.rect.xy - vec2<f32>(pad);
     let size = inst.rect.zw + vec2<f32>(pad * 2.0);
-    let pixel_pos = origin + corner * size;
+    let unrotated_local = (corner - vec2<f32>(0.5)) * size;
+
+    let rot = inst.border_and_grad.w;
+    let c = cos(rot);
+    let s = sin(rot);
+    let rotated_local = vec2<f32>(
+        unrotated_local.x * c - unrotated_local.y * s,
+        unrotated_local.x * s + unrotated_local.y * c,
+    );
+
+    let half_size = inst.rect.zw * 0.5;
+    let center = inst.rect.xy + half_size;
+    let pixel_pos = center + rotated_local;
 
     let ndc = vec2<f32>(
         (pixel_pos.x / globals.viewport_size.x) * 2.0 - 1.0,
         1.0 - (pixel_pos.y / globals.viewport_size.y) * 2.0,
     );
 
-    let half_size = inst.rect.zw * 0.5;
-    let center = inst.rect.xy + half_size;
-
     var out: VertexOut;
     out.clip_pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.local_pos = pixel_pos - center;
+    out.local_pos = unrotated_local;
     out.half_size = half_size;
     out.radii = inst.radii;
     out.fill_color = inst.fill_color;
     out.fill_color_end = inst.fill_color_end;
     out.border_color = inst.border_color;
-    out.border_width = inst.border_width;
-    out.gradient_dir = inst.gradient_dir;
+    out.border_width = inst.border_and_grad.x;
+    out.gradient_dir = inst.border_and_grad.yz;
     out.shadow_color = inst.shadow_color;
     out.shadow_params = inst.shadow_params;
     return out;
 }
-
-fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
-    let rx = select(vec2<f32>(r.w, r.x), vec2<f32>(r.z, r.y), p.x > 0.0);
-    let corner_r = select(rx.y, rx.x, p.y > 0.0);
-    let clamped_r = min(corner_r, min(b.x, b.y));
-    let q = abs(p) - b + vec2<f32>(clamped_r);
-    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - clamped_r;
-}
-
-@fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let dist = sd_rounded_box(in.local_pos, in.half_size, in.radii);
-    let outer_alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
-
-    let box_size = max(in.half_size * 2.0, vec2<f32>(1.0));
-    let box_uv = (in.local_pos / box_size) + vec2<f32>(0.5);
-    let g_t = clamp(dot(box_uv - vec2<f32>(0.5), in.gradient_dir) + 0.5, 0.0, 1.0);
-    let base_fill = mix(in.fill_color, in.fill_color_end, g_t);
-
-    var box_color = base_fill;
-    if in.border_width > 0.001 {
-        let bw = min(in.border_width, min(in.half_size.x, in.half_size.y));
-        let border_mix = smoothstep(-bw - 0.5, -bw + 0.5, dist);
-
-        let src_a = in.border_color.a;
-        let dst_a = base_fill.a;
-        let out_a = src_a + dst_a * (1.0 - src_a);
-        let out_rgb = select(
-            vec3<f32>(0.0),
-            (in.border_color.rgb * src_a + base_fill.rgb * dst_a * (1.0 - src_a)) / max(out_a, 0.0001),
-            out_a > 0.0001,
-        );
-        let border_over_fill = vec4<f32>(out_rgb, out_a);
-        box_color = mix(base_fill, border_over_fill, border_mix);
+    fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
+        let rx = select(vec2<f32>(r.w, r.x), vec2<f32>(r.z, r.y), p.x > 0.0);
+        let corner_r = select(rx.y, rx.x, p.y > 0.0);
+        let clamped_r = min(corner_r, min(b.x, b.y));
+        let q = abs(p) - b + vec2<f32>(clamped_r);
+        return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - clamped_r;
     }
 
-    let box_a = box_color.a * outer_alpha;
-    let box_pm = vec4<f32>(box_color.rgb * box_a, box_a);
+    @fragment
+    fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+        let dist = sd_rounded_box(in.local_pos, in.half_size, in.radii);
+        let outer_alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
 
-    var shad_pm = vec4<f32>(0.0);
-    if in.shadow_color.a > 0.001 {
-        let blur = max(in.shadow_params.z, 1.0);
-        let s_dist = sd_rounded_box(in.local_pos - in.shadow_params.xy, in.half_size, in.radii);
-        let sigma = blur * 0.44;
-        let t = max(s_dist + blur * 0.22, 0.0) / sigma;
-        var s_alpha = exp(-0.5 * t * t) * in.shadow_color.a;
+        let box_size = max(in.half_size * 2.0, vec2<f32>(1.0));
+        let box_uv = (in.local_pos / box_size) + vec2<f32>(0.5);
+        let g_t = clamp(dot(box_uv - vec2<f32>(0.5), in.gradient_dir) + 0.5, 0.0, 1.0);
+        let base_fill = mix(in.fill_color, in.fill_color_end, g_t);
 
-        if base_fill.a < 0.99 {
-            s_alpha *= smoothstep(-0.5, 0.5, dist);
+        var box_color = base_fill;
+        if in.border_width > 0.001 {
+            let bw = min(in.border_width, min(in.half_size.x, in.half_size.y));
+            let border_mix = smoothstep(-bw - 0.5, -bw + 0.5, dist);
+
+            let src_a = in.border_color.a;
+            let dst_a = base_fill.a;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            let out_rgb = select(
+                vec3<f32>(0.0),
+                (in.border_color.rgb * src_a + base_fill.rgb * dst_a * (1.0 - src_a)) / max(out_a, 0.0001),
+                out_a > 0.0001,
+            );
+            let border_over_fill = vec4<f32>(out_rgb, out_a);
+            box_color = mix(base_fill, border_over_fill, border_mix);
         }
-        shad_pm = vec4<f32>(in.shadow_color.rgb * s_alpha, s_alpha);
-    }
 
-    let out_pm = box_pm + shad_pm * (1.0 - box_pm.a);
-    if out_pm.a <= 0.0001 {
-        discard;
+        let box_a = box_color.a * outer_alpha;
+        let box_pm = vec4<f32>(box_color.rgb * box_a, box_a);
+
+        var shad_pm = vec4<f32>(0.0);
+        if in.shadow_color.a > 0.001 {
+            let blur = max(in.shadow_params.z, 1.0);
+            let s_dist = sd_rounded_box(in.local_pos - in.shadow_params.xy, in.half_size, in.radii);
+            let sigma = blur * 0.44;
+            let t = max(s_dist + blur * 0.22, 0.0) / sigma;
+            var s_alpha = exp(-0.5 * t * t) * in.shadow_color.a;
+
+            if base_fill.a < 0.99 {
+                s_alpha *= smoothstep(-0.5, 0.5, dist);
+            }
+            shad_pm = vec4<f32>(in.shadow_color.rgb * s_alpha, s_alpha);
+        }
+
+        let out_pm = box_pm + shad_pm * (1.0 - box_pm.a);
+        if out_pm.a <= 0.0001 {
+            discard;
+        }
+        return out_pm;
     }
-    return out_pm;
-}

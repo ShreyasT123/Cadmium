@@ -1,10 +1,9 @@
 use std::time::Duration;
 
 use steelui::{
-    create_signal, AlignItems, App, Button, Clipboard, Color, Column, Container, Divider, Edges,
-    FileDialog, FontWeight, IntoElement, JustifyContent, Length, MacTheme, Material, Row,
-    ScrollView, Shadow, Slider, Spacer, Switch, Text, TextInput, TrafficLights, WidgetWindow,
-    WindowSpec,
+    AlignItems, App, Button, Clipboard, Color, Column, Container, Dropdown, Edges, FileDialog,
+    FontWeight, IntoElement, JustifyContent, Length, MacTheme, Material, Row, ScrollView, Shadow,
+    Spacer, Tabs, Text, TextInput, TrafficLights, WidgetWindow, WindowSpec, create_signal,
 };
 
 fn main() {
@@ -15,32 +14,40 @@ fn main() {
     let app = App::new();
     let dispatcher = app.dispatcher();
 
+    let selected_engine_mode = create_signal(0_usize);
+    let engine_modes = ["Classic UI", "Frosted Glass", "Liquid Glass"];
     let search_text = create_signal("Magnum Engine".to_string());
+    let active_tab = create_signal(0_usize);
     let radius = create_signal(14.0_f32);
-    let glass_enabled = create_signal(true);
     let async_jobs = create_signal(0_u32);
-    let status_msg = create_signal("Ready — type in the search field or scroll the feed below".to_string());
+    let status_msg = create_signal("Ready — type in search box or switch tabs above".to_string());
 
     let theme = MacTheme::light();
 
     let window = WidgetWindow::new(move || {
         let search_field = TextInput::new(search_text)
-            .placeholder("Search or filter items...")
-            .width(Length::Px(240.0))
+            .placeholder("Search or filter...")
+            .width(Length::Px(210.0))
             .material(Material::Classic {
-                fill: Color::from_rgba8(255, 255, 255, 220),
+                fill: Color::from_rgba8(255, 255, 255, 225),
                 fill_end: None,
                 gradient_dir: [0.0, 1.0],
                 border_color: theme.hairline,
                 border_width: 1.0,
-                shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 24), 4.0, 1.0)),
+                shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 20), 4.0, 1.0)),
             });
+
+        let view_tabs =
+            Tabs::new(active_tab, &["Workspace", "Inspector", "Feed"]).width(Length::Px(260.0));
+
+        let mode_dropdown =
+            Dropdown::new(selected_engine_mode, &engine_modes).width(Length::Px(150.0));
 
         let toolbar = Row::new()
             .height(Length::Px(52.0))
             .padding(Edges::xy(18.0, 0.0))
             .align(AlignItems::Center)
-            .gap(16.0)
+            .gap(14.0)
             .fill(theme.content_bg)
             .border(theme.hairline, 1.0)
             .drag_region()
@@ -52,7 +59,9 @@ fn main() {
                     .color(theme.text_primary),
             )
             .child(Spacer::flex())
+            .child(view_tabs)
             .child(search_field)
+            .child(mode_dropdown)
             .child(
                 Text::reactive(move || format!("Jobs: {}", async_jobs.get()))
                     .size(12.5)
@@ -60,7 +69,6 @@ fn main() {
                     .color(theme.text_secondary),
             );
 
-        // Sidebar with Frosted Glass material
         let sidebar = Container::column()
             .width(Length::Px(220.0))
             .padding(Edges::all(16.0))
@@ -73,30 +81,26 @@ fn main() {
                     .weight(FontWeight::Semibold)
                     .color(theme.text_tertiary),
             )
-            .child(
-                Button::new("Run Async Task")
-                    .primary()
-                    .on_click({
-                        let disp = dispatcher.clone();
-                        move || {
-                            status_msg.set("Async worker dispatched...".into());
-                            let d = disp.clone();
-                            std::thread::spawn(move || {
-                                std::thread::sleep(Duration::from_millis(320));
-                                d.dispatch(move || {
-                                    async_jobs.update(|n| *n += 1);
-                                    status_msg.set("Background task completed on UI thread".into());
-                                });
-                            });
-                        }
-                    }),
-            )
+            .child(Button::new("Run Async Task").primary().on_click({
+                let disp = dispatcher.clone();
+                move || {
+                    status_msg.set("Async worker dispatched...".into());
+                    let d = disp.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(320));
+                        d.dispatch(move || {
+                            async_jobs.update(|n| *n += 1);
+                            status_msg.set("Background task completed on UI thread".into());
+                        });
+                    });
+                }
+            }))
             .child(Button::new("Copy Summary").on_click(move || {
                 let text_val = search_text.get();
                 let summary = format!(
-                    "Query='{text_val}' radius={:.0} glass={} jobs={}",
+                    "Query='{text_val}' tab={} radius={:.0} jobs={}",
+                    active_tab.get(),
                     radius.get(),
-                    glass_enabled.get(),
                     async_jobs.get()
                 );
                 match Clipboard::set_text(&summary) {
@@ -110,9 +114,8 @@ fn main() {
                 }
             }));
 
-        // Center Content: Liquid Glass Card + ScrollView list
         let preview_card = Container::column()
-            .height(Length::Px(130.0))
+            .height(Length::Px(120.0))
             .padding(Edges::all(18.0))
             .gap(6.0)
             .justify(JustifyContent::Center)
@@ -127,13 +130,17 @@ fn main() {
             )
             .child(
                 Text::reactive(move || {
-                    format!("Active Query: \"{}\"  •  Radius: {:.0} pt", search_text.get(), radius.get())
+                    format!(
+                        "Query: \"{}\"  •  Tab: {}  •  Radius: {:.0} pt",
+                        search_text.get(),
+                        active_tab.get(),
+                        radius.get()
+                    )
                 })
                 .size(13.0)
                 .color(theme.text_secondary),
             );
 
-        // Smooth ScrollView with multiple cards
         let mut feed_scroll = ScrollView::new().gap(8.0);
         for i in 1..=12 {
             let item_card = Container::row()
@@ -191,7 +198,7 @@ fn main() {
 
     let app = app.add_window(WindowSpec {
         title: "SteelUI Studio".into(),
-        width: 960.0,
+        width: 980.0,
         height: 600.0,
         borderless: true,
         clear_color: theme.window_bg,

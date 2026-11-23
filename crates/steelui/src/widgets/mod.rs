@@ -1,25 +1,26 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use slotmap::SlotMap;
 
-use crate::accessibility::{build_tree_update, A11yNodeRecord, A11yRole};
 use crate::animation::Spring;
 use crate::core::{Color, CornerRadii, Rect};
 use crate::debug::FrameProfiler;
 use crate::events::{FocusManager, Modifiers, WidgetId};
 use crate::layout::{
-    snap_rect_to_pixels, AlignItems, Edges, FlexDir, JustifyContent, LayoutEngine, LayoutNode,
-    LayoutStyle, Length,
+    AlignItems, Edges, FlexDir, JustifyContent, LayoutEngine, LayoutNode, LayoutStyle, Length,
+    snap_rect_to_pixels,
 };
 use crate::platform::Clipboard;
-use crate::reactive::{create_effect, dispose_effect, EffectId, Signal};
+use crate::reactive::{EffectId, Signal, create_effect, dispose_effect};
 use crate::renderer::{GlassQuad, SdfQuad};
 use crate::style::{MacTheme, Material, Shadow, ThemeMode};
 use crate::text::{FontWeight, TextBlock, TextEngine, TextStyle};
 use crate::window::{CursorStyle, FrameContext, WindowCommand, WindowDelegate};
+
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DirtyFlags {
@@ -28,12 +29,47 @@ pub struct DirtyFlags {
     pub paint: bool,
 }
 
-thread_local! {
-    static PENDING_WIDGET_DIRTY: RefCell<Vec<(WidgetId, DirtyFlags)>> = const { RefCell::new(Vec::new()) };
+type DirtyQueue = Rc<RefCell<Vec<(WidgetId, DirtyFlags)>>>;
+
+fn push_dirty(queue: &DirtyQueue, id: WidgetId, flags: DirtyFlags) {
+    queue.borrow_mut().push((id, flags));
 }
 
-fn push_widget_dirty(id: WidgetId, flags: DirtyFlags) {
-    PENDING_WIDGET_DIRTY.with(|q| q.borrow_mut().push((id, flags)));
+fn snap_char_boundary(s: &str, idx: usize) -> usize {
+    let mut i = idx.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn normalize_selection(s: &str, sel: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    sel.map(|(a, b)| (snap_char_boundary(s, a), snap_char_boundary(s, b)))
+}
+
+fn find_char_index_at_x(char_offsets: &[(usize, f32)], rel_x: f32) -> usize {
+    if rel_x <= 0.0 || char_offsets.is_empty() {
+        return 0;
+    }
+    let mut best_idx = 0;
+    let mut best_dist = f32::MAX;
+    for &(byte_idx, x_pos) in char_offsets {
+        let d = (rel_x - x_pos).abs();
+        if d < best_dist {
+            best_dist = d;
+            best_idx = byte_idx;
+        }
+    }
+    best_idx
+}
+
+fn lookup_offset_x(char_offsets: &[(usize, f32)], byte_idx: usize) -> f32 {
+    for &(idx, x_pos) in char_offsets {
+        if idx >= byte_idx {
+            return x_pos;
+        }
+    }
+    char_offsets.last().map(|&(_, x)| x).unwrap_or(0.0)
 }
 
 pub enum Element {
@@ -45,6 +81,8 @@ pub enum Element {
     Slider(Slider),
     TextInput(TextInput),
     ScrollView(ScrollView),
+    Tabs(Tabs),
+    Dropdown(Dropdown),
     TrafficLights(TrafficLights),
     Divider(Divider),
     Spacer(Spacer),
@@ -153,9 +191,21 @@ impl Container {
 
     pub fn border(mut self, color: Color, width: f32) -> Self {
         match &mut self.material {
-            Material::Classic { border_color, border_width, .. }
-            | Material::Frosted { border_color, border_width, .. }
-            | Material::Liquid { border_color, border_width, .. } => {
+            Material::Classic {
+                border_color,
+                border_width,
+                ..
+            }
+            | Material::Frosted {
+                border_color,
+                border_width,
+                ..
+            }
+            | Material::Liquid {
+                border_color,
+                border_width,
+                ..
+            } => {
                 *border_color = color;
                 *border_width = width;
             }
@@ -533,6 +583,88 @@ impl IntoElement for TrafficLights {
     }
 }
 
+pub struct Tabs {
+    signal: Signal<usize>,
+    items: Vec<String>,
+    material: Material,
+    width: Length,
+}
+
+impl Tabs {
+    pub fn new(signal: Signal<usize>, items: &[impl AsRef<str>]) -> Self {
+        Self {
+            signal,
+            items: items.iter().map(|s| s.as_ref().to_string()).collect(),
+            material: Material::Classic {
+                fill: Color::from_rgba8(229, 229, 234, 255),
+                fill_end: None,
+                gradient_dir: [0.0, 1.0],
+                border_color: Color::TRANSPARENT,
+                border_width: 0.0,
+                shadow: None,
+            },
+            width: Length::Auto,
+        }
+    }
+
+    pub fn material(mut self, mat: Material) -> Self {
+        self.material = mat;
+        self
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.width = w;
+        self
+    }
+}
+
+impl IntoElement for Tabs {
+    fn into_element(self) -> Element {
+        Element::Tabs(self)
+    }
+}
+
+pub struct Dropdown {
+    signal: Signal<usize>,
+    items: Vec<String>,
+    material: Material,
+    width: Length,
+}
+
+impl Dropdown {
+    pub fn new(signal: Signal<usize>, items: &[impl AsRef<str>]) -> Self {
+        Self {
+            signal,
+            items: items.iter().map(|s| s.as_ref().to_string()).collect(),
+            material: Material::Classic {
+                fill: Color::from_rgba8(255, 255, 255, 220),
+                fill_end: None,
+                gradient_dir: [0.0, 1.0],
+                border_color: Color::from_rgba8(0, 0, 0, 30),
+                border_width: 1.0,
+                shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 18), 4.0, 1.0)),
+            },
+            width: Length::Px(160.0),
+        }
+    }
+
+    pub fn material(mut self, mat: Material) -> Self {
+        self.material = mat;
+        self
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.width = w;
+        self
+    }
+}
+
+impl IntoElement for Dropdown {
+    fn into_element(self) -> Element {
+        Element::Dropdown(self)
+    }
+}
+
 pub struct Divider {
     color: Color,
 }
@@ -590,22 +722,38 @@ enum WidgetPayload {
     },
     TextInput {
         signal: Signal<String>,
-        placeholder: String,
         material: Material,
         cursor: usize,
+        selection: Option<(usize, usize)>,
+        is_selecting: bool,
         text_block: TextBlock,
         placeholder_block: TextBlock,
+        char_offsets: Vec<(usize, f32)>,
+        last_synced_text: String,
     },
     ScrollView {
         scroll_y: Spring,
         content_height: f32,
         content_id: WidgetId,
     },
+    Tabs {
+        signal: Signal<usize>,
+        items: Vec<String>,
+        labels: Vec<TextBlock>,
+        material: Material,
+        pill_spring: Spring,
+    },
+    Dropdown {
+        signal: Signal<usize>,
+        items: Vec<String>,
+        labels: Vec<TextBlock>,
+        selected_labels: Vec<TextBlock>,
+        material: Material,
+        is_open: bool,
+        chevron: TextBlock,
+    },
     TrafficLights {
         hovered: bool,
-        x_glyph: TextBlock,
-        min_glyph: TextBlock,
-        plus_glyph: TextBlock,
     },
     Divider {
         color: Color,
@@ -619,8 +767,6 @@ struct WidgetNode {
     layout_style: LayoutStyle,
     bounds: Rect,
     owned_effects: Vec<EffectId>,
-    a11y_role: A11yRole,
-    a11y_label: Option<String>,
     payload: WidgetPayload,
 }
 
@@ -630,6 +776,10 @@ pub struct WidgetArena {
     layout_to_widget: HashMap<LayoutNode, WidgetId>,
     root: Option<WidgetId>,
     focus: FocusManager,
+    dirty_queue: DirtyQueue,
+    scroll_ids: Vec<WidgetId>,
+    tab_ids: Vec<WidgetId>,
+    traffic_ids: Vec<WidgetId>,
     needs_layout: bool,
 }
 
@@ -641,6 +791,10 @@ impl WidgetArena {
             layout_to_widget: HashMap::new(),
             root: None,
             focus: FocusManager::new(),
+            dirty_queue: Rc::new(RefCell::new(Vec::new())),
+            scroll_ids: Vec::new(),
+            tab_ids: Vec::new(),
+            traffic_ids: Vec::new(),
             needs_layout: true,
         }
     }
@@ -661,6 +815,10 @@ impl WidgetArena {
             self.layout.remove(node.layout_node);
         }
         self.layout_to_widget.clear();
+        self.dirty_queue.borrow_mut().clear();
+        self.scroll_ids.clear();
+        self.tab_ids.clear();
+        self.traffic_ids.clear();
         self.focus = FocusManager::new();
         self.root = None;
     }
@@ -686,8 +844,6 @@ impl WidgetArena {
                     layout_style: c.layout,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: None,
                     payload: WidgetPayload::Container {
                         material: c.material,
                         radius: radius_cell.clone(),
@@ -697,10 +853,11 @@ impl WidgetArena {
                 self.layout_to_widget.insert(lnode, id);
 
                 if let Some(sig) = c.radius_signal {
-                    let cell = radius_cell;
+                    let q = self.dirty_queue.clone();
                     let eff = create_effect(move || {
-                        cell.set(sig.get());
-                        push_widget_dirty(
+                        radius_cell.set(sig.get());
+                        push_dirty(
+                            &q,
                             id,
                             DirtyFlags {
                                 state: false,
@@ -731,8 +888,6 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Label,
-                    a11y_label: if is_reactive { None } else { Some(initial) },
                     payload: WidgetPayload::Text {
                         block,
                         pending: if is_reactive {
@@ -745,12 +900,14 @@ impl WidgetArena {
                 self.layout_to_widget.insert(lnode, id);
 
                 if let TextSource::Reactive(mut f) = t.source {
+                    let q = self.dirty_queue.clone();
                     let eff = create_effect(move || {
                         let next = f();
                         let mut slot = shared.borrow_mut();
                         if *slot != next {
                             *slot = next;
-                            push_widget_dirty(
+                            push_dirty(
+                                &q,
                                 id,
                                 DirtyFlags {
                                     state: true,
@@ -791,8 +948,6 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Button,
-                    a11y_label: Some(b.label),
                     payload: WidgetPayload::Button {
                         label: label_block,
                         accent: b.accent,
@@ -816,13 +971,13 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Switch,
-                    a11y_label: Some("Toggle".into()),
                     payload: WidgetPayload::Switch { signal: sw.signal },
                 });
+                let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
                     let _ = sw.signal.get();
-                    push_widget_dirty(
+                    push_dirty(
+                        &q,
                         id,
                         DirtyFlags {
                             state: false,
@@ -849,17 +1004,17 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Slider,
-                    a11y_label: Some("Slider".into()),
                     payload: WidgetPayload::Slider {
                         signal: sl.signal,
                         min: sl.min,
                         max: sl.max,
                     },
                 });
+                let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
                     let _ = sl.signal.get();
-                    push_widget_dirty(
+                    push_dirty(
+                        &q,
                         id,
                         DirtyFlags {
                             state: false,
@@ -893,6 +1048,9 @@ impl WidgetArena {
                         weight: FontWeight::Regular,
                     },
                 );
+                let mut char_offsets = Vec::new();
+                text_block.collect_char_offsets(&mut char_offsets);
+
                 let placeholder_block = TextBlock::new(
                     text,
                     &ti.placeholder,
@@ -910,20 +1068,170 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: Some(ti.placeholder.clone()),
                     payload: WidgetPayload::TextInput {
                         signal: ti.signal,
-                        placeholder: ti.placeholder,
                         material: ti.material,
                         cursor,
+                        selection: None,
+                        is_selecting: false,
                         text_block,
                         placeholder_block,
+                        char_offsets,
+                        last_synced_text: current_val,
                     },
                 });
+                let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
                     let _ = ti.signal.get();
-                    push_widget_dirty(
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: true,
+                            layout: false,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                self.layout_to_widget.insert(lnode, id);
+                self.focus.focus_order.push(id);
+                id
+            }
+            Element::Tabs(tb) => {
+                let count = tb.items.len().max(1);
+                let lstyle = LayoutStyle {
+                    width: tb.width,
+                    min_width: Length::Px(count as f32 * 68.0),
+                    height: Length::Px(30.0),
+                    padding: Edges::all(2.0),
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+
+                let labels = tb
+                    .items
+                    .iter()
+                    .map(|it| {
+                        TextBlock::new(
+                            text,
+                            it,
+                            TextStyle {
+                                font_size: 12.5,
+                                line_height: 16.0,
+                                color: Color::from_rgba8(28, 28, 32, 255),
+                                weight: FontWeight::Medium,
+                            },
+                        )
+                    })
+                    .collect();
+
+                let initial_tab = tb.signal.get();
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    payload: WidgetPayload::Tabs {
+                        signal: tb.signal,
+                        items: tb.items,
+                        labels,
+                        material: tb.material,
+                        pill_spring: Spring::new(initial_tab as f32, 320.0, 26.0),
+                    },
+                });
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = tb.signal.get();
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: false,
+                            layout: false,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                self.layout_to_widget.insert(lnode, id);
+                self.focus.focus_order.push(id);
+                self.tab_ids.push(id);
+                id
+            }
+            Element::Dropdown(dd) => {
+                let lstyle = LayoutStyle {
+                    width: dd.width,
+                    height: Length::Px(32.0),
+                    padding: Edges::xy(12.0, 6.0),
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+                let labels = dd
+                    .items
+                    .iter()
+                    .map(|it| {
+                        TextBlock::new(
+                            text,
+                            it,
+                            TextStyle {
+                                font_size: 13.0,
+                                line_height: 18.0,
+                                color: Color::from_rgba8(28, 28, 32, 255),
+                                weight: FontWeight::Medium,
+                            },
+                        )
+                    })
+                    .collect();
+                let selected_labels = dd
+                    .items
+                    .iter()
+                    .map(|it| {
+                        TextBlock::new(
+                            text,
+                            it,
+                            TextStyle {
+                                font_size: 13.0,
+                                line_height: 18.0,
+                                color: Color::from_rgba8(255, 255, 255, 255),
+                                weight: FontWeight::Semibold,
+                            },
+                        )
+                    })
+                    .collect();
+                let chevron = TextBlock::new(
+                    text,
+                    "⌵",
+                    TextStyle {
+                        font_size: 11.0,
+                        line_height: 14.0,
+                        color: Color::from_rgba8(120, 120, 128, 255),
+                        weight: FontWeight::Bold,
+                    },
+                );
+
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    payload: WidgetPayload::Dropdown {
+                        signal: dd.signal,
+                        items: dd.items,
+                        labels,
+                        selected_labels,
+                        material: dd.material,
+                        is_open: false,
+                        chevron,
+                    },
+                });
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = dd.signal.get();
+                    push_dirty(
+                        &q,
                         id,
                         DirtyFlags {
                             state: false,
@@ -944,32 +1252,16 @@ impl WidgetArena {
                     ..Default::default()
                 };
                 let lnode = self.layout.new_leaf(lstyle);
-                let gs = TextStyle {
-                    font_size: 9.5,
-                    line_height: 11.0,
-                    color: Color::from_rgba8(77, 10, 8, 210),
-                    weight: FontWeight::Bold,
-                };
-                let x_glyph = TextBlock::new(text, "×", gs);
-                let min_glyph = TextBlock::new(text, "−", gs);
-                let plus_glyph = TextBlock::new(text, "+", gs);
-
                 let id = self.nodes.insert(WidgetNode {
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: Some("Window Controls".into()),
-                    payload: WidgetPayload::TrafficLights {
-                        hovered: false,
-                        x_glyph,
-                        min_glyph,
-                        plus_glyph,
-                    },
+                    payload: WidgetPayload::TrafficLights { hovered: false },
                 });
                 self.layout_to_widget.insert(lnode, id);
+                self.traffic_ids.push(id);
                 id
             }
             Element::ScrollView(sv) => {
@@ -996,8 +1288,6 @@ impl WidgetArena {
                     layout_style: content_lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: None,
                     payload: WidgetPayload::Container {
                         material: Material::solid(Color::TRANSPARENT),
                         radius: Rc::new(Cell::new(0.0)),
@@ -1011,8 +1301,7 @@ impl WidgetArena {
                     flex_grow: 1.0,
                     ..Default::default()
                 };
-                let viewport_lnode =
-                    self.layout.new_container(viewport_lstyle, &[content_lnode]);
+                let viewport_lnode = self.layout.new_container(viewport_lstyle, &[content_lnode]);
 
                 let id = self.nodes.insert(WidgetNode {
                     children: vec![content_id],
@@ -1020,8 +1309,6 @@ impl WidgetArena {
                     layout_style: viewport_lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: None,
                     payload: WidgetPayload::ScrollView {
                         scroll_y: Spring::new(0.0, 260.0, 24.0),
                         content_height: 0.0,
@@ -1029,6 +1316,7 @@ impl WidgetArena {
                     },
                 });
                 self.layout_to_widget.insert(viewport_lnode, id);
+                self.scroll_ids.push(id);
                 id
             }
             Element::Divider(d) => {
@@ -1043,8 +1331,6 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: None,
                     payload: WidgetPayload::Divider { color: d.color },
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1062,8 +1348,6 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
-                    a11y_role: A11yRole::Container,
-                    a11y_label: None,
                     payload: WidgetPayload::Spacer,
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1079,6 +1363,23 @@ impl Default for WidgetArena {
     }
 }
 
+struct OverlayRenderRecord {
+    source_id: WidgetId,
+    trigger_bounds: Rect,
+    selected: usize,
+    item_count: usize,
+}
+
+struct PaintCtx<'a, 'b> {
+    ctx: &'a mut FrameContext<'b>,
+    theme: &'a MacTheme,
+    scale: f32,
+    caret_visible: bool,
+    hovered: Option<WidgetId>,
+    focused: Option<WidgetId>,
+    overlays: &'a mut Vec<OverlayRenderRecord>,
+}
+
 pub struct WidgetWindow<F> {
     build_fn: F,
     theme_signal: Option<Signal<ThemeMode>>,
@@ -1087,7 +1388,9 @@ pub struct WidgetWindow<F> {
     last_size: (f32, f32),
     hovered: Option<WidgetId>,
     captured: Option<WidgetId>,
-    start_instant: Instant,
+    open_dropdowns: Vec<(WidgetId, Rect, usize)>,
+    caret_visible: bool,
+    next_blink_at: Option<Instant>,
 }
 
 impl<F> WidgetWindow<F>
@@ -1103,7 +1406,9 @@ where
             last_size: (0.0, 0.0),
             hovered: None,
             captured: None,
-            start_instant: Instant::now(),
+            open_dropdowns: Vec::new(),
+            caret_visible: true,
+            next_blink_at: None,
         }
     }
 
@@ -1123,15 +1428,32 @@ where
     }
 
     fn update_slider(&mut self, id: WidgetId, x: f32) -> bool {
-        if let Some(node) = self.arena.nodes.get(id) {
-            if let WidgetPayload::Slider { signal, min, max } = node.payload {
-                let t = ((x - node.bounds.x) / node.bounds.width.max(1.0)).clamp(0.0, 1.0);
-                let val = min + (max - min) * t;
-                signal.set(val);
-                return true;
-            }
+        if let Some(node) = self.arena.nodes.get(id)
+            && let WidgetPayload::Slider { signal, min, max } = node.payload
+        {
+            let t = ((x - node.bounds.x) / node.bounds.width.max(1.0)).clamp(0.0, 1.0);
+            let val = min + (max - min) * t;
+            signal.set(val);
+            return true;
         }
         false
+    }
+
+    fn reset_caret_blink(&mut self) {
+        let is_text_focused = self
+            .arena
+            .focus
+            .focused
+            .and_then(|id| self.arena.nodes.get(id))
+            .is_some_and(|n| matches!(n.payload, WidgetPayload::TextInput { .. }));
+
+        if is_text_focused {
+            self.caret_visible = true;
+            self.next_blink_at = Some(Instant::now() + CARET_BLINK_INTERVAL);
+        } else {
+            self.caret_visible = false;
+            self.next_blink_at = None;
+        }
     }
 }
 
@@ -1140,29 +1462,60 @@ where
     F: FnMut() -> Element + 'static,
 {
     fn init(&mut self, text: &mut TextEngine) {
+        self.hovered = None;
+        self.captured = None;
+        self.open_dropdowns.clear();
+        self.caret_visible = false;
+        self.next_blink_at = None;
+
         let root_elem = (self.build_fn)();
         self.arena.mount(root_elem, text);
     }
 
     fn tick(&mut self, dt: f32) -> bool {
         let mut animating = false;
-        for node in self.arena.nodes.values_mut() {
-            if let WidgetPayload::ScrollView { scroll_y, .. } = &mut node.payload {
+        for &sid in &self.arena.scroll_ids {
+            if let Some(node) = self.arena.nodes.get_mut(sid)
+                && let WidgetPayload::ScrollView { scroll_y, .. } = &mut node.payload
+            {
                 animating |= scroll_y.step(dt);
             }
         }
-        if self.arena.focus.focused.is_some() {
-            animating = true;
+        for &tid in &self.arena.tab_ids {
+            if let Some(node) = self.arena.nodes.get_mut(tid)
+                && let WidgetPayload::Tabs {
+                    signal,
+                    pill_spring,
+                    ..
+                } = &mut node.payload
+            {
+                pill_spring.set_target(signal.get() as f32);
+                animating |= pill_spring.step(dt);
+            }
         }
+
+        if let Some(blink_at) = self.next_blink_at {
+            let now = Instant::now();
+            if now >= blink_at {
+                self.caret_visible = !self.caret_visible;
+                self.next_blink_at = Some(now + CARET_BLINK_INTERVAL);
+            }
+        }
+
+        // Only return true for active spring motion; caret blink uses WaitUntil via next_redraw_at()
         animating
+    }
+
+    fn next_redraw_at(&self) -> Option<Instant> {
+        self.next_blink_at
     }
 
     fn cursor_style(&self) -> CursorStyle {
         if let Some(h) = self.hovered {
-            if let Some(node) = self.arena.nodes.get(h) {
-                if matches!(node.payload, WidgetPayload::TextInput { .. }) {
-                    return CursorStyle::Default;
-                }
+            if let Some(node) = self.arena.nodes.get(h)
+                && matches!(node.payload, WidgetPayload::TextInput { .. })
+            {
+                return CursorStyle::Default;
             }
             CursorStyle::Pointer
         } else if self.captured.is_some() {
@@ -1184,12 +1537,13 @@ where
 
     fn on_scroll(&mut self, _delta_x: f32, delta_y: f32) -> bool {
         let mut handled = false;
-        for node in self.arena.nodes.values_mut() {
-            if let WidgetPayload::ScrollView {
-                scroll_y,
-                content_height,
-                ..
-            } = &mut node.payload
+        for &sid in &self.arena.scroll_ids {
+            if let Some(node) = self.arena.nodes.get_mut(sid)
+                && let WidgetPayload::ScrollView {
+                    scroll_y,
+                    content_height,
+                    ..
+                } = &mut node.payload
             {
                 let max_scroll = (*content_height - node.bounds.height).max(0.0);
                 if max_scroll > 0.0 {
@@ -1216,98 +1570,189 @@ where
             return false;
         };
 
-        if let WidgetPayload::TextInput { signal, cursor, .. } = &mut node.payload {
+        let mut handled = false;
+        if let WidgetPayload::TextInput {
+            signal,
+            cursor,
+            selection,
+            ..
+        } = &mut node.payload
+        {
             let mut val = signal.get();
-            *cursor = (*cursor).min(val.len());
+            *cursor = snap_char_boundary(&val, *cursor);
+            *selection = normalize_selection(&val, *selection);
 
-            match key {
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
-                    if *cursor > 0 && !val.is_empty() {
-                        let prev = val[..*cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        val.drain(prev..*cursor);
-                        *cursor = prev;
-                        signal.set(val);
+            let is_ctrl = modifiers.ctrl || modifiers.super_key;
+            let is_shortcut_char = |ch: &str| -> bool {
+                matches!(key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case(ch))
+            };
+
+            let delete_sel =
+                |val: &mut String, cursor: &mut usize, sel: &mut Option<(usize, usize)>| -> bool {
+                    if let Some((start, end)) = sel.take() {
+                        let s = snap_char_boundary(val, start.min(end));
+                        let e = snap_char_boundary(val, start.max(end));
+                        if s < e {
+                            val.drain(s..e);
+                        }
+                        *cursor = s;
                         return true;
                     }
+                    false
+                };
+
+            if is_ctrl && is_shortcut_char("a") {
+                *selection = Some((0, val.len()));
+                *cursor = val.len();
+                handled = true;
+            } else if is_ctrl && is_shortcut_char("c") {
+                if let Some((start, end)) = *selection {
+                    let s = snap_char_boundary(&val, start.min(end));
+                    let e = snap_char_boundary(&val, start.max(end));
+                    let _ = Clipboard::set_text(&val[s..e]);
+                    handled = true;
                 }
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete) => {
-                    if *cursor < val.len() {
-                        let next = val[*cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| *cursor + i)
-                            .unwrap_or(val.len());
-                        val.drain(*cursor..next);
-                        signal.set(val);
-                        return true;
-                    }
+            } else if is_ctrl && is_shortcut_char("x") {
+                if let Some((start, end)) = *selection {
+                    let s = snap_char_boundary(&val, start.min(end));
+                    let e = snap_char_boundary(&val, start.max(end));
+                    let _ = Clipboard::set_text(&val[s..e]);
+                    delete_sel(&mut val, cursor, selection);
+                    signal.set(val);
+                    handled = true;
                 }
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
-                    if *cursor > 0 {
-                        *cursor = val[..*cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        return true;
-                    }
+            } else if is_ctrl && is_shortcut_char("v") {
+                if let Ok(pasted) = Clipboard::get_text() {
+                    let clean = pasted.replace('\r', "").replace('\n', " ");
+                    delete_sel(&mut val, cursor, selection);
+                    val.insert_str(*cursor, &clean);
+                    *cursor += clean.len();
+                    signal.set(val);
+                    handled = true;
                 }
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
-                    if *cursor < val.len() {
-                        *cursor = val[*cursor..]
-                            .char_indices()
-                            .nth(1)
-                            .map(|(i, _)| *cursor + i)
-                            .unwrap_or(val.len());
-                        return true;
-                    }
-                }
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
-                    *cursor = 0;
-                    return true;
-                }
-                winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
-                    *cursor = val.len();
-                    return true;
-                }
-                _ => {
-                    if (modifiers.ctrl || modifiers.super_key) && text == Some("v") {
-                        if let Ok(pasted) = Clipboard::get_text() {
-                            let clean = pasted.replace('\r', "").replace('\n', " ");
-                            val.insert_str(*cursor, &clean);
-                            *cursor += clean.len();
+            } else {
+                match key {
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                        if delete_sel(&mut val, cursor, selection) {
                             signal.set(val);
-                            return true;
+                            handled = true;
+                        } else if *cursor > 0 && !val.is_empty() {
+                            let prev = val[..*cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            val.drain(prev..*cursor);
+                            *cursor = prev;
+                            signal.set(val);
+                            handled = true;
                         }
                     }
-
-                    if let Some(ch_str) = text {
-                        if !ch_str.chars().any(|c| c.is_control()) {
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete) => {
+                        if delete_sel(&mut val, cursor, selection) {
+                            signal.set(val);
+                            handled = true;
+                        } else if *cursor < val.len() {
+                            let next = val[*cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| *cursor + i)
+                                .unwrap_or(val.len());
+                            val.drain(*cursor..next);
+                            signal.set(val);
+                            handled = true;
+                        }
+                    }
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
+                        *selection = None;
+                        if *cursor > 0 {
+                            *cursor = val[..*cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            handled = true;
+                        }
+                    }
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
+                        *selection = None;
+                        if *cursor < val.len() {
+                            *cursor = val[*cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| *cursor + i)
+                                .unwrap_or(val.len());
+                            handled = true;
+                        }
+                    }
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                        *selection = None;
+                        *cursor = 0;
+                        handled = true;
+                    }
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
+                        *selection = None;
+                        *cursor = val.len();
+                        handled = true;
+                    }
+                    _ => {
+                        if !is_ctrl
+                            && let Some(ch_str) = text
+                            && !ch_str.chars().any(|c| c.is_control())
+                        {
+                            delete_sel(&mut val, cursor, selection);
                             val.insert_str(*cursor, ch_str);
                             *cursor += ch_str.len();
                             signal.set(val);
-                            return true;
+                            handled = true;
                         }
                     }
                 }
             }
         }
-        false
+
+        if handled {
+            self.reset_caret_blink();
+        }
+        handled
     }
 
     fn on_pointer_move(&mut self, x: f32, y: f32) -> bool {
+        if let Some(cap) = self.captured
+            && let Some(node) = self.arena.nodes.get_mut(cap)
+            && let WidgetPayload::TextInput {
+                signal,
+                cursor,
+                selection,
+                is_selecting,
+                char_offsets,
+                ..
+            } = &mut node.payload
+            && *is_selecting
+        {
+            let val = signal.get();
+            let rel_x = x - (node.bounds.x + 12.0);
+            let anchor = snap_char_boundary(&val, selection.map(|s| s.0).unwrap_or(*cursor));
+            let new_cursor = snap_char_boundary(&val, find_char_index_at_x(char_offsets, rel_x));
+            *cursor = new_cursor;
+            *selection = if anchor != new_cursor {
+                Some((anchor, new_cursor))
+            } else {
+                None
+            };
+            return true;
+        }
         if let Some(cap) = self.captured {
             return self.update_slider(cap, x);
         }
+
         let next = self.hit_test(x, y);
         let mut redraw = false;
 
-        for node in self.arena.nodes.values_mut() {
-            if let WidgetPayload::TrafficLights { hovered, .. } = &mut node.payload {
+        for &tid in &self.arena.traffic_ids {
+            if let Some(node) = self.arena.nodes.get_mut(tid)
+                && let WidgetPayload::TrafficLights { hovered } = &mut node.payload
+            {
                 let inside = node.bounds.contains(x, y);
                 if *hovered != inside {
                     *hovered = inside;
@@ -1324,13 +1769,46 @@ where
     }
 
     fn on_pointer_down(&mut self, x: f32, y: f32) -> (bool, WindowCommand) {
+        if !self.open_dropdowns.is_empty() {
+            let overlays = std::mem::take(&mut self.open_dropdowns);
+            for (dd_id, menu_rect, count) in overlays.iter().rev().copied() {
+                if menu_rect.contains(x, y) {
+                    let row_h = 30.0;
+                    let clicked_idx = ((y - (menu_rect.y + 4.0)) / row_h).floor().max(0.0) as usize;
+                    let idx = clicked_idx.min(count.saturating_sub(1));
+                    if let Some(node) = self.arena.nodes.get_mut(dd_id)
+                        && let WidgetPayload::Dropdown {
+                            signal, is_open, ..
+                        } = &mut node.payload
+                    {
+                        signal.set(idx);
+                        *is_open = false;
+                    }
+                    return (true, WindowCommand::None);
+                }
+            }
+            // Clicked outside: close all open dropdowns
+            for (dd_id, _, _) in overlays {
+                if let Some(node) = self.arena.nodes.get_mut(dd_id)
+                    && let WidgetPayload::Dropdown { is_open, .. } = &mut node.payload
+                {
+                    *is_open = false;
+                }
+            }
+        }
+
         let Some(hit) = self.hit_test(x, y) else {
-            self.arena.focus.set_focus(None);
-            return (true, WindowCommand::None);
+            let focus_changed = self.arena.focus.set_focus(None);
+            self.reset_caret_blink();
+            if self.is_drag_region(x, y) {
+                return (false, WindowCommand::None);
+            }
+            return (focus_changed, WindowCommand::None);
         };
+
         self.arena.focus.set_focus(Some(hit));
         let mut clicked = false;
-        let mut capture_slider = false;
+        let mut capture_target = false;
 
         if let Some(node) = self.arena.nodes.get_mut(hit) {
             match &mut node.payload {
@@ -1356,19 +1834,44 @@ where
                     clicked = true;
                 }
                 WidgetPayload::Slider { .. } => {
-                    capture_slider = true;
+                    capture_target = true;
                     clicked = true;
                 }
-                WidgetPayload::TextInput { signal, cursor, .. } => {
+                WidgetPayload::Tabs { signal, items, .. } => {
+                    let tab_w = node.bounds.width / items.len().max(1) as f32;
+                    let idx = ((x - node.bounds.x) / tab_w).floor().max(0.0) as usize;
+                    signal.set(idx.min(items.len().saturating_sub(1)));
+                    clicked = true;
+                }
+                WidgetPayload::Dropdown { is_open, .. } => {
+                    *is_open = !*is_open;
+                    clicked = true;
+                }
+                WidgetPayload::TextInput {
+                    signal,
+                    cursor,
+                    selection,
+                    is_selecting,
+                    char_offsets,
+                    ..
+                } => {
                     let val = signal.get();
-                    *cursor = val.len();
+                    let rel_x = x - (node.bounds.x + 12.0);
+                    let char_idx =
+                        snap_char_boundary(&val, find_char_index_at_x(char_offsets, rel_x));
+                    *cursor = char_idx;
+                    *selection = None;
+                    *is_selecting = true;
+                    capture_target = true;
                     clicked = true;
                 }
                 _ => {}
             }
         }
 
-        if capture_slider {
+        self.reset_caret_blink();
+
+        if capture_target {
             self.captured = Some(hit);
             self.update_slider(hit, x);
         }
@@ -1376,8 +1879,14 @@ where
     }
 
     fn on_pointer_up(&mut self) -> bool {
-        let was = self.captured.is_some();
-        self.captured = None;
+        let mut was = self.captured.is_some();
+        if let Some(cap) = self.captured.take()
+            && let Some(node) = self.arena.nodes.get_mut(cap)
+            && let WidgetPayload::TextInput { is_selecting, .. } = &mut node.payload
+        {
+            *is_selecting = false;
+            was = true;
+        }
         was
     }
 
@@ -1390,9 +1899,9 @@ where
             .unwrap_or(ThemeMode::Light);
         let theme = MacTheme::from_mode(mode);
 
-        // Stage 1: Drain reactive widget dirty notifications
+        // Stage 1: Drain per-arena reactive dirty notifications
         let dirty_batch: Vec<(WidgetId, DirtyFlags)> =
-            PENDING_WIDGET_DIRTY.with(|q| std::mem::take(&mut *q.borrow_mut()));
+            std::mem::take(&mut *self.arena.dirty_queue.borrow_mut());
         for (id, flags) in dirty_batch {
             if let Some(node) = self.arena.nodes.get_mut(id) {
                 if flags.layout {
@@ -1400,16 +1909,30 @@ where
                     self.arena.needs_layout = true;
                 }
                 match &mut node.payload {
-                    WidgetPayload::Text { block, pending } => {
-                        if let Some(cell) = pending {
-                            let text_val = cell.borrow().clone();
-                            block.set_text(ctx.text_engine(), &text_val);
-                            node.a11y_label = Some(text_val);
-                        }
+                    WidgetPayload::Text {
+                        block,
+                        pending: Some(cell),
+                    } => {
+                        let text_val = cell.borrow().clone();
+                        block.set_text(ctx.text_engine(), &text_val);
                     }
-                    WidgetPayload::TextInput { signal, text_block, .. } => {
+                    WidgetPayload::TextInput {
+                        signal,
+                        cursor,
+                        selection,
+                        text_block,
+                        char_offsets,
+                        last_synced_text,
+                        ..
+                    } => {
                         let text_val = signal.get();
-                        text_block.set_text(ctx.text_engine(), &text_val);
+                        if *last_synced_text != text_val {
+                            *last_synced_text = text_val.clone();
+                            *cursor = snap_char_boundary(&text_val, *cursor);
+                            *selection = normalize_selection(&text_val, *selection);
+                            text_block.set_text(ctx.text_engine(), &text_val);
+                            text_block.collect_char_offsets(char_offsets);
+                        }
                     }
                     _ => {}
                 }
@@ -1424,95 +1947,160 @@ where
         // Stage 2: Incremental Taffy Layout + ScrollView content_height calculation
         let layout_start = FrameProfiler::begin_timer();
         let mut did_layout = false;
-        if self.arena.needs_layout {
-            if let Some(root) = self.arena.root {
-                let root_lnode = self.arena.nodes[root].layout_node;
-                let mut rstyle = self.arena.nodes[root].layout_style;
-                rstyle.width = Length::Px(ctx.width);
-                rstyle.height = Length::Px(ctx.height);
-                self.arena.layout.set_style(root_lnode, rstyle);
+        if self.arena.needs_layout
+            && let Some(root) = self.arena.root
+        {
+            let root_lnode = self.arena.nodes[root].layout_node;
+            let mut rstyle = self.arena.nodes[root].layout_style;
+            rstyle.width = Length::Px(ctx.width);
+            rstyle.height = Length::Px(ctx.height);
+            self.arena.layout.set_style(root_lnode, rstyle);
 
-                let nodes = &mut self.arena.nodes;
-                let lmap = &self.arena.layout_to_widget;
-                let text_engine = ctx.text_engine();
+            let nodes = &mut self.arena.nodes;
+            let lmap = &self.arena.layout_to_widget;
+            let text_engine = ctx.text_engine();
 
-                self.arena.layout.compute_with_measure(
-                    root_lnode,
-                    self.last_size.0,
-                    self.last_size.1,
-                    |lnode, _, _, avail_w, _| {
-                        let Some(&wid) = lmap.get(&lnode) else {
-                            return (0.0, 0.0);
-                        };
-                        let Some(node) = nodes.get_mut(wid) else {
-                            return (0.0, 0.0);
-                        };
-                        match &mut node.payload {
-                            WidgetPayload::Text { block, .. } => block.measure(text_engine, avail_w),
-                            WidgetPayload::Button { label, .. } => {
-                                let (w, _) = label.measure(text_engine, None);
-                                (w + 28.0, 30.0)
-                            }
-                            _ => (0.0, 0.0),
+            self.arena.layout.compute_with_measure(
+                root_lnode,
+                self.last_size.0,
+                self.last_size.1,
+                |lnode, _, _, avail_w, _| {
+                    let Some(&wid) = lmap.get(&lnode) else {
+                        return (0.0, 0.0);
+                    };
+                    let Some(node) = nodes.get_mut(wid) else {
+                        return (0.0, 0.0);
+                    };
+                    match &mut node.payload {
+                        WidgetPayload::Text { block, .. } => block.measure(text_engine, avail_w),
+                        WidgetPayload::Button { label, .. } => {
+                            let (w, _) = label.measure(text_engine, None);
+                            (w + 28.0, 30.0)
                         }
-                    },
-                );
-
-                let rects = self.arena.layout.collect_logical_rects(root_lnode);
-                for (lnode, rect) in rects {
-                    if let Some(&wid) = self.arena.layout_to_widget.get(&lnode) {
-                        if let Some(node) = self.arena.nodes.get_mut(wid) {
-                            node.bounds = rect;
-                        }
+                        _ => (0.0, 0.0),
                     }
+                },
+            );
+
+            let rects = self.arena.layout.collect_logical_rects(root_lnode);
+            for (lnode, rect) in rects {
+                if let Some(&wid) = self.arena.layout_to_widget.get(&lnode)
+                    && let Some(node) = self.arena.nodes.get_mut(wid)
+                {
+                    node.bounds = rect;
                 }
-
-                // Update content_height cleanly inside Stage 2 layout
-                let scroll_updates: Vec<(WidgetId, f32)> = self.arena.nodes.iter()
-                    .filter_map(|(id, node)| {
-                        if let WidgetPayload::ScrollView { content_id, .. } = &node.payload {
-                            self.arena.nodes.get(*content_id).map(|cn| (id, cn.bounds.height))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                for (sid, ch) in scroll_updates {
-                    if let Some(snode) = self.arena.nodes.get_mut(sid) {
-                        if let WidgetPayload::ScrollView { content_height, .. } = &mut snode.payload {
-                            *content_height = ch;
-                        }
-                    }
-                }
-
-                self.arena.needs_layout = false;
-                did_layout = true;
             }
+
+            for &sid in &self.arena.scroll_ids {
+                let cid = match self.arena.nodes.get(sid).map(|n| &n.payload) {
+                    Some(WidgetPayload::ScrollView { content_id, .. }) => *content_id,
+                    _ => continue,
+                };
+                let ch = self
+                    .arena
+                    .nodes
+                    .get(cid)
+                    .map(|n| n.bounds.height)
+                    .unwrap_or(0.0);
+                if let Some(snode) = self.arena.nodes.get_mut(sid)
+                    && let WidgetPayload::ScrollView { content_height, .. } = &mut snode.payload
+                {
+                    *content_height = ch;
+                }
+            }
+
+            self.arena.needs_layout = false;
+            did_layout = true;
         }
         let layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
 
-        // Stage 3: Hierarchical Paint with Scissor Clipping & AccessKit semantic snapshot
+        // Stage 3: Hierarchical Paint + Clamped Overlay Portals
         let paint_start = FrameProfiler::begin_timer();
-        let mut a11y_records = Vec::new();
+        let mut overlay_records = Vec::new();
+        self.open_dropdowns.clear();
+
         if let Some(root) = self.arena.root {
             let scale = ctx.scale;
-            let time_secs = self.start_instant.elapsed().as_secs_f32();
-
-            paint_node(
-                root,
-                &self.arena.nodes,
+            let mut pctx = PaintCtx {
                 ctx,
-                &theme,
+                theme: &theme,
                 scale,
-                time_secs,
-                self.hovered,
-                self.arena.focus.focused,
-                (0.0, 0.0),
-                &mut a11y_records,
-            );
+                caret_visible: self.caret_visible,
+                hovered: self.hovered,
+                focused: self.arena.focus.focused,
+                overlays: &mut overlay_records,
+            };
 
-            let _tree_update = build_tree_update(root, self.arena.focus.focused, &a11y_records);
+            paint_node(root, &self.arena.nodes, &mut pctx, (0.0, 0.0));
+
+            for ov in overlay_records {
+                let row_h = 30.0;
+                let menu_w = ov.trigger_bounds.width.max(160.0).min(ctx.width - 16.0);
+                let menu_h = ov.item_count as f32 * row_h + 8.0;
+                let menu_x = ov
+                    .trigger_bounds
+                    .x
+                    .clamp(8.0, (ctx.width - menu_w - 8.0).max(8.0));
+
+                let space_below =
+                    ctx.height - (ov.trigger_bounds.y + ov.trigger_bounds.height + 4.0);
+                let menu_y = if space_below >= menu_h + 8.0 {
+                    ov.trigger_bounds.y + ov.trigger_bounds.height + 4.0
+                } else {
+                    (ov.trigger_bounds.y - menu_h - 4.0).max(8.0)
+                };
+                let menu_rect = Rect::new(menu_x, menu_y, menu_w, menu_h);
+                self.open_dropdowns
+                    .push((ov.source_id, menu_rect, ov.item_count));
+
+                ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(menu_rect, scale),
+                    radii: CornerRadii::all(10.0).scale(scale),
+                    fill: Color::TRANSPARENT,
+                    shadow_color: Color::from_rgba8(0, 0, 0, 75),
+                    shadow_offset: [0.0, 8.0 * scale],
+                    shadow_blur: 20.0 * scale,
+                    ..Default::default()
+                });
+                ctx.push_glass(GlassQuad {
+                    rect: snap_rect_to_pixels(menu_rect, scale),
+                    radii: CornerRadii::all(10.0).scale(scale),
+                    tint: Color::from_rgba8(250, 250, 255, 185),
+                    border_color: theme.hairline,
+                    border_width: 1.0,
+                    frost: 0.40,
+                    specular: 0.85,
+                    ..Default::default()
+                });
+
+                if let Some(dd_node) = self.arena.nodes.get(ov.source_id)
+                    && let WidgetPayload::Dropdown {
+                        labels,
+                        selected_labels,
+                        ..
+                    } = &dd_node.payload
+                {
+                    for i in 0..ov.item_count {
+                        let ry = menu_y + 4.0 + i as f32 * row_h;
+                        let row_rect = Rect::new(menu_x + 4.0, ry, menu_w - 8.0, row_h);
+                        let is_sel = i == ov.selected;
+                        if is_sel {
+                            ctx.push_sdf(SdfQuad {
+                                rect: snap_rect_to_pixels(row_rect, scale),
+                                radii: CornerRadii::all(6.0).scale(scale),
+                                fill: theme.accent,
+                                ..Default::default()
+                            });
+                        }
+                        let block = if is_sel {
+                            &selected_labels[i]
+                        } else {
+                            &labels[i]
+                        };
+                        ctx.push_text(block, row_rect.x + 10.0, row_rect.y + 6.0);
+                    }
+                }
+            }
         }
 
         let paint_ms = paint_start.elapsed().as_secs_f32() * 1000.0;
@@ -1525,14 +2113,8 @@ where
 fn paint_node(
     wid: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
-    ctx: &mut FrameContext<'_>,
-    theme: &MacTheme,
-    scale: f32,
-    time_secs: f32,
-    hovered: Option<WidgetId>,
-    focused: Option<WidgetId>,
+    pctx: &mut PaintCtx<'_, '_>,
     offset: (f32, f32),
-    a11y_records: &mut Vec<A11yNodeRecord>,
 ) {
     let Some(node) = nodes.get(wid) else {
         return;
@@ -1545,26 +2127,22 @@ fn paint_node(
         node.bounds.height,
     );
 
-    let is_hovered = hovered == Some(wid);
-    let is_focused = focused == Some(wid);
-
-    a11y_records.push(A11yNodeRecord {
-        id: wid,
-        role: node.a11y_role,
-        label: node.a11y_label.clone(),
-        bounds,
-        children: node.children.clone(),
-    });
+    let scale = pctx.scale;
+    let theme = pctx.theme;
+    let is_hovered = pctx.hovered == Some(wid);
+    let is_focused = pctx.focused == Some(wid);
 
     match &node.payload {
-        WidgetPayload::Container { material, radius, .. } => {
-            render_material(ctx, bounds, *material, radius.get(), scale, theme);
+        WidgetPayload::Container {
+            material, radius, ..
+        } => {
+            render_material(pctx.ctx, bounds, *material, radius.get(), scale);
             for &child in &node.children {
-                paint_node(child, nodes, ctx, theme, scale, time_secs, hovered, focused, offset, a11y_records);
+                paint_node(child, nodes, pctx, offset);
             }
         }
         WidgetPayload::Text { block, .. } => {
-            ctx.push_text(block, bounds.x, bounds.y);
+            pctx.ctx.push_text(block, bounds.x, bounds.y);
         }
         WidgetPayload::Button { label, accent, .. } => {
             let fill = if *accent {
@@ -1574,29 +2152,37 @@ fn paint_node(
             } else {
                 theme.panel_bg
             };
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: snap_rect_to_pixels(bounds, scale),
                 radii: CornerRadii::all(7.0).scale(scale),
                 fill,
-                border_color: if *accent { Color::TRANSPARENT } else { theme.hairline },
+                border_color: if *accent {
+                    Color::TRANSPARENT
+                } else {
+                    theme.hairline
+                },
                 border_width: if *accent { 0.0 } else { 1.0 },
                 shadow_color: theme.shadow_soft,
                 shadow_offset: [0.0, 1.0 * scale],
                 shadow_blur: 3.0 * scale,
                 ..Default::default()
             });
-            ctx.push_text(label, bounds.x + 14.0, bounds.y + 6.0);
+            pctx.ctx.push_text(label, bounds.x + 14.0, bounds.y + 6.0);
         }
         WidgetPayload::Switch { signal } => {
             let on = signal.get();
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: snap_rect_to_pixels(bounds, scale),
                 radii: CornerRadii::all(11.0).scale(scale),
-                fill: if on { theme.switch_on } else { theme.switch_off },
+                fill: if on {
+                    theme.switch_on
+                } else {
+                    theme.switch_off
+                },
                 ..Default::default()
             });
             let tx = if on { bounds.x + 18.0 } else { bounds.x + 2.0 };
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: Rect::new(tx, bounds.y + 2.0, 18.0, 18.0).scale(scale),
                 radii: CornerRadii::all(9.0).scale(scale),
                 fill: theme.control_thumb,
@@ -1615,21 +2201,24 @@ fn paint_node(
                 bounds.width,
                 4.0,
             );
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: snap_rect_to_pixels(track, scale),
                 radii: CornerRadii::all(2.0).scale(scale),
                 fill: theme.control_track,
                 ..Default::default()
             });
-            ctx.push_sdf(SdfQuad {
-                rect: snap_rect_to_pixels(Rect::new(track.x, track.y, track.width * frac, 4.0), scale),
+            pctx.ctx.push_sdf(SdfQuad {
+                rect: snap_rect_to_pixels(
+                    Rect::new(track.x, track.y, track.width * frac, 4.0),
+                    scale,
+                ),
                 radii: CornerRadii::all(2.0).scale(scale),
                 fill: theme.accent,
                 ..Default::default()
             });
             let kx = track.x + track.width * frac - 8.0;
             let ky = bounds.y + (bounds.height - 16.0) * 0.5;
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: Rect::new(kx, ky, 16.0, 16.0).scale(scale),
                 radii: CornerRadii::all(8.0).scale(scale),
                 fill: theme.control_thumb,
@@ -1641,12 +2230,21 @@ fn paint_node(
                 ..Default::default()
             });
         }
-        WidgetPayload::TextInput { signal, material, cursor, text_block, placeholder_block, .. } => {
+        WidgetPayload::TextInput {
+            signal,
+            material,
+            cursor,
+            selection,
+            text_block,
+            placeholder_block,
+            char_offsets,
+            ..
+        } => {
             let val = signal.get();
-            render_material(ctx, bounds, *material, 8.0, scale, theme);
+            render_material(pctx.ctx, bounds, *material, 8.0, scale);
 
             if is_focused {
-                ctx.push_sdf(SdfQuad {
+                pctx.ctx.push_sdf(SdfQuad {
                     rect: snap_rect_to_pixels(bounds, scale),
                     radii: CornerRadii::all(8.0).scale(scale),
                     fill: Color::TRANSPARENT,
@@ -1659,47 +2257,111 @@ fn paint_node(
             let text_x = bounds.x + 12.0;
             let text_y = bounds.y + 8.0;
 
-            if val.is_empty() {
-                ctx.push_text(placeholder_block, text_x, text_y);
-            } else {
-                ctx.push_text(text_block, text_x, text_y);
+            if let Some((start, end)) = *selection {
+                let s = snap_char_boundary(&val, start.min(end));
+                let e = snap_char_boundary(&val, start.max(end));
+                if s != e {
+                    let x1 = lookup_offset_x(char_offsets, s);
+                    let x2 = lookup_offset_x(char_offsets, e);
+                    let sel_rect = Rect::new(text_x + x1, text_y - 1.0, (x2 - x1).max(2.0), 18.0);
+                    pctx.ctx.push_sdf(SdfQuad {
+                        rect: snap_rect_to_pixels(sel_rect, scale),
+                        radii: CornerRadii::all(3.0).scale(scale),
+                        fill: Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 0.28),
+                        ..Default::default()
+                    });
+                }
             }
 
-            if is_focused && (time_secs * 1.88).fract() < 0.52 {
-                let prefix = &val[..(*cursor).min(val.len())];
-                let caret_offset_x = if prefix.is_empty() {
-                    0.0
-                } else {
-                    let mut temp = TextBlock::new(
-                        ctx.text_engine(),
-                        prefix,
-                        TextStyle {
-                            font_size: 13.5,
-                            line_height: 18.0,
-                            color: Color::TRANSPARENT,
-                            weight: FontWeight::Regular,
-                        },
-                    );
-                    temp.measure(ctx.text_engine(), None).0
-                };
+            if val.is_empty() {
+                pctx.ctx.push_text(placeholder_block, text_x, text_y);
+            } else {
+                pctx.ctx.push_text(text_block, text_x, text_y);
+            }
 
+            if is_focused && pctx.caret_visible {
+                let safe_cursor = snap_char_boundary(&val, *cursor);
+                let caret_offset_x = lookup_offset_x(char_offsets, safe_cursor);
                 let caret_x = text_x + caret_offset_x;
                 let caret_rect = Rect::new(caret_x, text_y + 1.0, 1.5, 16.0);
-                ctx.push_sdf(SdfQuad {
+                pctx.ctx.push_sdf(SdfQuad {
                     rect: snap_rect_to_pixels(caret_rect, scale),
                     fill: theme.accent,
                     ..Default::default()
                 });
             }
         }
-        WidgetPayload::ScrollView { scroll_y, content_height, content_id } => {
+        WidgetPayload::Tabs {
+            items,
+            labels,
+            material,
+            pill_spring,
+            ..
+        } => {
+            render_material(pctx.ctx, bounds, *material, 7.0, scale);
+
+            let count = items.len().max(1);
+            let tab_w = (bounds.width - 4.0) / count as f32;
+            let pill_x = bounds.x + 2.0 + pill_spring.value * tab_w;
+            let pill_rect = Rect::new(pill_x, bounds.y + 2.0, tab_w, bounds.height - 4.0);
+
+            pctx.ctx.push_sdf(SdfQuad {
+                rect: snap_rect_to_pixels(pill_rect, scale),
+                radii: CornerRadii::all(5.5).scale(scale),
+                fill: theme.control_thumb,
+                border_color: theme.hairline,
+                border_width: 0.5 * scale,
+                shadow_color: theme.shadow_soft,
+                shadow_offset: [0.0, 1.0 * scale],
+                shadow_blur: 3.0 * scale,
+                ..Default::default()
+            });
+
+            for (i, label) in labels.iter().enumerate() {
+                let item_cx = bounds.x + 2.0 + (i as f32 + 0.5) * tab_w;
+                let lw = label.style().font_size * 0.55 * items[i].len() as f32;
+                pctx.ctx
+                    .push_text(label, item_cx - lw * 0.5, bounds.y + 7.0);
+            }
+        }
+        WidgetPayload::Dropdown {
+            signal,
+            items,
+            labels,
+            material,
+            is_open,
+            chevron,
+            ..
+        } => {
+            render_material(pctx.ctx, bounds, *material, 8.0, scale);
+            let selected = signal.get().min(items.len().saturating_sub(1));
+            if let Some(lbl) = labels.get(selected) {
+                pctx.ctx.push_text(lbl, bounds.x + 12.0, bounds.y + 7.0);
+            }
+            pctx.ctx
+                .push_text(chevron, bounds.x + bounds.width - 20.0, bounds.y + 7.0);
+
+            if *is_open {
+                pctx.overlays.push(OverlayRenderRecord {
+                    source_id: wid,
+                    trigger_bounds: bounds,
+                    selected,
+                    item_count: items.len(),
+                });
+            }
+        }
+        WidgetPayload::ScrollView {
+            scroll_y,
+            content_height,
+            content_id,
+        } => {
             let viewport = bounds;
-            ctx.push_clip(viewport);
+            pctx.ctx.push_clip(viewport);
 
             let child_offset = (offset.0, offset.1 - scroll_y.value);
-            paint_node(*content_id, nodes, ctx, theme, scale, time_secs, hovered, focused, child_offset, a11y_records);
+            paint_node(*content_id, nodes, pctx, child_offset);
 
-            ctx.pop_clip();
+            pctx.ctx.pop_clip();
 
             if *content_height > viewport.height {
                 let track_h = viewport.height - 8.0;
@@ -1707,8 +2369,9 @@ fn paint_node(
                 let max_scroll = (*content_height - viewport.height).max(1.0);
                 let thumb_t = (scroll_y.value / max_scroll).clamp(0.0, 1.0);
                 let thumb_y = viewport.y + 4.0 + thumb_t * (track_h - thumb_h);
-                let thumb_rect = Rect::new(viewport.x + viewport.width - 6.0, thumb_y, 4.0, thumb_h);
-                ctx.push_sdf(SdfQuad {
+                let thumb_rect =
+                    Rect::new(viewport.x + viewport.width - 6.0, thumb_y, 4.0, thumb_h);
+                pctx.ctx.push_sdf(SdfQuad {
                     rect: snap_rect_to_pixels(thumb_rect, scale),
                     radii: CornerRadii::all(2.0).scale(scale),
                     fill: Color::from_rgba8(0, 0, 0, 75),
@@ -1716,52 +2379,89 @@ fn paint_node(
                 });
             }
         }
-        WidgetPayload::TrafficLights {
-            hovered,
-            x_glyph,
-            min_glyph,
-            plus_glyph,
-        } => {
+        WidgetPayload::TrafficLights { hovered } => {
             let cy = bounds.y + (bounds.height - 12.0) * 0.5;
+            let r1 = snap_rect_to_pixels(Rect::new(bounds.x, cy, 12.0, 12.0), scale);
+            let r2 = snap_rect_to_pixels(Rect::new(bounds.x + 20.0, cy, 12.0, 12.0), scale);
+            let r3 = snap_rect_to_pixels(Rect::new(bounds.x + 40.0, cy, 12.0, 12.0), scale);
 
-            let r1 = Rect::new(bounds.x, cy, 12.0, 12.0);
-            ctx.push_sdf(SdfQuad {
-                rect: snap_rect_to_pixels(r1, scale),
-                radii: CornerRadii::all(6.0).scale(scale),
-                fill: theme.traffic_close,
-                border_color: theme.traffic_border,
-                border_width: 1.0,
-                ..Default::default()
-            });
-
-            let r2 = Rect::new(bounds.x + 20.0, cy, 12.0, 12.0);
-            ctx.push_sdf(SdfQuad {
-                rect: snap_rect_to_pixels(r2, scale),
-                radii: CornerRadii::all(6.0).scale(scale),
-                fill: theme.traffic_minimize,
-                border_color: theme.traffic_border,
-                border_width: 1.0,
-                ..Default::default()
-            });
-
-            let r3 = Rect::new(bounds.x + 40.0, cy, 12.0, 12.0);
-            ctx.push_sdf(SdfQuad {
-                rect: snap_rect_to_pixels(r3, scale),
-                radii: CornerRadii::all(6.0).scale(scale),
-                fill: theme.traffic_zoom,
-                border_color: theme.traffic_border,
-                border_width: 1.0,
-                ..Default::default()
-            });
+            for (rect, fill) in [
+                (r1, theme.traffic_close),
+                (r2, theme.traffic_minimize),
+                (r3, theme.traffic_zoom),
+            ] {
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect,
+                    radii: CornerRadii::all(rect.width * 0.5),
+                    fill,
+                    border_color: theme.traffic_border,
+                    border_width: 1.0,
+                    ..Default::default()
+                });
+            }
 
             if *hovered {
-                ctx.push_text(x_glyph, r1.x + 2.8, r1.y + 0.5);
-                ctx.push_text(min_glyph, r2.x + 2.8, r2.y + 0.5);
-                ctx.push_text(plus_glyph, r3.x + 2.8, r3.y + 0.5);
+                let bar_len = 6.2 * scale;
+                let bar_thick = 1.35 * scale;
+                let bar_r = CornerRadii::all(bar_thick * 0.5);
+
+                let cx1 = r1.x + r1.width * 0.5;
+                let cy1 = r1.y + r1.height * 0.5;
+                let x_len = 6.6 * scale;
+                let red_glyph = Color::from_rgba8(77, 10, 8, 225);
+                for rot in [std::f32::consts::FRAC_PI_4, -std::f32::consts::FRAC_PI_4] {
+                    pctx.ctx.push_sdf(SdfQuad {
+                        rect: Rect::new(cx1 - x_len * 0.5, cy1 - bar_thick * 0.5, x_len, bar_thick),
+                        radii: bar_r,
+                        fill: red_glyph,
+                        rotation: rot,
+                        ..Default::default()
+                    });
+                }
+
+                let cx2 = r2.x + r2.width * 0.5;
+                let cy2 = r2.y + r2.height * 0.5;
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: Rect::new(
+                        cx2 - bar_len * 0.5,
+                        cy2 - bar_thick * 0.5,
+                        bar_len,
+                        bar_thick,
+                    ),
+                    radii: bar_r,
+                    fill: Color::from_rgba8(153, 87, 0, 225),
+                    ..Default::default()
+                });
+
+                let cx3 = r3.x + r3.width * 0.5;
+                let cy3 = r3.y + r3.height * 0.5;
+                let green_glyph = Color::from_rgba8(0, 101, 0, 225);
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: Rect::new(
+                        cx3 - bar_len * 0.5,
+                        cy3 - bar_thick * 0.5,
+                        bar_len,
+                        bar_thick,
+                    ),
+                    radii: bar_r,
+                    fill: green_glyph,
+                    ..Default::default()
+                });
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: Rect::new(
+                        cx3 - bar_thick * 0.5,
+                        cy3 - bar_len * 0.5,
+                        bar_thick,
+                        bar_len,
+                    ),
+                    radii: bar_r,
+                    fill: green_glyph,
+                    ..Default::default()
+                });
             }
         }
         WidgetPayload::Divider { color } => {
-            ctx.push_sdf(SdfQuad {
+            pctx.ctx.push_sdf(SdfQuad {
                 rect: snap_rect_to_pixels(bounds, scale),
                 fill: *color,
                 ..Default::default()
@@ -1778,9 +2478,7 @@ fn hit_test_node(
     y: f32,
     offset: (f32, f32),
 ) -> Option<WidgetId> {
-    let Some(node) = nodes.get(wid) else {
-        return None;
-    };
+    let node = nodes.get(wid)?;
     let bounds = Rect::new(
         node.bounds.x + offset.0,
         node.bounds.y + offset.1,
@@ -1788,7 +2486,12 @@ fn hit_test_node(
         node.bounds.height,
     );
 
-    if let WidgetPayload::ScrollView { scroll_y, content_id, .. } = &node.payload {
+    if let WidgetPayload::ScrollView {
+        scroll_y,
+        content_id,
+        ..
+    } = &node.payload
+    {
         if !bounds.contains(x, y) {
             return None;
         }
@@ -1809,6 +2512,8 @@ fn hit_test_node(
                 | WidgetPayload::Switch { .. }
                 | WidgetPayload::Slider { .. }
                 | WidgetPayload::TextInput { .. }
+                | WidgetPayload::Tabs { .. }
+                | WidgetPayload::Dropdown { .. }
                 | WidgetPayload::TrafficLights { .. }
         )
     {
@@ -1834,10 +2539,13 @@ fn is_drag_node(
         node.bounds.width,
         node.bounds.height,
     );
-    if let WidgetPayload::Container { is_drag_region: true, .. } = &node.payload {
-        if bounds.contains(x, y) {
-            return true;
-        }
+    if let WidgetPayload::Container {
+        is_drag_region: true,
+        ..
+    } = &node.payload
+        && bounds.contains(x, y)
+    {
+        return true;
     }
     for &child in &node.children {
         if is_drag_node(child, nodes, x, y, offset) {
@@ -1853,7 +2561,6 @@ fn render_material(
     material: Material,
     radius: f32,
     scale: f32,
-    theme: &MacTheme,
 ) {
     match material {
         Material::Classic {
@@ -1865,7 +2572,11 @@ fn render_material(
             shadow,
         } => {
             let (shad_col, shad_blur, shad_off) = match shadow {
-                Some(s) => (s.color, s.blur * scale, [s.offset[0] * scale, s.offset[1] * scale]),
+                Some(s) => (
+                    s.color,
+                    s.blur * scale,
+                    [s.offset[0] * scale, s.offset[1] * scale],
+                ),
                 None => (Color::TRANSPARENT, 0.0, [0.0, 0.0]),
             };
             ctx.push_sdf(SdfQuad {
@@ -1874,6 +2585,7 @@ fn render_material(
                 fill,
                 fill_end,
                 gradient_dir,
+                rotation: 0.0,
                 border_color,
                 border_width: border_width * scale,
                 shadow_color: shad_col,
@@ -1951,5 +2663,44 @@ fn render_material(
                 conic_strength,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reactive::create_signal;
+
+    #[test]
+    fn utf8_boundary_snapping_prevents_mid_char_panics() {
+        let s = "Café🦀";
+        // 'é' spans bytes 3..5; '🦀' spans bytes 5..9
+        assert_eq!(snap_char_boundary(s, 4), 3);
+        assert_eq!(snap_char_boundary(s, 7), 5);
+        assert_eq!(snap_char_boundary(s, 99), s.len());
+    }
+
+    #[test]
+    fn dirty_queues_are_isolated_per_arena() {
+        let mut te = TextEngine::new();
+        let sig_a = create_signal("A".to_string());
+        let sig_b = create_signal("B".to_string());
+
+        let mut arena_a = WidgetArena::new();
+        let mut arena_b = WidgetArena::new();
+        arena_a.mount(Text::reactive(move || sig_a.get()).into_element(), &mut te);
+        arena_b.mount(Text::reactive(move || sig_b.get()).into_element(), &mut te);
+
+        arena_a.dirty_queue.borrow_mut().clear();
+        arena_b.dirty_queue.borrow_mut().clear();
+
+        sig_a.set("A2".to_string());
+        crate::reactive::flush_effects();
+
+        assert_eq!(arena_a.dirty_queue.borrow().len(), 1);
+        assert_eq!(arena_b.dirty_queue.borrow().len(), 0);
+
+        sig_a.dispose();
+        sig_b.dispose();
     }
 }

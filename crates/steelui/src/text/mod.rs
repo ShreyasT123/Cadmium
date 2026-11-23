@@ -50,10 +50,38 @@ pub struct TextEngine {
 
 impl TextEngine {
     pub fn new() -> Self {
+        let mut db = cosmic_text::fontdb::Database::new();
+
+        #[cfg(target_os = "windows")]
+        {
+            for path in [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\segoeuisb.ttf",
+                r"C:\Windows\Fonts\seguisym.ttf",
+            ] {
+                let _ = db.load_font_file(path);
+            }
+            if db.is_empty() {
+                db.load_system_fonts();
+            } else {
+                db.set_sans_serif_family("Segoe UI");
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            db.load_system_fonts();
+        }
+
         Self {
-            font_system: FontSystem::new(),
+            font_system: FontSystem::new_with_locale_and_db("en-US".to_string(), db),
             swash_cache: SwashCache::new(),
         }
+    }
+
+    pub fn load_system_fonts(&mut self) {
+        self.font_system.db_mut().load_system_fonts();
     }
 
     pub(crate) fn rasterize_uncached(&mut self, key: CacheKey) -> Option<SwashImage> {
@@ -143,13 +171,14 @@ impl TextBlock {
         (width.ceil(), height.ceil())
     }
 
-    pub(crate) fn collect_glyphs(
+    pub(crate) fn collect_glyphs_into(
         &self,
         origin_x_px: f32,
         origin_y_px: f32,
         scale: f32,
-    ) -> Vec<ShapedGlyph> {
-        let mut out = Vec::new();
+        out: &mut Vec<ShapedGlyph>,
+    ) {
+        out.clear();
         for run in self.buffer.layout_runs() {
             let line_y_px = (run.line_y * scale).round() as i32;
             for glyph in run.glyphs.iter() {
@@ -161,7 +190,28 @@ impl TextBlock {
                 });
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn collect_glyphs(
+        &self,
+        origin_x_px: f32,
+        origin_y_px: f32,
+        scale: f32,
+    ) -> Vec<ShapedGlyph> {
+        let mut out = Vec::new();
+        self.collect_glyphs_into(origin_x_px, origin_y_px, scale, &mut out);
         out
+    }
+
+    pub(crate) fn collect_char_offsets(&self, out: &mut Vec<(usize, f32)>) {
+        out.clear();
+        out.push((0, 0.0));
+        if let Some(run) = self.buffer.layout_runs().next() {
+            for g in run.glyphs.iter() {
+                out.push((g.end, g.x + g.w));
+            }
+        }
     }
 }
 

@@ -87,6 +87,18 @@ fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - clamped_r;
 }
 
+fn linear_to_srgb_vec(c: vec3<f32>) -> vec3<f32> {
+    let lo = c * 12.92;
+    let hi = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, c <= vec3<f32>(0.0031308));
+}
+
+fn srgb_to_linear_vec(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow(max((c + 0.055) / 1.055, vec3<f32>(0.0)), vec3<f32>(2.4));
+    return select(hi, lo, c <= vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let dist = sd_rounded_box(in.local_pos, in.half_size, in.radii);
@@ -140,16 +152,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     let luma = dot(bg, vec3<f32>(0.2126, 0.7152, 0.0722));
     let saturated = clamp(mix(vec3<f32>(luma), bg, in.saturation), vec3<f32>(0.0), vec3<f32>(1.0));
-    // Subtle curved light-source reflection across upper-left glass face (in perceptual sRGB)
+    // Subtle curved light-source reflection across upper-left glass face (in exact sRGB)
     let p_uv = in.local_pos / max(in.half_size, vec2<f32>(1.0));
     let refl_coord = p_uv.x * 0.55 + p_uv.y * 0.85 + 0.12 * sin(p_uv.x * 2.4);
-    let refl_band = smoothstep(0.20, -0.45, refl_coord) * smoothstep(-1.25, -0.35, refl_coord);
+    let refl_band = (1.0 - smoothstep(-0.45, 0.20, refl_coord)) * smoothstep(-1.25, -0.35, refl_coord);
     let glass_sheen_srgb = refl_band * 0.065 * in.specular;
 
-    let bg_srgb = pow(max(saturated, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-    let tint_srgb = pow(max(in.tint_color.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    let bg_srgb = linear_to_srgb_vec(saturated);
+    let tint_srgb = linear_to_srgb_vec(in.tint_color.rgb);
     let mixed_srgb = clamp(mix(bg_srgb, tint_srgb, in.tint_color.a) + vec3<f32>(glass_sheen_srgb), vec3<f32>(0.0), vec3<f32>(1.0));
-    var surface_rgb = pow(mixed_srgb, vec3<f32>(2.2));
+    var surface_rgb = srgb_to_linear_vec(mixed_srgb);
 
     let sheen_prog = in.glass_fx.z;
     let conic_str = in.glass_fx.w;

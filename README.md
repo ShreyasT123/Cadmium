@@ -5,7 +5,9 @@
 **A GPU-native, reactive desktop GUI framework for Rust.**  
 *Crafted for fluid motion, refined typography, and authentic macOS-grade Liquid Glass aesthetics across Windows, Linux, and macOS.*
 
-[![CI](https://github.com/steelui/steelui/actions/workflows/ci.yml/badge.svg)](https://github.com/steelui/steelui/actions)
+**Early experimental prototype (`v0.1.0`) — active Phase 3 development.**
+
+[![CI](https://github.com/ShreyasT123/steelui/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreyasT123/steelui/actions)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![GPU](https://img.shields.io/badge/graphics-wgpu%2030-purple.svg)](https://wgpu.rs)
@@ -21,7 +23,7 @@
 * **Retained Widget Arena & Fine-Grained Signals:** Generational arena-backed widget tree (`slotmap`) paired with fine-grained reactive `Signal<T>` primitives. Subscribed widgets update their paint/layout state with zero full-tree reconstruction.
 * **3-Stage Invalidation Pipeline:** Separates updates into `STATE` → `LAYOUT` → `PAINT`. Changing a hover state or dragging a slider bypasses layout recalculation entirely, maintaining a solid 60–144+ FPS and **dropping to 0% CPU/GPU when idle**.
 * **Flexbox & Grid Layout via Taffy:** Flexbox row/column containers, gaps, alignment, and fractional DPI pixel snapping backed by an internal wrapper over `taffy` 0.15.
-* **Decoupled Text Engine:** High-quality text shaping, bidi, wrapping, and glyph rasterization via `cosmic-text` and `swash`, rendered via a shelf-packed 2048×2048 GPU glyph atlas.
+* **Decoupled Text Engine:** High-quality text shaping, bidi, wrapping, and glyph rasterization via `cosmic-text` and `swash`, rendered via a 512×512 GPU glyph atlas (grows dynamically up to 2048×2048).
 * **Thread-Safe Async Dispatcher:** Safely dispatch closures and state mutations from Tokio or background threads back onto the UI thread via `UiDispatcher` with automatic event-loop waking.
 * **Multi-Window by Design:** Shared process-wide `GpuContext` (device, pipelines, glyph atlas, texture caches) composited into canonical `Rgba8UnormSrgb` intermediate targets before per-window swapchain presentation.
 
@@ -143,18 +145,6 @@ cargo run -p liquid_glass
 Demonstrates the retained `WidgetArena`, reactive `Signal` updates, background worker dispatching via `UiDispatcher`, clipboard integration, and native file dialogs:
 ```powershell
 cargo run -p steelui_dogfood
-```
-
-### 3. Sequel Media Tracker Showcase
-Recreates an authentic macOS media tracker with full-bleed atmospheric gradients, glowing auras, and floating liquid glass navigation pills:
-```powershell
-cargo run -p sequel_showcase
-```
-
-### 4. Apple Notes Reference
-Tests 3-pane split views, 1px-inset hairlines, compact 13px typography, and floating popovers over text:
-```powershell
-cargo run -p macos_notes
 ```
 
 ---

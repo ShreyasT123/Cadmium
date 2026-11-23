@@ -225,7 +225,7 @@ impl WindowDelegate for LiquidGlassScene {
             return true;
         }
 
-        let in_traffic = x >= 14.0 && x <= 76.0 && y >= 14.0 && y <= 36.0;
+        let in_traffic = (14.0..=76.0).contains(&x) && (14.0..=36.0).contains(&y);
         let in_gen = hit_test(self.gen_rect, x, y);
         let in_card = hit_test(self.card_rect, x, y);
 
@@ -251,7 +251,7 @@ impl WindowDelegate for LiquidGlassScene {
             (40.0, WindowCommand::Minimize),
             (60.0, WindowCommand::ToggleMaximize),
         ] {
-            if x >= tx && x <= tx + 12.0 && y >= 20.0 && y <= 32.0 {
+            if (tx..=tx + 12.0).contains(&x) && (20.0..=32.0).contains(&y) {
                 return (false, cmd);
             }
         }
@@ -333,10 +333,10 @@ impl WindowDelegate for LiquidGlassScene {
                 border_width: 1.0,
                 ..Default::default()
             });
-            if self.hovered_traffic {
-                if let Some(g) = glyph_opt {
-                    ctx.push_text(g, tx + 2.8, 20.0);
-                }
+            if self.hovered_traffic
+                && let Some(g) = glyph_opt
+            {
+                ctx.push_text(g, tx + 2.8, 20.0);
             }
         }
 

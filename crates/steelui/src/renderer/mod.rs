@@ -7,10 +7,11 @@ use wgpu::util::DeviceExt;
 
 use crate::assets::DecodedImage;
 use crate::core::{Color, CornerRadii, Rect, SteelError};
-use crate::text::{swash_is_color, TextBlock, TextEngine};
+use crate::text::{ShapedGlyph, TextBlock, TextEngine, swash_is_color};
 
 pub const CANONICAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-const ATLAS_SIZE: u32 = 2048;
+const INITIAL_ATLAS_SIZE: u32 = 512;
+const MAX_ATLAS_SIZE: u32 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureHandle(pub usize);
@@ -22,6 +23,7 @@ pub struct SdfQuad {
     pub fill: Color,
     pub fill_end: Option<Color>,
     pub gradient_dir: [f32; 2],
+    pub rotation: f32,
     pub border_color: Color,
     pub border_width: f32,
     pub shadow_color: Color,
@@ -37,6 +39,7 @@ impl Default for SdfQuad {
             fill: Color::TRANSPARENT,
             fill_end: None,
             gradient_dir: [0.0, 1.0],
+            rotation: 0.0,
             border_color: Color::TRANSPARENT,
             border_width: 0.0,
             shadow_color: Color::TRANSPARENT,
@@ -95,7 +98,7 @@ impl Default for GlassQuad {
             specular: 0.90,
             frost: 0.45,
             liquid_ripple: 0.0,
-            rim_angle: -1.309, // -75 deg
+            rim_angle: -1.309,
             sheen_progress: 0.0,
             conic_strength: 0.0,
         }
@@ -125,9 +128,7 @@ struct RawSdfInstance {
     fill_color: [f32; 4],
     fill_color_end: [f32; 4],
     border_color: [f32; 4],
-    border_width: f32,
-    gradient_dir: [f32; 2],
-    _pad0: f32,
+    border_and_grad: [f32; 4],
     shadow_color: [f32; 4],
     shadow_params: [f32; 3],
     _pad1: f32,
@@ -142,9 +143,12 @@ impl From<SdfQuad> for RawSdfInstance {
             fill_color: q.fill.to_array(),
             fill_color_end: end.to_array(),
             border_color: q.border_color.to_array(),
-            border_width: q.border_width,
-            gradient_dir: q.gradient_dir,
-            _pad0: 0.0,
+            border_and_grad: [
+                q.border_width,
+                q.gradient_dir[0],
+                q.gradient_dir[1],
+                q.rotation,
+            ],
             shadow_color: q.shadow_color.to_array(),
             shadow_params: [q.shadow_offset[0], q.shadow_offset[1], q.shadow_blur],
             _pad1: 0.0,
@@ -197,7 +201,12 @@ impl From<GlassQuad> for RawGlassInstance {
             saturation: g.saturation,
             specular: g.specular,
             frost: g.frost,
-            glass_fx: [g.liquid_ripple, g.rim_angle, g.sheen_progress, g.conic_strength],
+            glass_fx: [
+                g.liquid_ripple,
+                g.rim_angle,
+                g.sheen_progress,
+                g.conic_strength,
+            ],
         }
     }
 }
@@ -213,7 +222,10 @@ struct RawGlyphInstance {
 #[derive(Debug, Clone)]
 enum DrawBatch {
     Sdf(Range<u32>),
-    Image { tex: TextureHandle, range: Range<u32> },
+    Image {
+        tex: TextureHandle,
+        range: Range<u32>,
+    },
     Text(Range<u32>),
     Glass(u32),
     SetScissor(Option<Rect>),
@@ -225,7 +237,10 @@ pub struct DrawList {
     image_instances: Vec<RawImageInstance>,
     glyph_instances: Vec<RawGlyphInstance>,
     glass_instances: Vec<RawGlassInstance>,
+    clip_stack: Vec<Rect>,
+    glyph_scratch: Vec<ShapedGlyph>,
     batches: Vec<DrawBatch>,
+    atlas_overflowed: bool,
 }
 
 impl DrawList {
@@ -236,7 +251,10 @@ impl DrawList {
             image_instances: Vec::new(),
             glyph_instances: Vec::new(),
             glass_instances: Vec::new(),
+            clip_stack: Vec::new(),
+            glyph_scratch: Vec::new(),
             batches: Vec::new(),
+            atlas_overflowed: false,
         }
     }
 
@@ -271,11 +289,18 @@ impl DrawList {
     }
 
     pub fn push_clip(&mut self, rect: Rect) {
-        self.batches.push(DrawBatch::SetScissor(Some(rect)));
+        let clipped = match self.clip_stack.last().copied() {
+            Some(parent) => intersect_rect(parent, rect),
+            None => rect,
+        };
+        self.clip_stack.push(clipped);
+        self.batches.push(DrawBatch::SetScissor(Some(clipped)));
     }
 
     pub fn pop_clip(&mut self) {
-        self.batches.push(DrawBatch::SetScissor(None));
+        self.clip_stack.pop();
+        self.batches
+            .push(DrawBatch::SetScissor(self.clip_stack.last().copied()));
     }
 
     pub fn push_text(
@@ -287,16 +312,23 @@ impl DrawList {
     ) {
         let origin_x_px = (logical_x * self.scale).round();
         let origin_y_px = (logical_y * self.scale).round();
-        let glyphs = block.collect_glyphs(origin_x_px, origin_y_px, self.scale);
+        block.collect_glyphs_into(
+            origin_x_px,
+            origin_y_px,
+            self.scale,
+            &mut self.glyph_scratch,
+        );
         let style_color = block.style().color;
 
         let start = self.glyph_instances.len() as u32;
-        for g in glyphs {
-            let Some(entry) = gpu.glyph_atlas.get_or_insert(
-                &gpu.queue,
-                &mut gpu.text_engine,
-                g.cache_key,
-            ) else {
+        for g in &self.glyph_scratch {
+            let Some(entry) =
+                gpu.glyph_atlas
+                    .get_or_insert(&gpu.queue, &mut gpu.text_engine, g.cache_key)
+            else {
+                if gpu.glyph_atlas.overflow_pending {
+                    self.atlas_overflowed = true;
+                }
                 continue;
             };
 
@@ -329,6 +361,14 @@ impl DrawList {
     }
 }
 
+fn intersect_rect(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    Rect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+}
+
 struct UploadedTexture {
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
@@ -345,21 +385,43 @@ struct CachedGlyph {
 }
 
 struct GlyphAtlas {
+    size: u32,
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     cache: HashMap<CacheKey, Option<CachedGlyph>>,
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
+    overflow_pending: bool,
 }
 
 impl GlyphAtlas {
     fn new(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler) -> Self {
+        let size = INITIAL_ATLAS_SIZE;
+        let (texture, bind_group) = Self::create_storage(device, bgl, sampler, size);
+        Self {
+            size,
+            texture,
+            bind_group,
+            cache: HashMap::new(),
+            cursor_x: 1,
+            cursor_y: 1,
+            row_height: 0,
+            overflow_pending: false,
+        }
+    }
+
+    fn create_storage(
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        size: u32,
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("SteelUI Glyph Atlas"),
             size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
+                width: size,
+                height: size,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -385,15 +447,30 @@ impl GlyphAtlas {
                 },
             ],
         });
+        (texture, bind_group)
+    }
 
-        Self {
-            texture,
-            bind_group,
-            cache: HashMap::new(),
-            cursor_x: 1,
-            cursor_y: 1,
-            row_height: 0,
+    fn begin_frame(
+        &mut self,
+        device: &wgpu::Device,
+        bgl: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) {
+        if !self.overflow_pending {
+            return;
         }
+        self.overflow_pending = false;
+        if self.size < MAX_ATLAS_SIZE {
+            self.size *= 2;
+        }
+        // Always recreate a clean zeroed GPU texture on reset so stale glyphs never bleed
+        let (texture, bind_group) = Self::create_storage(device, bgl, sampler, self.size);
+        self.texture = texture;
+        self.bind_group = bind_group;
+        self.cache.clear();
+        self.cursor_x = 1;
+        self.cursor_y = 1;
+        self.row_height = 0;
     }
 
     fn get_or_insert(
@@ -426,16 +503,15 @@ impl GlyphAtlas {
             return Some(empty);
         }
 
-        if self.cursor_x + w + 1 > ATLAS_SIZE {
+        if self.cursor_x + w + 1 > self.size {
             self.cursor_x = 1;
             self.cursor_y += self.row_height + 1;
             self.row_height = 0;
         }
-        if self.cursor_y + h + 1 > ATLAS_SIZE {
-            self.cache.clear();
-            self.cursor_x = 1;
-            self.cursor_y = 1;
-            self.row_height = 0;
+        if self.cursor_y + h + 1 > self.size || w + 2 > self.size {
+            // Defer growth/reset to frame boundary so already-emitted quads keep valid UVs
+            self.overflow_pending = true;
+            return None;
         }
 
         let ax = self.cursor_x;
@@ -454,7 +530,7 @@ impl GlyphAtlas {
             }
             cosmic_text::SwashContent::SubpixelMask => {
                 let mut buf = Vec::with_capacity((w * h * 4) as usize);
-                for chunk in image.data.chunks_exact(3) {
+                for chunk in image.data.as_chunks::<3>().0 {
                     let a = ((chunk[0] as u16 + chunk[1] as u16 + chunk[2] as u16) / 3) as u8;
                     buf.extend_from_slice(&[255, 255, 255, a]);
                 }
@@ -483,7 +559,7 @@ impl GlyphAtlas {
             },
         );
 
-        let inv = 1.0 / ATLAS_SIZE as f32;
+        let inv = 1.0 / self.size as f32;
         let entry = CachedGlyph {
             uv_rect: [
                 ax as f32 * inv,
@@ -510,7 +586,8 @@ pub struct GpuContext {
 
     pub text_engine: TextEngine,
     glyph_atlas: GlyphAtlas,
-    textures: Vec<UploadedTexture>,
+    textures: Vec<Option<UploadedTexture>>,
+    free_textures: Vec<usize>,
 
     globals_bgl: wgpu::BindGroupLayout,
     tex_bgl: wgpu::BindGroupLayout,
@@ -535,7 +612,7 @@ impl GpuContext {
     ) -> Result<Self, SteelError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface,
                 force_fallback_adapter: false,
                 apply_limit_buckets: true,
@@ -548,7 +625,7 @@ impl GpuContext {
                 required_features: wgpu::Features::empty(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
             })
             .await?;
@@ -597,6 +674,7 @@ impl GpuContext {
             text_engine: TextEngine::new(),
             glyph_atlas,
             textures: Vec::new(),
+            free_textures: Vec::new(),
             globals_bgl,
             tex_bgl,
             blur_bgl,
@@ -610,6 +688,11 @@ impl GpuContext {
             blit_shader,
             blit_pipelines: HashMap::new(),
         })
+    }
+
+    pub(crate) fn begin_frame(&mut self) {
+        self.glyph_atlas
+            .begin_frame(&self.device, &self.tex_bgl, &self.nearest_sampler);
     }
 
     pub fn upload_image(&mut self, img: &DecodedImage) -> TextureHandle {
@@ -664,12 +747,27 @@ impl GpuContext {
             ],
         });
 
-        let id = TextureHandle(self.textures.len());
-        self.textures.push(UploadedTexture {
+        let uploaded = UploadedTexture {
             _texture: texture,
             bind_group,
-        });
-        id
+        };
+
+        if let Some(slot) = self.free_textures.pop() {
+            self.textures[slot] = Some(uploaded);
+            TextureHandle(slot)
+        } else {
+            let id = self.textures.len();
+            self.textures.push(Some(uploaded));
+            TextureHandle(id)
+        }
+    }
+
+    pub fn release_texture(&mut self, handle: TextureHandle) {
+        if let Some(slot) = self.textures.get_mut(handle.0)
+            && slot.take().is_some()
+        {
+            self.free_textures.push(handle.0);
+        }
     }
 
     fn blit_pipeline_for(&mut self, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
@@ -720,6 +818,87 @@ impl GpuContext {
     }
 }
 
+struct GlassTargets {
+    backdrop_tex: wgpu::Texture,
+    backdrop_bg: wgpu::BindGroup,
+    _mip1_tex: wgpu::Texture,
+    mip1_view: wgpu::TextureView,
+    mip1_bg: wgpu::BindGroup,
+    _mip2_tex: wgpu::Texture,
+    mip2_view: wgpu::TextureView,
+    mip2_bg: wgpu::BindGroup,
+    blur_param_buffers: [wgpu::Buffer; 3],
+    blur_param_bgs: [wgpu::BindGroup; 3],
+}
+
+impl GlassTargets {
+    fn new(gpu: &GpuContext, width: u32, height: u32) -> Self {
+        let (backdrop_tex, backdrop_bg) = create_backdrop_target(gpu, width, height);
+        let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
+        let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
+
+        let (mip1_tex, mip1_view, mip1_bg) = create_blur_target(gpu, w1, h1, "BlurMip1");
+        let (mip2_tex, mip2_view, mip2_bg) = create_blur_target(gpu, w2, h2, "BlurMip2");
+
+        let uniforms = blur_pyramid_uniforms([width, height], [w1, h1], [w2, h2]);
+        let blur_param_buffers = uniforms.map(|u| {
+            gpu.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SteelUI Blur Params"),
+                    contents: bytemuck::bytes_of(&u),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                })
+        });
+        let blur_param_bgs = std::array::from_fn(|i| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("SteelUI Blur Params BG"),
+                layout: &gpu.blur_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: blur_param_buffers[i].as_entire_binding(),
+                }],
+            })
+        });
+
+        Self {
+            backdrop_tex,
+            backdrop_bg,
+            _mip1_tex: mip1_tex,
+            mip1_view,
+            mip1_bg,
+            _mip2_tex: mip2_tex,
+            mip2_view,
+            mip2_bg,
+            blur_param_buffers,
+            blur_param_bgs,
+        }
+    }
+
+    fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
+        let (btex, bbg) = create_backdrop_target(gpu, width, height);
+        self.backdrop_tex = btex;
+        self.backdrop_bg = bbg;
+
+        let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
+        let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
+
+        let (m1, mv1, mb1) = create_blur_target(gpu, w1, h1, "BlurMip1");
+        let (m2, mv2, mb2) = create_blur_target(gpu, w2, h2, "BlurMip2");
+        self._mip1_tex = m1;
+        self.mip1_view = mv1;
+        self.mip1_bg = mb1;
+        self._mip2_tex = m2;
+        self.mip2_view = mv2;
+        self.mip2_bg = mb2;
+
+        let uniforms = blur_pyramid_uniforms([width, height], [w1, h1], [w2, h2]);
+        for (i, u) in uniforms.into_iter().enumerate() {
+            gpu.queue
+                .write_buffer(&self.blur_param_buffers[i], 0, bytemuck::bytes_of(&u));
+        }
+    }
+}
+
 pub struct WindowRenderTarget {
     width: u32,
     height: u32,
@@ -728,23 +907,7 @@ pub struct WindowRenderTarget {
     canonical_blit_bg: wgpu::BindGroup,
     canonical_linear_bg: wgpu::BindGroup,
 
-    backdrop_tex: wgpu::Texture,
-    backdrop_bg: wgpu::BindGroup,
-
-    _mip1_tex: wgpu::Texture,
-    mip1_view: wgpu::TextureView,
-    mip1_bg: wgpu::BindGroup,
-
-    _mip2_tex: wgpu::Texture,
-    mip2_view: wgpu::TextureView,
-    mip2_bg: wgpu::BindGroup,
-
-    _mip3_tex: wgpu::Texture,
-    mip3_view: wgpu::TextureView,
-    mip3_bg: wgpu::BindGroup,
-
-    blur_param_buffers: [wgpu::Buffer; 5],
-    blur_param_bgs: [wgpu::BindGroup; 5],
+    glass_targets: Option<GlassTargets>,
 
     globals_buffer: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
@@ -769,35 +932,6 @@ impl WindowRenderTarget {
 
         let (canonical_tex, canonical_view, canonical_blit_bg, canonical_linear_bg) =
             create_canonical_target(gpu, width, height);
-        let (backdrop_tex, backdrop_bg) = create_backdrop_target(gpu, width, height);
-
-        let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
-        let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
-        let (w3, h3) = ((w2 / 2).max(1), (h2 / 2).max(1));
-
-        let (mip1_tex, mip1_view, mip1_bg) = create_blur_target(gpu, w1, h1, "BlurMip1");
-        let (mip2_tex, mip2_view, mip2_bg) = create_blur_target(gpu, w2, h2, "BlurMip2");
-        let (mip3_tex, mip3_view, mip3_bg) = create_blur_target(gpu, w3, h3, "BlurMip3");
-
-        let uniforms = blur_pyramid_uniforms(width, height, w1, h1, w2, h2, w3, h3);
-        let blur_param_buffers = uniforms.map(|u| {
-            gpu.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("SteelUI Blur Params"),
-                    contents: bytemuck::bytes_of(&u),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                })
-        });
-        let blur_param_bgs = std::array::from_fn(|i| {
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("SteelUI Blur Params BG"),
-                layout: &gpu.blur_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: blur_param_buffers[i].as_entire_binding(),
-                }],
-            })
-        });
 
         let globals = GlobalsUniform {
             viewport_size: [width as f32, height as f32],
@@ -842,19 +976,7 @@ impl WindowRenderTarget {
             canonical_view,
             canonical_blit_bg,
             canonical_linear_bg,
-            backdrop_tex,
-            backdrop_bg,
-            _mip1_tex: mip1_tex,
-            mip1_view,
-            mip1_bg,
-            _mip2_tex: mip2_tex,
-            mip2_view,
-            mip2_bg,
-            _mip3_tex: mip3_tex,
-            mip3_view,
-            mip3_bg,
-            blur_param_buffers,
-            blur_param_bgs,
+            glass_targets: None,
             globals_buffer,
             globals_bg,
             sdf_buffer,
@@ -878,35 +1000,13 @@ impl WindowRenderTarget {
         self.height = height;
 
         let (tex, view, blit_bg, linear_bg) = create_canonical_target(gpu, width, height);
-        let (btex, bbg) = create_backdrop_target(gpu, width, height);
         self.canonical_tex = tex;
         self.canonical_view = view;
         self.canonical_blit_bg = blit_bg;
         self.canonical_linear_bg = linear_bg;
-        self.backdrop_tex = btex;
-        self.backdrop_bg = bbg;
 
-        let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
-        let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
-        let (w3, h3) = ((w2 / 2).max(1), (h2 / 2).max(1));
-
-        let (m1, mv1, mb1) = create_blur_target(gpu, w1, h1, "BlurMip1");
-        let (m2, mv2, mb2) = create_blur_target(gpu, w2, h2, "BlurMip2");
-        let (m3, mv3, mb3) = create_blur_target(gpu, w3, h3, "BlurMip3");
-        self._mip1_tex = m1;
-        self.mip1_view = mv1;
-        self.mip1_bg = mb1;
-        self._mip2_tex = m2;
-        self.mip2_view = mv2;
-        self.mip2_bg = mb2;
-        self._mip3_tex = m3;
-        self.mip3_view = mv3;
-        self.mip3_bg = mb3;
-
-        let uniforms = blur_pyramid_uniforms(width, height, w1, h1, w2, h2, w3, h3);
-        for (i, u) in uniforms.into_iter().enumerate() {
-            gpu.queue
-                .write_buffer(&self.blur_param_buffers[i], 0, bytemuck::bytes_of(&u));
+        if let Some(gt) = &mut self.glass_targets {
+            gt.resize(gpu, width, height);
         }
 
         let globals = GlobalsUniform {
@@ -924,7 +1024,7 @@ impl WindowRenderTarget {
         surface_format: wgpu::TextureFormat,
         clear_color: Color,
         draw_list: &DrawList,
-    ) {
+    ) -> bool {
         if draw_list.sdf_instances.len() > self.sdf_capacity {
             let new_cap = draw_list.sdf_instances.len().next_power_of_two();
             self.sdf_buffer = create_vertex_buffer::<RawSdfInstance>(&gpu.device, new_cap, "SDF");
@@ -989,6 +1089,7 @@ impl WindowRenderTarget {
         let mut is_first_pass = true;
         let mut active_scissor: Option<Rect> = None;
         let mut i = 0;
+
         while i < draw_list.batches.len() {
             match &draw_list.batches[i] {
                 DrawBatch::SetScissor(sc) => {
@@ -1005,6 +1106,10 @@ impl WindowRenderTarget {
                         is_first_pass = false;
                     }
 
+                    let gt = self
+                        .glass_targets
+                        .get_or_insert_with(|| GlassTargets::new(gpu, self.width, self.height));
+
                     encoder.copy_texture_to_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: &self.canonical_tex,
@@ -1013,7 +1118,7 @@ impl WindowRenderTarget {
                             aspect: wgpu::TextureAspect::All,
                         },
                         wgpu::TexelCopyTextureInfo {
-                            texture: &self.backdrop_tex,
+                            texture: &gt.backdrop_tex,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
@@ -1025,9 +1130,27 @@ impl WindowRenderTarget {
                         },
                     );
 
-                    run_blur_pass(&mut encoder, &gpu.blur_pipeline, &self.canonical_linear_bg, &self.blur_param_bgs[0], &self.mip1_view);
-                    run_blur_pass(&mut encoder, &gpu.blur_pipeline, &self.mip1_bg, &self.blur_param_bgs[1], &self.mip2_view);
-                    run_blur_pass(&mut encoder, &gpu.blur_pipeline, &self.mip2_bg, &self.blur_param_bgs[4], &self.mip1_view);
+                    run_blur_pass(
+                        &mut encoder,
+                        &gpu.blur_pipeline,
+                        &self.canonical_linear_bg,
+                        &gt.blur_param_bgs[0],
+                        &gt.mip1_view,
+                    );
+                    run_blur_pass(
+                        &mut encoder,
+                        &gpu.blur_pipeline,
+                        &gt.mip1_bg,
+                        &gt.blur_param_bgs[1],
+                        &gt.mip2_view,
+                    );
+                    run_blur_pass(
+                        &mut encoder,
+                        &gpu.blur_pipeline,
+                        &gt.mip2_bg,
+                        &gt.blur_param_bgs[2],
+                        &gt.mip1_view,
+                    );
 
                     {
                         let mut pass = begin_canonical_pass(
@@ -1035,13 +1158,20 @@ impl WindowRenderTarget {
                             &self.canonical_view,
                             wgpu::LoadOp::Load,
                         );
-                        apply_scissor(&mut pass, active_scissor, draw_list.scale, self.width, self.height);
-                        pass.set_pipeline(&gpu.glass_pipeline);
-                        pass.set_bind_group(0, &self.globals_bg, &[]);
-                        pass.set_bind_group(1, &self.backdrop_bg, &[]);
-                        pass.set_bind_group(2, &self.mip1_bg, &[]);
-                        pass.set_vertex_buffer(0, self.glass_buffer.slice(..));
-                        pass.draw(0..4, *idx..(*idx + 1));
+                        if apply_scissor(
+                            &mut pass,
+                            active_scissor,
+                            draw_list.scale,
+                            self.width,
+                            self.height,
+                        ) {
+                            pass.set_pipeline(&gpu.glass_pipeline);
+                            pass.set_bind_group(0, &self.globals_bg, &[]);
+                            pass.set_bind_group(1, &gt.backdrop_bg, &[]);
+                            pass.set_bind_group(2, &gt.mip1_bg, &[]);
+                            pass.set_vertex_buffer(0, self.glass_buffer.slice(..));
+                            pass.draw(0..4, *idx..(*idx + 1));
+                        }
                     }
                     i += 1;
                 }
@@ -1056,23 +1186,39 @@ impl WindowRenderTarget {
                     {
                         let mut pass =
                             begin_canonical_pass(&mut encoder, &self.canonical_view, load);
-                        apply_scissor(&mut pass, active_scissor, draw_list.scale, self.width, self.height);
+                        let mut scissor_visible = apply_scissor(
+                            &mut pass,
+                            active_scissor,
+                            draw_list.scale,
+                            self.width,
+                            self.height,
+                        );
                         while i < draw_list.batches.len() {
                             match &draw_list.batches[i] {
                                 DrawBatch::SetScissor(sc) => {
                                     active_scissor = *sc;
-                                    apply_scissor(&mut pass, active_scissor, draw_list.scale, self.width, self.height);
+                                    scissor_visible = apply_scissor(
+                                        &mut pass,
+                                        active_scissor,
+                                        draw_list.scale,
+                                        self.width,
+                                        self.height,
+                                    );
                                     i += 1;
                                 }
                                 DrawBatch::Sdf(range) => {
-                                    pass.set_pipeline(&gpu.sdf_pipeline);
-                                    pass.set_bind_group(0, &self.globals_bg, &[]);
-                                    pass.set_vertex_buffer(0, self.sdf_buffer.slice(..));
-                                    pass.draw(0..4, range.clone());
+                                    if scissor_visible {
+                                        pass.set_pipeline(&gpu.sdf_pipeline);
+                                        pass.set_bind_group(0, &self.globals_bg, &[]);
+                                        pass.set_vertex_buffer(0, self.sdf_buffer.slice(..));
+                                        pass.draw(0..4, range.clone());
+                                    }
                                     i += 1;
                                 }
                                 DrawBatch::Image { tex, range } => {
-                                    if let Some(uploaded) = gpu.textures.get(tex.0) {
+                                    if scissor_visible
+                                        && let Some(Some(uploaded)) = gpu.textures.get(tex.0)
+                                    {
                                         pass.set_pipeline(&gpu.image_pipeline);
                                         pass.set_bind_group(0, &self.globals_bg, &[]);
                                         pass.set_bind_group(1, &uploaded.bind_group, &[]);
@@ -1082,11 +1228,13 @@ impl WindowRenderTarget {
                                     i += 1;
                                 }
                                 DrawBatch::Text(range) => {
-                                    pass.set_pipeline(&gpu.text_pipeline);
-                                    pass.set_bind_group(0, &self.globals_bg, &[]);
-                                    pass.set_bind_group(1, &gpu.glyph_atlas.bind_group, &[]);
-                                    pass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
-                                    pass.draw(0..4, range.clone());
+                                    if scissor_visible {
+                                        pass.set_pipeline(&gpu.text_pipeline);
+                                        pass.set_bind_group(0, &self.globals_bg, &[]);
+                                        pass.set_bind_group(1, &gpu.glyph_atlas.bind_group, &[]);
+                                        pass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
+                                        pass.draw(0..4, range.clone());
+                                    }
                                     i += 1;
                                 }
                                 DrawBatch::Glass(_) => break,
@@ -1130,25 +1278,55 @@ impl WindowRenderTarget {
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        draw_list.atlas_overflowed
     }
 }
 
-fn blur_pyramid_uniforms(
-    w0: u32,
-    h0: u32,
-    w1: u32,
-    h1: u32,
-    w2: u32,
-    h2: u32,
-    _w3: u32,
-    _h3: u32,
-) -> [BlurUniform; 5] {
+fn apply_scissor(
+    pass: &mut wgpu::RenderPass<'_>,
+    scissor: Option<Rect>,
+    scale: f32,
+    target_width: u32,
+    target_height: u32,
+) -> bool {
+    match scissor {
+        Some(r) => {
+            let tw = target_width as f32;
+            let th = target_height as f32;
+            let x0 = (r.x * scale).round().clamp(0.0, tw) as u32;
+            let y0 = (r.y * scale).round().clamp(0.0, th) as u32;
+            let x1 = ((r.x + r.width) * scale).round().clamp(0.0, tw) as u32;
+            let y1 = ((r.y + r.height) * scale).round().clamp(0.0, th) as u32;
+            if x1 <= x0 || y1 <= y0 {
+                return false;
+            }
+            pass.set_scissor_rect(x0, y0, x1 - x0, y1 - y0);
+            true
+        }
+        None => {
+            pass.set_scissor_rect(0, 0, target_width.max(1), target_height.max(1));
+            true
+        }
+    }
+}
+
+fn blur_pyramid_uniforms(full: [u32; 2], mip1: [u32; 2], mip2: [u32; 2]) -> [BlurUniform; 3] {
     [
-        BlurUniform { texel_size: [1.0 / w0 as f32, 1.0 / h0 as f32], offset: 0.60, _pad: 0.0 },
-        BlurUniform { texel_size: [1.0 / w1 as f32, 1.0 / h1 as f32], offset: 0.50, _pad: 0.0 },
-        BlurUniform { texel_size: [1.0 / w2 as f32, 1.0 / h2 as f32], offset: 0.00, _pad: 0.0 },
-        BlurUniform { texel_size: [1.0 / w2 as f32, 1.0 / h2 as f32], offset: 0.35, _pad: 0.0 },
-        BlurUniform { texel_size: [1.0 / w2 as f32, 1.0 / h2 as f32], offset: 0.35, _pad: 0.0 },
+        BlurUniform {
+            texel_size: [1.0 / full[0] as f32, 1.0 / full[1] as f32],
+            offset: 0.60,
+            _pad: 0.0,
+        },
+        BlurUniform {
+            texel_size: [1.0 / mip1[0] as f32, 1.0 / mip1[1] as f32],
+            offset: 0.50,
+            _pad: 0.0,
+        },
+        BlurUniform {
+            texel_size: [1.0 / mip2[0] as f32, 1.0 / mip2[1] as f32],
+            offset: 0.35,
+            _pad: 0.0,
+        },
     ]
 }
 
@@ -1315,7 +1493,11 @@ fn create_blur_target(
     (texture, view, bg)
 }
 
-fn create_backdrop_target(gpu: &GpuContext, width: u32, height: u32) -> (wgpu::Texture, wgpu::BindGroup) {
+fn create_backdrop_target(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::BindGroup) {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("SteelUI Sharp Backdrop Copy"),
         size: wgpu::Extent3d {
@@ -1366,15 +1548,46 @@ fn create_sdf_pipeline(
         array_stride: std::mem::size_of::<RawSdfInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 32, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 48, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 64, shader_location: 4, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 80, shader_location: 5, format: wgpu::VertexFormat::Float32 },
-            wgpu::VertexAttribute { offset: 84, shader_location: 6, format: wgpu::VertexFormat::Float32x2 },
-            wgpu::VertexAttribute { offset: 96, shader_location: 7, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 112, shader_location: 8, format: wgpu::VertexFormat::Float32x3 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 48,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 64,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 80,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 96,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 112,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32x3,
+            },
         ],
     };
 
@@ -1430,10 +1643,26 @@ fn create_image_pipeline(
         array_stride: std::mem::size_of::<RawImageInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 32, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 48, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 48,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -1489,9 +1718,21 @@ fn create_text_pipeline(
         array_stride: std::mem::size_of::<RawGlyphInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 32, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -1595,15 +1836,51 @@ fn create_glass_pipeline(
         array_stride: std::mem::size_of::<RawGlassInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &[
-            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 16, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 32, shader_location: 2, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 48, shader_location: 3, format: wgpu::VertexFormat::Float32x4 },
-            wgpu::VertexAttribute { offset: 64, shader_location: 4, format: wgpu::VertexFormat::Float32 },
-            wgpu::VertexAttribute { offset: 68, shader_location: 5, format: wgpu::VertexFormat::Float32 },
-            wgpu::VertexAttribute { offset: 72, shader_location: 6, format: wgpu::VertexFormat::Float32 },
-            wgpu::VertexAttribute { offset: 76, shader_location: 7, format: wgpu::VertexFormat::Float32 },
-            wgpu::VertexAttribute { offset: 80, shader_location: 8, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 16,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 32,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 48,
+                shader_location: 3,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 64,
+                shader_location: 4,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 68,
+                shader_location: 5,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 72,
+                shader_location: 6,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 76,
+                shader_location: 7,
+                format: wgpu::VertexFormat::Float32,
+            },
+            wgpu::VertexAttribute {
+                offset: 80,
+                shader_location: 8,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 
@@ -1699,27 +1976,25 @@ fn create_tex_resources(
     (shader, bgl, nearest, linear)
 }
 
-fn apply_scissor(
-    pass: &mut wgpu::RenderPass<'_>,
-    scissor: Option<Rect>,
-    scale: f32,
-    target_width: u32,
-    target_height: u32,
-) {
-    match scissor {
-        Some(r) => {
-            let x = (r.x * scale).round().max(0.0) as u32;
-            let y = (r.y * scale).round().max(0.0) as u32;
-            let w = ((r.width * scale).round().max(1.0) as u32)
-                .min(target_width.saturating_sub(x))
-                .max(1);
-            let h = ((r.height * scale).round().max(1.0) as u32)
-                .min(target_height.saturating_sub(y))
-                .max(1);
-            pass.set_scissor_rect(x, y, w, h);
-        }
-        None => {
-            pass.set_scissor_rect(0, 0, target_width, target_height);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_stack_intersects_and_restores_parent_clip() {
+        let mut dl = DrawList::new(1.0);
+        dl.push_clip(Rect::new(10.0, 10.0, 200.0, 200.0));
+        dl.push_clip(Rect::new(150.0, 50.0, 100.0, 100.0));
+        assert_eq!(
+            dl.clip_stack.last().copied(),
+            Some(Rect::new(150.0, 50.0, 60.0, 100.0))
+        );
+        dl.pop_clip();
+        assert_eq!(
+            dl.clip_stack.last().copied(),
+            Some(Rect::new(10.0, 10.0, 200.0, 200.0))
+        );
+        dl.pop_clip();
+        assert_eq!(dl.clip_stack.last().copied(), None);
     }
 }
