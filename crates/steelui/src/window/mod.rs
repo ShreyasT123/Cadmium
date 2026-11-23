@@ -1,0 +1,613 @@
+use crate::Rect;
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use winit::{
+    application::ApplicationHandler,
+    dpi::LogicalSize,
+    event::{ElementState, MouseButton, WindowEvent},
+    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    window::{CursorIcon, ResizeDirection, Window, WindowId},
+};
+
+use crate::core::{Color, SteelError};
+use crate::reactive::{self, UiDispatcher};
+use crate::renderer::{DrawList, GlassQuad, GpuContext, ImageQuad, SdfQuad, WindowRenderTarget};
+use crate::text::TextEngine;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SteelWake;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStyle {
+    Default,
+    Pointer,
+    Grab,
+    Grabbing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCommand {
+    None,
+    Close,
+    Minimize,
+    ToggleMaximize,
+    RequestRedrawAll,
+}
+
+pub struct FrameContext<'a> {
+    pub width: f32,
+    pub height: f32,
+    pub scale: f32,
+    pub cursor_pos: Option<(f32, f32)>,
+    gpu: &'a mut GpuContext,
+    draw_list: DrawList,
+}
+
+impl<'a> FrameContext<'a> {
+    pub fn text_engine(&mut self) -> &mut TextEngine {
+        &mut self.gpu.text_engine
+    }
+
+    pub fn push_sdf(&mut self, quad: SdfQuad) {
+        self.draw_list.push_sdf(quad);
+    }
+
+    pub fn push_image(&mut self, img: ImageQuad) {
+        self.draw_list.push_image(img);
+    }
+
+    pub fn push_glass(&mut self, glass: GlassQuad) {
+        self.draw_list.push_glass(glass);
+    }
+
+    pub fn push_clip(&mut self, rect: Rect) {
+        self.draw_list.push_clip(rect);
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.draw_list.pop_clip();
+    }
+
+    pub fn push_text(&mut self, block: &crate::text::TextBlock, logical_x: f32, logical_y: f32) {
+        self.draw_list
+            .push_text(self.gpu, block, logical_x, logical_y);
+    }
+}
+
+pub trait WindowDelegate: 'static {
+    fn init(&mut self, _text: &mut TextEngine) {}
+    fn init_gpu(&mut self, _gpu: &mut GpuContext) {}
+    fn tick(&mut self, _dt: f32) -> bool {
+        false
+    }
+    fn on_pointer_move(&mut self, _x: f32, _y: f32) -> bool {
+        false
+    }
+    fn on_pointer_down(&mut self, _x: f32, _y: f32) -> (bool, WindowCommand) {
+        (false, WindowCommand::None)
+    }
+    fn on_pointer_up(&mut self) -> bool {
+        false
+    }
+    fn on_scroll(&mut self, _delta_x: f32, _delta_y: f32) -> bool {
+        false
+    }
+    fn on_key(
+        &mut self,
+        _key: &winit::keyboard::Key,
+        _text: Option<&str>,
+        _modifiers: &crate::events::Modifiers,
+    ) -> bool {
+        false
+    }
+    fn is_drag_region(&self, _x: f32, _y: f32) -> bool {
+        false
+    }
+    fn cursor_style(&self) -> CursorStyle {
+        CursorStyle::Default
+    }
+    fn render(&mut self, ctx: &mut FrameContext<'_>);
+}
+
+pub struct WindowSpec {
+    pub title: String,
+    pub width: f64,
+    pub height: f64,
+    pub borderless: bool,
+    pub clear_color: Color,
+    pub delegate: Box<dyn WindowDelegate>,
+}
+
+struct WindowContext {
+    surface: wgpu::Surface<'static>,
+    window: Arc<Window>,
+    config: wgpu::SurfaceConfiguration,
+    target: WindowRenderTarget,
+    borderless: bool,
+    clear_color: Color,
+    cursor_pos: Option<(f32, f32)>,
+    last_tick: Instant,
+    delegate: Box<dyn WindowDelegate>,
+}
+
+impl WindowContext {
+    fn configure_surface(&self, gpu: &GpuContext) {
+        self.surface.configure(&gpu.device, &self.config);
+    }
+
+    fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        self.config.width = width;
+        self.config.height = height;
+        self.configure_surface(gpu);
+        self.target.resize(gpu, width, height);
+    }
+
+    fn resize_edge(&self, lx: f32, ly: f32) -> Option<ResizeDirection> {
+        if !self.borderless || self.window.is_maximized() {
+            return None;
+        }
+        let scale = self.window.scale_factor() as f32;
+        let w = self.config.width as f32 / scale;
+        let h = self.config.height as f32 / scale;
+        let m = 6.0;
+
+        let left = lx <= m;
+        let right = lx >= w - m;
+        let top = ly <= m;
+        let bottom = ly >= h - m;
+
+        match (left, right, top, bottom) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(ResizeDirection::West),
+            (_, true, _, _) => Some(ResizeDirection::East),
+            (_, _, true, _) => Some(ResizeDirection::North),
+            (_, _, _, true) => Some(ResizeDirection::South),
+            _ => None,
+        }
+    }
+
+    fn render(&mut self, gpu: &mut GpuContext) {
+        if self.config.width == 0 || self.config.height == 0 {
+            return;
+        }
+
+        reactive::flush_effects();
+
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.last_tick)
+            .as_secs_f32()
+            .clamp(0.0001, 0.05);
+        self.last_tick = now;
+        let animating = self.delegate.tick(dt);
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                drop(frame);
+                let size = self.window.inner_size();
+                if size.width > 0 && size.height > 0 {
+                    self.resize(gpu, size.width, size.height);
+                    self.window.request_redraw();
+                }
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                let size = self.window.inner_size();
+                if size.width > 0 && size.height > 0 {
+                    self.resize(gpu, size.width, size.height);
+                    self.window.request_redraw();
+                }
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                let size = self.window.inner_size();
+                self.resize(gpu, size.width, size.height);
+                self.window.request_redraw();
+                return;
+            }
+        };
+
+        let scale = self.window.scale_factor() as f32;
+        let logical_w = self.config.width as f32 / scale;
+        let logical_h = self.config.height as f32 / scale;
+
+        let mut frame_ctx = FrameContext {
+            width: logical_w,
+            height: logical_h,
+            scale,
+            cursor_pos: self.cursor_pos,
+            gpu,
+            draw_list: DrawList::new(scale),
+        };
+        self.delegate.render(&mut frame_ctx);
+        let draw_list = frame_ctx.draw_list;
+
+        let surface_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.target.render(
+            gpu,
+            &surface_view,
+            self.config.format,
+            self.clear_color,
+            &draw_list,
+        );
+
+        gpu.queue.present(frame);
+
+        if animating {
+            self.window.request_redraw();
+        }
+    }
+}
+
+pub struct App {
+    pending_windows: Vec<WindowSpec>,
+    gpu: Option<GpuContext>,
+    windows: HashMap<WindowId, WindowContext>,
+    modifiers: crate::events::Modifiers,
+    initialized: bool,
+    async_tx: Sender<Box<dyn FnOnce() + Send>>,
+    async_rx: Receiver<Box<dyn FnOnce() + Send>>,
+    proxy_slot: Arc<Mutex<Option<EventLoopProxy<SteelWake>>>>,
+    wake_fn: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl App {
+    pub fn new() -> Self {
+        let (async_tx, async_rx) = mpsc::channel();
+        let proxy_slot: Arc<Mutex<Option<EventLoopProxy<SteelWake>>>> = Arc::new(Mutex::new(None));
+        let slot_clone = proxy_slot.clone();
+        let wake_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Ok(guard) = slot_clone.lock() {
+                if let Some(proxy) = &*guard {
+                    let _ = proxy.send_event(SteelWake);
+                }
+            }
+        });
+        reactive::set_wake_callback(wake_fn.clone());
+
+        Self {
+            pending_windows: Vec::new(),
+            gpu: None,
+            windows: HashMap::new(),
+            modifiers: crate::events::Modifiers::default(),
+            initialized: false,
+            async_tx,
+            async_rx,
+            proxy_slot,
+            wake_fn,
+        }
+    }
+
+    pub fn dispatcher(&self) -> UiDispatcher {
+        UiDispatcher::new(self.async_tx.clone(), self.wake_fn.clone())
+    }
+
+    pub fn add_window(mut self, spec: WindowSpec) -> Self {
+        self.pending_windows.push(spec);
+        self
+    }
+
+    pub fn run(mut self) -> Result<(), SteelError> {
+        let event_loop = EventLoop::<SteelWake>::with_user_event().build()?;
+        let proxy = event_loop.create_proxy();
+        *self.proxy_slot.lock().unwrap() = Some(proxy);
+        event_loop.run_app(&mut self)?;
+        Ok(())
+    }
+
+    fn drain_async_tasks(&mut self) {
+        let mut ran = false;
+        while let Ok(task) = self.async_rx.try_recv() {
+            task();
+            ran = true;
+        }
+        if ran {
+            reactive::flush_effects();
+            for win in self.windows.values() {
+                win.window.request_redraw();
+            }
+        }
+    }
+
+    fn spawn_window(
+        event_loop: &ActiveEventLoop,
+        gpu: &mut Option<GpuContext>,
+        mut spec: WindowSpec,
+    ) -> Result<(WindowId, WindowContext), SteelError> {
+        let attrs = Window::default_attributes()
+            .with_title(spec.title)
+            .with_decorations(!spec.borderless)
+            .with_inner_size(LogicalSize::new(spec.width, spec.height));
+
+        let window = Arc::new(event_loop.create_window(attrs)?);
+        let id = window.id();
+
+        let instance = match gpu {
+            Some(ctx) => ctx.instance.clone(),
+            None => wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
+                Box::new(event_loop.owned_display_handle()),
+            )),
+        };
+
+        let surface = instance.create_surface(window.clone())?;
+
+        if gpu.is_none() {
+            let ctx = pollster::block_on(GpuContext::new(instance, Some(&surface)))?;
+            *gpu = Some(ctx);
+        }
+
+        let ctx = gpu.as_mut().expect("GpuContext initialized");
+        spec.delegate.init(&mut ctx.text_engine);
+        spec.delegate.init_gpu(ctx);
+
+        let caps = surface.get_capabilities(&ctx.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+        surface.configure(&ctx.device, &config);
+
+        let target = WindowRenderTarget::new(ctx, config.width, config.height);
+        window.request_redraw();
+
+        Ok((
+            id,
+            WindowContext {
+                surface,
+                window,
+                config,
+                target,
+                borderless: spec.borderless,
+                clear_color: spec.clear_color,
+                cursor_pos: None,
+                last_tick: Instant::now(),
+                delegate: spec.delegate,
+            },
+        ))
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApplicationHandler<SteelWake> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+
+        let specs = std::mem::take(&mut self.pending_windows);
+        for spec in specs {
+            match Self::spawn_window(event_loop, &mut self.gpu, spec) {
+                Ok((id, win_ctx)) => {
+                    self.windows.insert(id, win_ctx);
+                }
+                Err(err) => {
+                    tracing::error!("Failed to open window: {err}");
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
+        self.drain_async_tasks();
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: SteelWake) {
+        self.drain_async_tasks();
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::ModifiersChanged(mods) => {
+                let state = mods.state();
+                self.modifiers = crate::events::Modifiers {
+                    shift: state.shift_key(),
+                    ctrl: state.control_key(),
+                    alt: state.alt_key(),
+                    super_key: state.super_key(),
+                };
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
+                };
+                if let Some(win) = self.windows.get_mut(&id) {
+                    if win.delegate.on_scroll(dx, dy) {
+                        reactive::flush_effects();
+                        win.last_tick = Instant::now();
+                        win.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state.is_pressed() {
+                    let text = event.text.as_deref();
+                    if let Some(win) = self.windows.get_mut(&id) {
+                        if win
+                            .delegate
+                            .on_key(&event.logical_key, text, &self.modifiers)
+                        {
+                            reactive::flush_effects();
+                            win.last_tick = Instant::now();
+                            win.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::CloseRequested => {
+                self.windows.remove(&id);
+                if self.windows.is_empty() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::Resized(size) => {
+                if let (Some(gpu), Some(win)) = (&self.gpu, self.windows.get_mut(&id)) {
+                    win.resize(gpu, size.width, size.height);
+                    win.window.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(win) = self.windows.get(&id) {
+                    win.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(win) = self.windows.get_mut(&id) {
+                    let scale = win.window.scale_factor() as f32;
+                    let lx = position.x as f32 / scale;
+                    let ly = position.y as f32 / scale;
+                    win.cursor_pos = Some((lx, ly));
+
+                    let cursor = match win.resize_edge(lx, ly) {
+                        Some(ResizeDirection::North | ResizeDirection::South) => {
+                            CursorIcon::NsResize
+                        }
+                        Some(ResizeDirection::East | ResizeDirection::West) => CursorIcon::EwResize,
+                        Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => {
+                            CursorIcon::NwseResize
+                        }
+                        Some(ResizeDirection::NorthEast | ResizeDirection::SouthWest) => {
+                            CursorIcon::NeswResize
+                        }
+                        None => match win.delegate.cursor_style() {
+                            CursorStyle::Default => CursorIcon::Default,
+                            CursorStyle::Pointer => CursorIcon::Pointer,
+                            CursorStyle::Grab => CursorIcon::Grab,
+                            CursorStyle::Grabbing => CursorIcon::Grabbing,
+                        },
+                    };
+                    win.window.set_cursor(cursor);
+
+                    if win.delegate.on_pointer_move(lx, ly) {
+                        reactive::flush_effects();
+                        win.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(win) = self.windows.get_mut(&id) {
+                    win.cursor_pos = None;
+                    win.window.set_cursor(CursorIcon::Default);
+                    if win.delegate.on_pointer_move(-1.0, -1.0) {
+                        win.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let mut command = WindowCommand::None;
+                let mut redraw = false;
+
+                if let Some(win) = self.windows.get_mut(&id) {
+                    if let Some((lx, ly)) = win.cursor_pos {
+                        if let Some(dir) = win.resize_edge(lx, ly) {
+                            let _ = win.window.drag_resize_window(dir);
+                            return;
+                        }
+                        let (handled, cmd) = win.delegate.on_pointer_down(lx, ly);
+                        command = cmd;
+                        redraw = handled;
+                        if !handled
+                            && cmd == WindowCommand::None
+                            && win.delegate.is_drag_region(lx, ly)
+                        {
+                            let _ = win.window.drag_window();
+                            return;
+                        }
+                    }
+                }
+
+                reactive::flush_effects();
+
+                match command {
+                    WindowCommand::Close => {
+                        self.windows.remove(&id);
+                        if self.windows.is_empty() {
+                            event_loop.exit();
+                        }
+                    }
+                    WindowCommand::Minimize => {
+                        if let Some(win) = self.windows.get(&id) {
+                            win.window.set_minimized(true);
+                        }
+                    }
+                    WindowCommand::ToggleMaximize => {
+                        if let Some(win) = self.windows.get(&id) {
+                            win.window.set_maximized(!win.window.is_maximized());
+                        }
+                    }
+                    WindowCommand::RequestRedrawAll => {
+                        for win in self.windows.values() {
+                            win.window.request_redraw();
+                        }
+                    }
+                    WindowCommand::None => {
+                        if redraw {
+                            if let Some(win) = self.windows.get_mut(&id) {
+                                win.last_tick = Instant::now();
+                                win.window.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(win) = self.windows.get_mut(&id) {
+                    if win.delegate.on_pointer_up() {
+                        reactive::flush_effects();
+                        win.last_tick = Instant::now();
+                        win.window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let (Some(gpu), Some(win)) = (&mut self.gpu, self.windows.get_mut(&id)) {
+                    win.render(gpu);
+                }
+            }
+            _ => {}
+        }
+    }
+}

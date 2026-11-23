@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/steelui",
+    "apps/dogfood",
+    "examples/liquid_glass",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+steelui = { path = "crates/steelui" }
+
+# Graphics, Windowing & Math
+wgpu = "30.0"
+winit = "0.30"
+bytemuck = { version = "1.25", features = ["derive"] }
+
+# Layout & Text
+taffy = "0.15"
+cosmic-text = "0.19"
+swash = "0.2"
+
+# Assets & Media
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+resvg = "0.50"
+
+# Platform & Accessibility
+accesskit = "0.25"
+arboard = "3.7"
+rfd = "0.17"
+
+# Core Utilities, Async & Diagnostics
+slotmap = "1.1"
+pollster = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
