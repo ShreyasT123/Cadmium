@@ -1,6 +1,6 @@
 <div align="center">
 
-# SteelUI
+# Cadmium
 
 **A GPU-native, reactive desktop GUI framework for Rust.**  
 *Crafted for fluid motion, refined typography, and authentic macOS-grade Liquid Glass aesthetics across Windows, Linux, and macOS.*
@@ -119,7 +119,7 @@ fn main() {
     });
 
     app.add_window(WindowSpec {
-        title: "SteelUI App".into(),
+        title: "Cadmium App".into(),
         width: 800.0,
         height: 500.0,
         borderless: false,
@@ -133,7 +133,7 @@ fn main() {
 
 ## Interactive Examples
 
-Run any of the included reference applications to explore SteelUI:
+Run any of the included reference applications to explore Cadmium:
 
 ### 1. Liquid Glass Menu & Interactive Conic Pill
 Features elastic spring drag-and-drop, SVG icon rendering, crystal-clear optical refraction, and a dynamic conic-bordered glass button:
@@ -141,7 +141,7 @@ Features elastic spring drag-and-drop, SVG icon rendering, crystal-clear optical
 cargo run -p liquid_glass
 ```
 
-### 2. SteelUI Studio (Dogfood App)
+### 2. Cadmium Studio (Dogfood App)
 Demonstrates the retained `WidgetArena`, reactive `Signal` updates, background worker dispatching via `UiDispatcher`, clipboard integration, and native file dialogs:
 ```powershell
 cargo run -p cadmium_dogfood
@@ -166,7 +166,7 @@ We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.m
 
 ## License
 
-SteelUI is dual-licensed under either:
+Cadmium is dual-licensed under either:
 
 * **MIT License** ([LICENSE-MIT](LICENSE-MIT))
 * **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
