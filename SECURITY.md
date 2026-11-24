@@ -3,7 +3,7 @@
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in SteelUI, please **do not** open a public issue.
-Instead, send an email to security@steelui.dev with details about:
+Instead, send an email to security@cadmium.dev with details about:
 
 * The affected versions
 * A description of the vulnerability

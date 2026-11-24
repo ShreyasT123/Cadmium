@@ -1,11 +1,11 @@
 [package]
-name = "steelui_dogfood"
+name = "cadmium_dogfood"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-steelui.workspace = true
+cadmium.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 wgpu.workspace = true

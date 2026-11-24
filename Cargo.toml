@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/steelui",
+    "crates/cadmium",
     "apps/dogfood",
     "examples/liquid_glass",
 ]
@@ -11,10 +11,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Shreyas Thale"]
-repository = "https://github.com/ShreyasT123/steelui"
+repository = "https://github.com/ShreyasT123/cadmium"
 
 [workspace.dependencies]
-steelui = { path = "crates/steelui" }
+cadmium = { path = "crates/cadmium" }
 
 # Graphics & Windowing
 wgpu = "30.0"

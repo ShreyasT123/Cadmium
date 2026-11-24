@@ -1414,7 +1414,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "liquid_glass"
 version = "0.1.0"
 dependencies = [
- "steelui",
+ "cadmium",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2776,7 +2776,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "steelui"
+name = "cadmium"
 version = "0.1.0"
 dependencies = [
  "accesskit",
@@ -2799,11 +2799,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "steelui_dogfood"
+name = "cadmium_dogfood"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "steelui",
+ "cadmium",
  "tracing",
  "tracing-subscriber",
  "wgpu",

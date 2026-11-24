@@ -7,7 +7,7 @@
 
 **Early experimental prototype (`v0.1.0`) — active Phase 3 development.**
 
-[![CI](https://github.com/ShreyasT123/steelui/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreyasT123/steelui/actions)
+[![CI](https://github.com/ShreyasT123/cadmium/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreyasT123/cadmium/actions)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![GPU](https://img.shields.io/badge/graphics-wgpu%2030-purple.svg)](https://wgpu.rs)
@@ -67,7 +67,7 @@
 Construct reactive desktop interfaces using declarative builders and copyable signals without fighting the Rust borrow checker:
 
 ```rust
-use steelui::{
+use cadmium::{
     create_signal, AlignItems, App, Button, Column, Container,
     Edges, FontWeight, Length, MacTheme, Row, Slider, Spacer,
     Switch, Text, WidgetWindow, WindowSpec,
@@ -144,7 +144,7 @@ cargo run -p liquid_glass
 ### 2. SteelUI Studio (Dogfood App)
 Demonstrates the retained `WidgetArena`, reactive `Signal` updates, background worker dispatching via `UiDispatcher`, clipboard integration, and native file dialogs:
 ```powershell
-cargo run -p steelui_dogfood
+cargo run -p cadmium_dogfood
 ```
 
 ---
