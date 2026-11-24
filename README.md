@@ -18,7 +18,7 @@
 
 ## Highlights
 
-* **Powered by Magnum:** A custom GPU-native 2D rendering pipeline built directly on `wgpu` and WGSL. No Skia, no WebViews, no Chromium, and no native OS widget wrapping.
+* **Powered by Xune:** A custom GPU-native 2D rendering pipeline built directly on `wgpu` and WGSL. No Skia, no WebViews, no Chromium, and no native OS widget wrapping.
 * **Optical Liquid Glass:** Custom multi-pass shaders combining monotonic convex bezel refraction, chromatic aberration (RGB dispersion), dual-layer backdrop diffusion (sharp bezel + Gaussian core), and directional 45° opposing-corner specular catchlights.
 * **Retained Widget Arena & Fine-Grained Signals:** Generational arena-backed widget tree (`slotmap`) paired with fine-grained reactive `Signal<T>` primitives. Subscribed widgets update their paint/layout state with zero full-tree reconstruction.
 * **3-Stage Invalidation Pipeline:** Separates updates into `STATE` → `LAYOUT` → `PAINT`. Changing a hover state or dragging a slider bypasses layout recalculation entirely, maintaining a solid 60–144+ FPS and **dropping to 0% CPU/GPU when idle**.
@@ -41,7 +41,7 @@
          v                                                 v
 +-------------------+                             +-------------------+
 |   Widget Arena    |  (Generational SlotMap)     |   GpuContext      |  (Shared wgpu device,
-|   + Signal Graph  |  (Fine-grained reactivity)  |   Magnum Engine   |   pipelines & atlases)
+|   + Signal Graph  |  (Fine-grained reactivity)  |   Xune Engine   |   pipelines & atlases)
 +---------+---------+                             +---------+---------+
           |                                                 |
           |  1. Reactive Flush                              |
@@ -49,7 +49,7 @@
           |  3. DisplayList Recording                       |
           v                                                 v
 +---------------------------------------------------------------------+
-|                           Magnum Engine                             |
+|                           Xune Engine                             |
 |  - Pass 1: Canonical Offscreen Target (Rgba8UnormSrgb)              |
 |      * Instanced Analytical SDFs (boxes, radii, borders, shadows)   |
 |      * Batched GPU Text (cosmic-text + swash shelf atlas)           |
