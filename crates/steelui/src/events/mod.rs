@@ -4,6 +4,24 @@ new_key_type! {
     pub struct WidgetId;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    Character(String),
+    Backspace,
+    Delete,
+    Enter,
+    Tab,
+    Escape,
+    Space,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerButton {
     Left,
@@ -48,7 +66,7 @@ pub enum UiEvent {
     FocusGained,
     FocusLost,
     KeyDown {
-        key: String,
+        key: Key,
         modifiers: Modifiers,
     },
 }

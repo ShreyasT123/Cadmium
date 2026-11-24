@@ -5,22 +5,24 @@ use std::time::{Duration, Instant};
 
 use slotmap::SlotMap;
 
+use crate::accessibility::{A11yAction, A11yNodeRecord, A11yRole, SemanticTree};
 use crate::animation::Spring;
 use crate::core::{Color, CornerRadii, Rect};
 use crate::debug::FrameProfiler;
-use crate::events::{FocusManager, Modifiers, WidgetId};
+use crate::events::{FocusManager, Key, Modifiers, WidgetId};
 use crate::layout::{
     AlignItems, Edges, FlexDir, JustifyContent, LayoutEngine, LayoutNode, LayoutStyle, Length,
     snap_rect_to_pixels,
 };
 use crate::platform::Clipboard;
 use crate::reactive::{EffectId, Signal, create_effect, dispose_effect};
-use crate::renderer::{GlassQuad, SdfQuad};
+use crate::renderer::{ATLAS_FORMAT, GlassQuad, ImageQuad, SdfQuad, TextureHandle};
 use crate::style::{MacTheme, Material, Shadow, ThemeMode};
 use crate::text::{FontWeight, TextBlock, TextEngine, TextStyle};
 use crate::window::{CursorStyle, FrameContext, WindowCommand, WindowDelegate};
 
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const TOOLTIP_HOVER_DELAY: Duration = Duration::from_millis(450);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DirtyFlags {
@@ -72,6 +74,42 @@ fn lookup_offset_x(char_offsets: &[(usize, f32)], byte_idx: usize) -> f32 {
     char_offsets.last().map(|&(_, x)| x).unwrap_or(0.0)
 }
 
+pub struct MenuItem {
+    pub label: Option<String>,
+    pub on_select: Option<Box<dyn FnMut()>>,
+}
+
+impl MenuItem {
+    pub fn new(label: impl Into<String>, on_select: impl FnMut() + 'static) -> Self {
+        Self {
+            label: Some(label.into()),
+            on_select: Some(Box::new(on_select)),
+        }
+    }
+
+    pub fn separator() -> Self {
+        Self {
+            label: None,
+            on_select: None,
+        }
+    }
+}
+
+pub trait CustomGpuPass: 'static {
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        time_secs: f32,
+    );
+}
+
 pub enum Element {
     Container(Container),
     Glass(GlassPanel),
@@ -81,8 +119,11 @@ pub enum Element {
     Slider(Slider),
     TextInput(TextInput),
     ScrollView(ScrollView),
+    SplitPane(SplitPane),
+    VirtualizedList(VirtualizedList),
     Tabs(Tabs),
     Dropdown(Dropdown),
+    CustomGpuSurface(CustomGpuSurface),
     TrafficLights(TrafficLights),
     Divider(Divider),
     Spacer(Spacer),
@@ -101,9 +142,12 @@ impl IntoElement for Element {
 pub struct Container {
     layout: LayoutStyle,
     material: Material,
+    material_signal: Option<Signal<Material>>,
     radius: f32,
     radius_signal: Option<Signal<f32>>,
     is_drag_region: bool,
+    tooltip: Option<String>,
+    context_menu: Vec<MenuItem>,
     children: Vec<Element>,
 }
 
@@ -112,9 +156,12 @@ impl Container {
         Self {
             layout: LayoutStyle::default(),
             material: Material::solid(Color::TRANSPARENT),
+            material_signal: None,
             radius: 0.0,
             radius_signal: None,
             is_drag_region: false,
+            tooltip: None,
+            context_menu: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -169,6 +216,12 @@ impl Container {
 
     pub fn material(mut self, mat: Material) -> Self {
         self.material = mat;
+        self
+    }
+
+    pub fn bind_material(mut self, sig: Signal<Material>) -> Self {
+        self.material = sig.try_get().unwrap_or(self.material);
+        self.material_signal = Some(sig);
         self
     }
 
@@ -237,6 +290,19 @@ impl Container {
 
     pub fn drag_region(mut self) -> Self {
         self.is_drag_region = true;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn context_menu<I>(mut self, items: I) -> Self
+    where
+        I: IntoIterator<Item = MenuItem>,
+    {
+        self.context_menu.extend(items);
         self
     }
 
@@ -409,6 +475,7 @@ impl IntoElement for Text {
 pub struct Button {
     label: String,
     accent: bool,
+    tooltip: Option<String>,
     on_click: Option<Box<dyn FnMut()>>,
 }
 
@@ -417,12 +484,18 @@ impl Button {
         Self {
             label: label.into(),
             accent: false,
+            tooltip: None,
             on_click: None,
         }
     }
 
     pub fn primary(mut self) -> Self {
         self.accent = true;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 
@@ -440,11 +513,20 @@ impl IntoElement for Button {
 
 pub struct Switch {
     signal: Signal<bool>,
+    tooltip: Option<String>,
 }
 
 impl Switch {
     pub fn new(signal: Signal<bool>) -> Self {
-        Self { signal }
+        Self {
+            signal,
+            tooltip: None,
+        }
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
     }
 }
 
@@ -459,6 +541,7 @@ pub struct Slider {
     min: f32,
     max: f32,
     width: f32,
+    tooltip: Option<String>,
 }
 
 impl Slider {
@@ -468,11 +551,17 @@ impl Slider {
             min,
             max,
             width: 160.0,
+            tooltip: None,
         }
     }
 
     pub fn width(mut self, width: f32) -> Self {
         self.width = width;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 }
@@ -488,6 +577,7 @@ pub struct TextInput {
     placeholder: String,
     material: Material,
     width: Length,
+    tooltip: Option<String>,
 }
 
 impl TextInput {
@@ -497,6 +587,7 @@ impl TextInput {
             placeholder: "Search or type...".into(),
             material: Material::solid(Color::from_rgba8(255, 255, 255, 240)),
             width: Length::Px(240.0),
+            tooltip: None,
         }
     }
 
@@ -512,6 +603,11 @@ impl TextInput {
 
     pub fn width(mut self, w: Length) -> Self {
         self.width = w;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 }
@@ -588,6 +684,7 @@ pub struct Tabs {
     items: Vec<String>,
     material: Material,
     width: Length,
+    tooltip: Option<String>,
 }
 
 impl Tabs {
@@ -604,6 +701,7 @@ impl Tabs {
                 shadow: None,
             },
             width: Length::Auto,
+            tooltip: None,
         }
     }
 
@@ -614,6 +712,11 @@ impl Tabs {
 
     pub fn width(mut self, w: Length) -> Self {
         self.width = w;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
         self
     }
 }
@@ -629,6 +732,7 @@ pub struct Dropdown {
     items: Vec<String>,
     material: Material,
     width: Length,
+    tooltip: Option<String>,
 }
 
 impl Dropdown {
@@ -645,6 +749,7 @@ impl Dropdown {
                 shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 18), 4.0, 1.0)),
             },
             width: Length::Px(160.0),
+            tooltip: None,
         }
     }
 
@@ -657,11 +762,209 @@ impl Dropdown {
         self.width = w;
         self
     }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
 }
 
 impl IntoElement for Dropdown {
     fn into_element(self) -> Element {
         Element::Dropdown(self)
+    }
+}
+
+pub struct CustomGpuSurface {
+    layout: LayoutStyle,
+    radius: f32,
+    radius_signal: Option<Signal<f32>>,
+    animate_signal: Option<Signal<bool>>,
+    tooltip: Option<String>,
+    context_menu: Vec<MenuItem>,
+    pass: Box<dyn CustomGpuPass>,
+}
+
+impl CustomGpuSurface {
+    pub fn new(pass: impl CustomGpuPass) -> Self {
+        Self {
+            layout: LayoutStyle::default(),
+            radius: 12.0,
+            radius_signal: None,
+            animate_signal: None,
+            tooltip: None,
+            context_menu: Vec::new(),
+            pass: Box::new(pass),
+        }
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.layout.width = w;
+        self
+    }
+
+    pub fn height(mut self, h: Length) -> Self {
+        self.layout.height = h;
+        self
+    }
+
+    pub fn flex_grow(mut self, g: f32) -> Self {
+        self.layout.flex_grow = g;
+        self
+    }
+
+    pub fn radius(mut self, r: f32) -> Self {
+        self.radius = r;
+        self
+    }
+
+    pub fn bind_radius(mut self, sig: Signal<f32>) -> Self {
+        self.radius = sig.try_get().unwrap_or(self.radius);
+        self.radius_signal = Some(sig);
+        self
+    }
+
+    pub fn animate_when(mut self, sig: Signal<bool>) -> Self {
+        self.animate_signal = Some(sig);
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn context_menu<I>(mut self, items: I) -> Self
+    where
+        I: IntoIterator<Item = MenuItem>,
+    {
+        self.context_menu.extend(items);
+        self
+    }
+}
+
+impl IntoElement for CustomGpuSurface {
+    fn into_element(self) -> Element {
+        Element::CustomGpuSurface(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+pub struct SplitPane {
+    direction: SplitDirection,
+    ratio: Signal<f32>,
+    min_ratio: f32,
+    max_ratio: f32,
+    first: Option<Box<Element>>,
+    second: Option<Box<Element>>,
+    divider_color: Option<Color>,
+}
+
+impl SplitPane {
+    pub fn horizontal(ratio: Signal<f32>) -> Self {
+        Self::new(SplitDirection::Horizontal, ratio)
+    }
+
+    pub fn vertical(ratio: Signal<f32>) -> Self {
+        Self::new(SplitDirection::Vertical, ratio)
+    }
+
+    pub fn new(direction: SplitDirection, ratio: Signal<f32>) -> Self {
+        Self {
+            direction,
+            ratio,
+            min_ratio: 0.15,
+            max_ratio: 0.85,
+            first: None,
+            second: None,
+            divider_color: None,
+        }
+    }
+
+    pub fn bounds(mut self, min_ratio: f32, max_ratio: f32) -> Self {
+        self.min_ratio = min_ratio.clamp(0.05, 0.90);
+        self.max_ratio = max_ratio.clamp(self.min_ratio, 0.95);
+        self
+    }
+
+    pub fn divider_color(mut self, color: Color) -> Self {
+        self.divider_color = Some(color);
+        self
+    }
+
+    pub fn first(mut self, elem: impl IntoElement) -> Self {
+        self.first = Some(Box::new(elem.into_element()));
+        self
+    }
+
+    pub fn second(mut self, elem: impl IntoElement) -> Self {
+        self.second = Some(Box::new(elem.into_element()));
+        self
+    }
+}
+
+impl IntoElement for SplitPane {
+    fn into_element(self) -> Element {
+        Element::SplitPane(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VirtualRow {
+    pub title: String,
+    pub subtitle: String,
+    pub badge: String,
+}
+
+pub struct VirtualizedList {
+    item_count: usize,
+    item_height: f32,
+    gap: f32,
+    selected: Option<Signal<usize>>,
+    on_select: Option<Box<dyn FnMut(usize)>>,
+    row_builder: Box<dyn FnMut(usize) -> VirtualRow>,
+}
+
+impl VirtualizedList {
+    pub fn new(
+        item_count: usize,
+        item_height: f32,
+        row_builder: impl FnMut(usize) -> VirtualRow + 'static,
+    ) -> Self {
+        Self {
+            item_count,
+            item_height: item_height.max(20.0),
+            gap: 6.0,
+            selected: None,
+            on_select: None,
+            row_builder: Box::new(row_builder),
+        }
+    }
+
+    pub fn gap(mut self, g: f32) -> Self {
+        self.gap = g.max(0.0);
+        self
+    }
+
+    pub fn selected(mut self, sig: Signal<usize>) -> Self {
+        self.selected = Some(sig);
+        self
+    }
+
+    pub fn on_select(mut self, f: impl FnMut(usize) + 'static) -> Self {
+        self.on_select = Some(Box::new(f));
+        self
+    }
+}
+
+impl IntoElement for VirtualizedList {
+    fn into_element(self) -> Element {
+        Element::VirtualizedList(self)
     }
 }
 
@@ -697,9 +1000,36 @@ impl IntoElement for Spacer {
     }
 }
 
+struct CustomSurfaceState {
+    pass: Box<dyn CustomGpuPass>,
+    handle: Option<TextureHandle>,
+    view: Option<wgpu::TextureView>,
+    size: (u32, u32),
+}
+
+struct VirtualRowSlot {
+    cached_index: Option<usize>,
+    title: TextBlock,
+    subtitle: TextBlock,
+    badge: TextBlock,
+    badge_width: f32,
+}
+
+struct VirtualListState {
+    item_count: usize,
+    item_height: f32,
+    gap: f32,
+    scroll_y: Spring,
+    hovered_row: Option<usize>,
+    selected: Option<Signal<usize>>,
+    on_select: Option<Box<dyn FnMut(usize)>>,
+    row_builder: Box<dyn FnMut(usize) -> VirtualRow>,
+    pool: Vec<VirtualRowSlot>,
+}
+
 enum WidgetPayload {
     Container {
-        material: Material,
+        material: Rc<Cell<Material>>,
         radius: Rc<Cell<f32>>,
         is_drag_region: bool,
     },
@@ -736,10 +1066,23 @@ enum WidgetPayload {
         content_height: f32,
         content_id: WidgetId,
     },
+    SplitPane {
+        direction: SplitDirection,
+        ratio: Signal<f32>,
+        min_ratio: f32,
+        max_ratio: f32,
+        first_id: WidgetId,
+        divider_id: WidgetId,
+        divider_color: Option<Color>,
+    },
+    VirtualizedList {
+        state: RefCell<VirtualListState>,
+    },
     Tabs {
         signal: Signal<usize>,
         items: Vec<String>,
         labels: Vec<TextBlock>,
+        label_widths: Vec<f32>,
         material: Material,
         pill_spring: Spring,
     },
@@ -751,6 +1094,11 @@ enum WidgetPayload {
         material: Material,
         is_open: bool,
         chevron: TextBlock,
+    },
+    CustomGpuSurface {
+        radius: Rc<Cell<f32>>,
+        animate_signal: Option<Signal<bool>>,
+        state: RefCell<CustomSurfaceState>,
     },
     TrafficLights {
         hovered: bool,
@@ -767,6 +1115,8 @@ struct WidgetNode {
     layout_style: LayoutStyle,
     bounds: Rect,
     owned_effects: Vec<EffectId>,
+    tooltip: Option<String>,
+    context_menu: Vec<MenuItem>,
     payload: WidgetPayload,
 }
 
@@ -780,6 +1130,9 @@ pub struct WidgetArena {
     scroll_ids: Vec<WidgetId>,
     tab_ids: Vec<WidgetId>,
     traffic_ids: Vec<WidgetId>,
+    custom_surface_ids: Vec<WidgetId>,
+    split_ids: Vec<WidgetId>,
+    virtual_list_ids: Vec<WidgetId>,
     needs_layout: bool,
 }
 
@@ -795,6 +1148,9 @@ impl WidgetArena {
             scroll_ids: Vec::new(),
             tab_ids: Vec::new(),
             traffic_ids: Vec::new(),
+            custom_surface_ids: Vec::new(),
+            split_ids: Vec::new(),
+            virtual_list_ids: Vec::new(),
             needs_layout: true,
         }
     }
@@ -819,6 +1175,9 @@ impl WidgetArena {
         self.scroll_ids.clear();
         self.tab_ids.clear();
         self.traffic_ids.clear();
+        self.custom_surface_ids.clear();
+        self.split_ids.clear();
+        self.virtual_list_ids.clear();
         self.focus = FocusManager::new();
         self.root = None;
     }
@@ -837,6 +1196,7 @@ impl WidgetArena {
                     .collect();
                 let lnode = self.layout.new_container(c.layout, &child_layout_nodes);
                 let radius_cell = Rc::new(Cell::new(c.radius));
+                let material_cell = Rc::new(Cell::new(c.material));
 
                 let id = self.nodes.insert(WidgetNode {
                     children: child_ids,
@@ -844,8 +1204,10 @@ impl WidgetArena {
                     layout_style: c.layout,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: c.tooltip,
+                    context_menu: c.context_menu,
                     payload: WidgetPayload::Container {
-                        material: c.material,
+                        material: material_cell.clone(),
                         radius: radius_cell.clone(),
                         is_drag_region: c.is_drag_region,
                     },
@@ -855,16 +1217,37 @@ impl WidgetArena {
                 if let Some(sig) = c.radius_signal {
                     let q = self.dirty_queue.clone();
                     let eff = create_effect(move || {
-                        radius_cell.set(sig.get());
-                        push_dirty(
-                            &q,
-                            id,
-                            DirtyFlags {
-                                state: false,
-                                layout: false,
-                                paint: true,
-                            },
-                        );
+                        if let Some(v) = sig.try_get() {
+                            radius_cell.set(v);
+                            push_dirty(
+                                &q,
+                                id,
+                                DirtyFlags {
+                                    state: false,
+                                    layout: false,
+                                    paint: true,
+                                },
+                            );
+                        }
+                    });
+                    self.nodes[id].owned_effects.push(eff);
+                }
+
+                if let Some(sig) = c.material_signal {
+                    let q = self.dirty_queue.clone();
+                    let eff = create_effect(move || {
+                        if let Some(m) = sig.try_get() {
+                            material_cell.set(m);
+                            push_dirty(
+                                &q,
+                                id,
+                                DirtyFlags {
+                                    state: false,
+                                    layout: false,
+                                    paint: true,
+                                },
+                            );
+                        }
                     });
                     self.nodes[id].owned_effects.push(eff);
                 }
@@ -888,6 +1271,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Text {
                         block,
                         pending: if is_reactive {
@@ -948,6 +1333,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: b.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Button {
                         label: label_block,
                         accent: b.accent,
@@ -971,11 +1358,13 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: sw.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Switch { signal: sw.signal },
                 });
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
-                    let _ = sw.signal.get();
+                    let _ = sw.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -1004,6 +1393,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: sl.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Slider {
                         signal: sl.signal,
                         min: sl.min,
@@ -1012,7 +1403,7 @@ impl WidgetArena {
                 });
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
-                    let _ = sl.signal.get();
+                    let _ = sl.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -1036,7 +1427,7 @@ impl WidgetArena {
                     ..Default::default()
                 };
                 let lnode = self.layout.new_leaf(lstyle);
-                let current_val = ti.signal.get();
+                let current_val = ti.signal.try_get().unwrap_or_default();
                 let cursor = current_val.len();
                 let text_block = TextBlock::new(
                     text,
@@ -1068,6 +1459,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: ti.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::TextInput {
                         signal: ti.signal,
                         material: ti.material,
@@ -1082,7 +1475,7 @@ impl WidgetArena {
                 });
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
-                    let _ = ti.signal.get();
+                    let _ = ti.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -1109,41 +1502,45 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
 
-                let labels = tb
-                    .items
-                    .iter()
-                    .map(|it| {
-                        TextBlock::new(
-                            text,
-                            it,
-                            TextStyle {
-                                font_size: 12.5,
-                                line_height: 16.0,
-                                color: Color::from_rgba8(28, 28, 32, 255),
-                                weight: FontWeight::Medium,
-                            },
-                        )
-                    })
-                    .collect();
+                let mut labels = Vec::with_capacity(tb.items.len());
+                let mut label_widths = Vec::with_capacity(tb.items.len());
+                for it in &tb.items {
+                    let mut block = TextBlock::new(
+                        text,
+                        it,
+                        TextStyle {
+                            font_size: 12.5,
+                            line_height: 16.0,
+                            color: Color::from_rgba8(28, 28, 32, 255),
+                            weight: FontWeight::Medium,
+                        },
+                    );
+                    let (w, _) = block.measure(text, None);
+                    labels.push(block);
+                    label_widths.push(w);
+                }
 
-                let initial_tab = tb.signal.get();
+                let initial_tab = tb.signal.try_get().unwrap_or(0);
                 let id = self.nodes.insert(WidgetNode {
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: tb.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Tabs {
                         signal: tb.signal,
                         items: tb.items,
                         labels,
+                        label_widths,
                         material: tb.material,
                         pill_spring: Spring::new(initial_tab as f32, 320.0, 26.0),
                     },
                 });
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
-                    let _ = tb.signal.get();
+                    let _ = tb.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -1202,7 +1599,7 @@ impl WidgetArena {
                     .collect();
                 let chevron = TextBlock::new(
                     text,
-                    "⌵",
+                    "v",
                     TextStyle {
                         font_size: 11.0,
                         line_height: 14.0,
@@ -1217,6 +1614,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: dd.tooltip,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Dropdown {
                         signal: dd.signal,
                         items: dd.items,
@@ -1229,7 +1628,7 @@ impl WidgetArena {
                 });
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
-                    let _ = dd.signal.get();
+                    let _ = dd.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -1245,6 +1644,67 @@ impl WidgetArena {
                 self.focus.focus_order.push(id);
                 id
             }
+            Element::CustomGpuSurface(cs) => {
+                let lnode = self.layout.new_leaf(cs.layout);
+                let radius_cell = Rc::new(Cell::new(cs.radius));
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: cs.layout,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: cs.tooltip,
+                    context_menu: cs.context_menu,
+                    payload: WidgetPayload::CustomGpuSurface {
+                        radius: radius_cell.clone(),
+                        animate_signal: cs.animate_signal,
+                        state: RefCell::new(CustomSurfaceState {
+                            pass: cs.pass,
+                            handle: None,
+                            view: None,
+                            size: (0, 0),
+                        }),
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                self.custom_surface_ids.push(id);
+
+                if let Some(sig) = cs.radius_signal {
+                    let q = self.dirty_queue.clone();
+                    let eff = create_effect(move || {
+                        if let Some(v) = sig.try_get() {
+                            radius_cell.set(v);
+                            push_dirty(
+                                &q,
+                                id,
+                                DirtyFlags {
+                                    state: false,
+                                    layout: false,
+                                    paint: true,
+                                },
+                            );
+                        }
+                    });
+                    self.nodes[id].owned_effects.push(eff);
+                }
+                if let Some(anim_sig) = cs.animate_signal {
+                    let q = self.dirty_queue.clone();
+                    let eff = create_effect(move || {
+                        let _ = anim_sig.try_get();
+                        push_dirty(
+                            &q,
+                            id,
+                            DirtyFlags {
+                                state: false,
+                                layout: false,
+                                paint: true,
+                            },
+                        );
+                    });
+                    self.nodes[id].owned_effects.push(eff);
+                }
+                id
+            }
             Element::TrafficLights(_) => {
                 let lstyle = LayoutStyle {
                     width: Length::Px(56.0),
@@ -1258,6 +1718,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::TrafficLights { hovered: false },
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1288,8 +1750,10 @@ impl WidgetArena {
                     layout_style: content_lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Container {
-                        material: Material::solid(Color::TRANSPARENT),
+                        material: Rc::new(Cell::new(Material::solid(Color::TRANSPARENT))),
                         radius: Rc::new(Cell::new(0.0)),
                         is_drag_region: false,
                     },
@@ -1309,6 +1773,8 @@ impl WidgetArena {
                     layout_style: viewport_lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::ScrollView {
                         scroll_y: Spring::new(0.0, 260.0, 24.0),
                         content_height: 0.0,
@@ -1317,6 +1783,203 @@ impl WidgetArena {
                 });
                 self.layout_to_widget.insert(viewport_lnode, id);
                 self.scroll_ids.push(id);
+                id
+            }
+            Element::SplitPane(sp) => {
+                let first_elem = sp
+                    .first
+                    .map(|b| *b)
+                    .unwrap_or_else(|| Spacer::flex().into_element());
+                let second_elem = sp
+                    .second
+                    .map(|b| *b)
+                    .unwrap_or_else(|| Spacer::flex().into_element());
+
+                let first_id = self.mount_node(first_elem, text);
+                let second_id = self.mount_node(second_elem, text);
+
+                let init_ratio = sp
+                    .ratio
+                    .try_get()
+                    .unwrap_or(0.3)
+                    .clamp(sp.min_ratio, sp.max_ratio);
+
+                let is_h = sp.direction == SplitDirection::Horizontal;
+
+                let mut first_style = self.nodes[first_id].layout_style;
+                if is_h {
+                    first_style.width = Length::Percent(init_ratio);
+                    first_style.height = Length::Auto;
+                } else {
+                    first_style.height = Length::Percent(init_ratio);
+                    first_style.width = Length::Auto;
+                }
+                first_style.flex_grow = 0.0;
+                first_style.flex_shrink = 0.0;
+                self.nodes[first_id].layout_style = first_style;
+                self.layout
+                    .set_style(self.nodes[first_id].layout_node, first_style);
+
+                let div_style = LayoutStyle {
+                    width: if is_h { Length::Px(1.0) } else { Length::Auto },
+                    height: if is_h { Length::Auto } else { Length::Px(1.0) },
+                    flex_shrink: 0.0,
+                    ..Default::default()
+                };
+                let div_lnode = self.layout.new_leaf(div_style);
+                let divider_id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: div_lnode,
+                    layout_style: div_style,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::Spacer,
+                });
+                self.layout_to_widget.insert(div_lnode, divider_id);
+
+                let mut second_style = self.nodes[second_id].layout_style;
+                second_style.flex_grow = 1.0;
+                second_style.flex_shrink = 1.0;
+                self.nodes[second_id].layout_style = second_style;
+                self.layout
+                    .set_style(self.nodes[second_id].layout_node, second_style);
+
+                let parent_style = LayoutStyle {
+                    direction: if is_h { FlexDir::Row } else { FlexDir::Column },
+                    flex_grow: 1.0,
+                    ..Default::default()
+                };
+                let child_lnodes = [
+                    self.nodes[first_id].layout_node,
+                    div_lnode,
+                    self.nodes[second_id].layout_node,
+                ];
+                let parent_lnode = self.layout.new_container(parent_style, &child_lnodes);
+
+                let id = self.nodes.insert(WidgetNode {
+                    children: vec![first_id, divider_id, second_id],
+                    layout_node: parent_lnode,
+                    layout_style: parent_style,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::SplitPane {
+                        direction: sp.direction,
+                        ratio: sp.ratio,
+                        min_ratio: sp.min_ratio,
+                        max_ratio: sp.max_ratio,
+                        first_id,
+                        divider_id,
+                        divider_color: sp.divider_color,
+                    },
+                });
+                self.layout_to_widget.insert(parent_lnode, id);
+                self.split_ids.push(id);
+
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = sp.ratio.try_get();
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: true,
+                            layout: true,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                id
+            }
+            Element::VirtualizedList(vl) => {
+                let lstyle = LayoutStyle {
+                    flex_grow: 1.0,
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+
+                let pool = (0..40)
+                    .map(|_| VirtualRowSlot {
+                        cached_index: None,
+                        title: TextBlock::new(
+                            text,
+                            "",
+                            TextStyle {
+                                font_size: 13.0,
+                                line_height: 18.0,
+                                color: Color::from_rgba8(29, 29, 31, 255),
+                                weight: FontWeight::Medium,
+                            },
+                        ),
+                        subtitle: TextBlock::new(
+                            text,
+                            "",
+                            TextStyle {
+                                font_size: 11.5,
+                                line_height: 15.0,
+                                color: Color::from_rgba8(110, 110, 115, 255),
+                                weight: FontWeight::Regular,
+                            },
+                        ),
+                        badge: TextBlock::new(
+                            text,
+                            "",
+                            TextStyle {
+                                font_size: 12.0,
+                                line_height: 16.0,
+                                color: Color::from_rgba8(110, 110, 115, 255),
+                                weight: FontWeight::Medium,
+                            },
+                        ),
+                        badge_width: 0.0,
+                    })
+                    .collect();
+
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::VirtualizedList {
+                        state: RefCell::new(VirtualListState {
+                            item_count: vl.item_count,
+                            item_height: vl.item_height,
+                            gap: vl.gap,
+                            scroll_y: Spring::new(0.0, 260.0, 24.0),
+                            hovered_row: None,
+                            selected: vl.selected,
+                            on_select: vl.on_select,
+                            row_builder: vl.row_builder,
+                            pool,
+                        }),
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                self.virtual_list_ids.push(id);
+
+                if let Some(sel) = vl.selected {
+                    let q = self.dirty_queue.clone();
+                    let eff = create_effect(move || {
+                        let _ = sel.try_get();
+                        push_dirty(
+                            &q,
+                            id,
+                            DirtyFlags {
+                                state: false,
+                                layout: false,
+                                paint: true,
+                            },
+                        );
+                    });
+                    self.nodes[id].owned_effects.push(eff);
+                }
                 id
             }
             Element::Divider(d) => {
@@ -1331,6 +1994,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Divider { color: d.color },
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1348,6 +2013,8 @@ impl WidgetArena {
                     layout_style: lstyle,
                     bounds: Rect::default(),
                     owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
                     payload: WidgetPayload::Spacer,
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1370,14 +2037,24 @@ struct OverlayRenderRecord {
     item_count: usize,
 }
 
+struct ContextMenuState {
+    owner: WidgetId,
+    anchor: (f32, f32),
+    menu_rect: Rect,
+    hovered_idx: Option<usize>,
+    labels: Vec<Option<(TextBlock, TextBlock)>>,
+}
+
 struct PaintCtx<'a, 'b> {
     ctx: &'a mut FrameContext<'b>,
     theme: &'a MacTheme,
     scale: f32,
+    time_secs: f32,
     caret_visible: bool,
     hovered: Option<WidgetId>,
     focused: Option<WidgetId>,
     overlays: &'a mut Vec<OverlayRenderRecord>,
+    a11y_records: Option<&'a mut Vec<A11yNodeRecord>>,
 }
 
 pub struct WidgetWindow<F> {
@@ -1389,8 +2066,23 @@ pub struct WidgetWindow<F> {
     hovered: Option<WidgetId>,
     captured: Option<WidgetId>,
     open_dropdowns: Vec<(WidgetId, Rect, usize)>,
+    hovered_dropdown_row: Option<(WidgetId, usize)>,
+    context_menu: Option<ContextMenuState>,
+    tooltip_id: Option<WidgetId>,
+    tooltip_anchor: Rect,
+    tooltip_show_at: Option<Instant>,
+    tooltip_visible: bool,
+    tooltip_cached_id: Option<WidgetId>,
+    tooltip_block: Option<TextBlock>,
     caret_visible: bool,
     next_blink_at: Option<Instant>,
+    start_instant: Instant,
+    show_fps: bool,
+    fps_block: Option<TextBlock>,
+    last_fps_update: Instant,
+    last_cursor: (f32, f32),
+    a11y_active: bool,
+    cached_semantic_tree: Option<SemanticTree>,
 }
 
 impl<F> WidgetWindow<F>
@@ -1407,13 +2099,33 @@ where
             hovered: None,
             captured: None,
             open_dropdowns: Vec::new(),
+            hovered_dropdown_row: None,
+            context_menu: None,
+            tooltip_id: None,
+            tooltip_anchor: Rect::default(),
+            tooltip_show_at: None,
+            tooltip_visible: false,
+            tooltip_cached_id: None,
+            tooltip_block: None,
             caret_visible: true,
             next_blink_at: None,
+            start_instant: Instant::now(),
+            show_fps: false,
+            fps_block: None,
+            last_fps_update: Instant::now(),
+            last_cursor: (0.0, 0.0),
+            a11y_active: false,
+            cached_semantic_tree: None,
         }
     }
 
     pub fn with_theme(mut self, theme_signal: Signal<ThemeMode>) -> Self {
         self.theme_signal = Some(theme_signal);
+        self
+    }
+
+    pub fn show_fps(mut self, show: bool) -> Self {
+        self.show_fps = show;
         self
     }
 
@@ -1437,6 +2149,14 @@ where
             return true;
         }
         false
+    }
+
+    fn clear_tooltip(&mut self) -> bool {
+        let was_visible = self.tooltip_visible;
+        self.tooltip_id = None;
+        self.tooltip_show_at = None;
+        self.tooltip_visible = false;
+        was_visible
     }
 
     fn reset_caret_blink(&mut self) {
@@ -1465,8 +2185,16 @@ where
         self.hovered = None;
         self.captured = None;
         self.open_dropdowns.clear();
+        self.hovered_dropdown_row = None;
+        self.context_menu = None;
+        self.tooltip_id = None;
+        self.tooltip_show_at = None;
+        self.tooltip_visible = false;
+        self.tooltip_cached_id = None;
+        self.tooltip_block = None;
         self.caret_visible = false;
         self.next_blink_at = None;
+        self.cached_semantic_tree = None;
 
         let root_elem = (self.build_fn)();
         self.arena.mount(root_elem, text);
@@ -1489,44 +2217,78 @@ where
                     ..
                 } = &mut node.payload
             {
-                pill_spring.set_target(signal.get() as f32);
+                pill_spring.set_target(signal.try_get().unwrap_or(0) as f32);
                 animating |= pill_spring.step(dt);
             }
         }
-
-        if let Some(blink_at) = self.next_blink_at {
-            let now = Instant::now();
-            if now >= blink_at {
-                self.caret_visible = !self.caret_visible;
-                self.next_blink_at = Some(now + CARET_BLINK_INTERVAL);
+        for &cid in &self.arena.custom_surface_ids {
+            if let Some(node) = self.arena.nodes.get(cid)
+                && let WidgetPayload::CustomGpuSurface {
+                    animate_signal: Some(sig),
+                    ..
+                } = &node.payload
+                && sig.try_get().unwrap_or(false)
+            {
+                animating = true;
+            }
+        }
+        for &vid in &self.arena.virtual_list_ids {
+            if let Some(node) = self.arena.nodes.get(vid)
+                && let WidgetPayload::VirtualizedList { state } = &node.payload
+            {
+                animating |= state.borrow_mut().scroll_y.step(dt);
             }
         }
 
-        // Only return true for active spring motion; caret blink uses WaitUntil via next_redraw_at()
+        let now = Instant::now();
+        if let Some(blink_at) = self.next_blink_at
+            && now >= blink_at
+        {
+            self.caret_visible = !self.caret_visible;
+            self.next_blink_at = Some(now + CARET_BLINK_INTERVAL);
+        }
+
+        if let Some(show_at) = self.tooltip_show_at
+            && now >= show_at
+        {
+            self.tooltip_visible = true;
+            self.tooltip_show_at = None;
+        }
+
         animating
     }
 
     fn next_redraw_at(&self) -> Option<Instant> {
-        self.next_blink_at
-    }
-
-    fn cursor_style(&self) -> CursorStyle {
-        if let Some(h) = self.hovered {
-            if let Some(node) = self.arena.nodes.get(h)
-                && matches!(node.payload, WidgetPayload::TextInput { .. })
-            {
-                return CursorStyle::Default;
-            }
-            CursorStyle::Pointer
-        } else if self.captured.is_some() {
-            CursorStyle::Pointer
-        } else {
-            CursorStyle::Default
+        match (self.next_blink_at, self.tooltip_show_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         }
     }
 
+    fn cursor_style(&self) -> CursorStyle {
+        if let Some(target) = self.captured.or(self.hovered)
+            && let Some(node) = self.arena.nodes.get(target)
+        {
+            match node.payload {
+                WidgetPayload::SplitPane {
+                    direction: SplitDirection::Horizontal,
+                    ..
+                } => return CursorStyle::ColResize,
+                WidgetPayload::SplitPane {
+                    direction: SplitDirection::Vertical,
+                    ..
+                } => return CursorStyle::RowResize,
+                WidgetPayload::TextInput { .. } => return CursorStyle::Default,
+                _ => return CursorStyle::Pointer,
+            }
+        }
+        CursorStyle::Default
+    }
+
     fn is_drag_region(&self, x: f32, y: f32) -> bool {
-        if self.hit_test(x, y).is_some() {
+        if self.context_menu.is_some() || self.hit_test(x, y).is_some() {
             return false;
         }
         self.arena
@@ -1536,9 +2298,33 @@ where
     }
 
     fn on_scroll(&mut self, _delta_x: f32, delta_y: f32) -> bool {
-        let mut handled = false;
+        let mut handled = self.clear_tooltip();
+        let (cx, cy) = self.last_cursor;
+
+        for &vid in &self.arena.virtual_list_ids {
+            if let Some(node) = self.arena.nodes.get(vid)
+                && node.bounds.contains(cx, cy)
+                && let WidgetPayload::VirtualizedList { state } = &node.payload
+            {
+                let mut st = state.borrow_mut();
+                let stride = st.item_height + st.gap;
+                let total_h = if st.item_count == 0 {
+                    0.0
+                } else {
+                    st.item_count as f32 * stride - st.gap
+                };
+                let max_scroll = (total_h - node.bounds.height).max(0.0);
+                if max_scroll > 0.0 {
+                    let next = (st.scroll_y.target - delta_y).clamp(0.0, max_scroll);
+                    st.scroll_y.set_target(next);
+                    return true;
+                }
+            }
+        }
+
         for &sid in &self.arena.scroll_ids {
             if let Some(node) = self.arena.nodes.get_mut(sid)
+                && node.bounds.contains(cx, cy)
                 && let WidgetPayload::ScrollView {
                     scroll_y,
                     content_height,
@@ -1556,12 +2342,71 @@ where
         handled
     }
 
-    fn on_key(
-        &mut self,
-        key: &winit::keyboard::Key,
-        text: Option<&str>,
-        modifiers: &Modifiers,
-    ) -> bool {
+    fn set_a11y_active(&mut self, active: bool) {
+        self.a11y_active = active;
+        if !active {
+            self.cached_semantic_tree = None;
+        }
+    }
+
+    fn semantic_tree(&self) -> Option<SemanticTree> {
+        self.cached_semantic_tree.clone()
+    }
+
+    fn on_semantic_action(&mut self, action: A11yAction) -> bool {
+        match action {
+            A11yAction::Focus(wid) => {
+                if self.arena.nodes.contains_key(wid) {
+                    let changed = self.arena.focus.set_focus(Some(wid));
+                    self.reset_caret_blink();
+                    return changed;
+                }
+                false
+            }
+            A11yAction::Click(wid) => {
+                let Some(node) = self.arena.nodes.get_mut(wid) else {
+                    return false;
+                };
+                match &mut node.payload {
+                    WidgetPayload::Button { on_click, .. } => {
+                        if let Some(cb) = on_click {
+                            cb();
+                        }
+                        true
+                    }
+                    WidgetPayload::Switch { signal } => {
+                        signal.update(|v| *v = !*v);
+                        true
+                    }
+                    WidgetPayload::Dropdown { is_open, .. } => {
+                        *is_open = !*is_open;
+                        true
+                    }
+                    WidgetPayload::TextInput { .. } => {
+                        self.arena.focus.set_focus(Some(wid));
+                        self.reset_caret_blink();
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: &Key, text: Option<&str>, modifiers: &Modifiers) -> bool {
+        if *key == Key::Escape && self.context_menu.take().is_some() {
+            return true;
+        }
+        if *key == Key::Tab {
+            if modifiers.shift {
+                self.arena.focus.cycle_prev();
+            } else {
+                self.arena.focus.cycle_next();
+            }
+            self.reset_caret_blink();
+            return true;
+        }
+
         let Some(focused_id) = self.arena.focus.focused else {
             return false;
         };
@@ -1578,13 +2423,15 @@ where
             ..
         } = &mut node.payload
         {
-            let mut val = signal.get();
+            let Some(mut val) = signal.try_get() else {
+                return false;
+            };
             *cursor = snap_char_boundary(&val, *cursor);
             *selection = normalize_selection(&val, *selection);
 
             let is_ctrl = modifiers.ctrl || modifiers.super_key;
             let is_shortcut_char = |ch: &str| -> bool {
-                matches!(key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case(ch))
+                matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(ch))
             };
 
             let delete_sel =
@@ -1632,7 +2479,7 @@ where
                 }
             } else {
                 match key {
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                    Key::Backspace => {
                         if delete_sel(&mut val, cursor, selection) {
                             signal.set(val);
                             handled = true;
@@ -1648,7 +2495,7 @@ where
                             handled = true;
                         }
                     }
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete) => {
+                    Key::Delete => {
                         if delete_sel(&mut val, cursor, selection) {
                             signal.set(val);
                             handled = true;
@@ -1663,7 +2510,7 @@ where
                             handled = true;
                         }
                     }
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
+                    Key::ArrowLeft => {
                         *selection = None;
                         if *cursor > 0 {
                             *cursor = val[..*cursor]
@@ -1674,7 +2521,7 @@ where
                             handled = true;
                         }
                     }
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
+                    Key::ArrowRight => {
                         *selection = None;
                         if *cursor < val.len() {
                             *cursor = val[*cursor..]
@@ -1685,12 +2532,12 @@ where
                             handled = true;
                         }
                     }
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                    Key::Home => {
                         *selection = None;
                         *cursor = 0;
                         handled = true;
                     }
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
+                    Key::End => {
                         *selection = None;
                         *cursor = val.len();
                         handled = true;
@@ -1718,6 +2565,29 @@ where
     }
 
     fn on_pointer_move(&mut self, x: f32, y: f32) -> bool {
+        self.last_cursor = (x, y);
+        if let Some(cap) = self.captured
+            && let Some(node) = self.arena.nodes.get(cap)
+            && let WidgetPayload::SplitPane {
+                direction,
+                ratio,
+                min_ratio,
+                max_ratio,
+                ..
+            } = &node.payload
+        {
+            let next_r = match direction {
+                SplitDirection::Horizontal => {
+                    (x - node.bounds.x) / node.bounds.width.max(1.0)
+                }
+                SplitDirection::Vertical => {
+                    (y - node.bounds.y) / node.bounds.height.max(1.0)
+                }
+            }
+            .clamp(*min_ratio, *max_ratio);
+            ratio.set(next_r);
+            return true;
+        }
         if let Some(cap) = self.captured
             && let Some(node) = self.arena.nodes.get_mut(cap)
             && let WidgetPayload::TextInput {
@@ -1730,7 +2600,7 @@ where
             } = &mut node.payload
             && *is_selecting
         {
-            let val = signal.get();
+            let val = signal.try_get().unwrap_or_default();
             let rel_x = x - (node.bounds.x + 12.0);
             let anchor = snap_char_boundary(&val, selection.map(|s| s.0).unwrap_or(*cursor));
             let new_cursor = snap_char_boundary(&val, find_char_index_at_x(char_offsets, rel_x));
@@ -1746,9 +2616,76 @@ where
             return self.update_slider(cap, x);
         }
 
-        let next = self.hit_test(x, y);
         let mut redraw = false;
 
+        if let Some(cm) = &mut self.context_menu {
+            let next_row = if cm.menu_rect.contains(x, y) {
+                let mut found = None;
+                let mut cur_y = cm.menu_rect.y + 4.0;
+                for (i, item) in cm.labels.iter().enumerate() {
+                    let h = if item.is_some() { 28.0 } else { 9.0 };
+                    if item.is_some() && y >= cur_y && y < cur_y + h {
+                        found = Some(i);
+                        break;
+                    }
+                    cur_y += h;
+                }
+                found
+            } else {
+                None
+            };
+            if cm.hovered_idx != next_row {
+                cm.hovered_idx = next_row;
+                redraw = true;
+            }
+            return redraw;
+        }
+
+        if !self.open_dropdowns.is_empty() {
+            let mut next_dd_row = None;
+            for &(dd_id, menu_rect, count) in self.open_dropdowns.iter().rev() {
+                if menu_rect.contains(x, y) {
+                    let idx = ((y - (menu_rect.y + 4.0)) / 30.0).floor().max(0.0) as usize;
+                    next_dd_row = Some((dd_id, idx.min(count.saturating_sub(1))));
+                    break;
+                }
+            }
+            if next_dd_row != self.hovered_dropdown_row {
+                self.hovered_dropdown_row = next_dd_row;
+                redraw = true;
+            }
+            if next_dd_row.is_some() {
+                redraw |= self.clear_tooltip();
+                return redraw;
+            }
+        } else if self.hovered_dropdown_row.take().is_some() {
+            redraw = true;
+        }
+
+        for &vid in &self.arena.virtual_list_ids {
+            if let Some(node) = self.arena.nodes.get(vid)
+                && let WidgetPayload::VirtualizedList { state } = &node.payload
+            {
+                let mut st = state.borrow_mut();
+                let next_row = if node.bounds.contains(x, y) {
+                    let stride = st.item_height + st.gap;
+                    let idx = ((y - node.bounds.y + st.scroll_y.value) / stride).floor() as isize;
+                    if idx >= 0 && (idx as usize) < st.item_count {
+                        Some(idx as usize)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if st.hovered_row != next_row {
+                    st.hovered_row = next_row;
+                    redraw = true;
+                }
+            }
+        }
+
+        let next = self.hit_test(x, y);
         for &tid in &self.arena.traffic_ids {
             if let Some(node) = self.arena.nodes.get_mut(tid)
                 && let WidgetPayload::TrafficLights { hovered } = &mut node.payload
@@ -1765,10 +2702,74 @@ where
             self.hovered = next;
             redraw = true;
         }
+
+        let next_tt = self
+            .arena
+            .root
+            .and_then(|root| find_tooltip_node(root, &self.arena.nodes, x, y, (0.0, 0.0)));
+
+        let next_tt_id = next_tt.map(|(wid, _)| wid);
+        if next_tt_id != self.tooltip_id {
+            redraw |= self.clear_tooltip();
+            if let Some((wid, anchor)) = next_tt {
+                self.tooltip_id = Some(wid);
+                self.tooltip_anchor = anchor;
+                self.tooltip_show_at = Some(Instant::now() + TOOLTIP_HOVER_DELAY);
+            }
+        }
+
+        redraw
+    }
+
+    fn on_secondary_down(&mut self, x: f32, y: f32) -> bool {
+        let mut redraw = self.clear_tooltip();
+
+        for (dd_id, _, _) in self.open_dropdowns.drain(..) {
+            if let Some(node) = self.arena.nodes.get_mut(dd_id)
+                && let WidgetPayload::Dropdown { is_open, .. } = &mut node.payload
+            {
+                *is_open = false;
+                redraw = true;
+            }
+        }
+
+        let hit = self
+            .arena
+            .root
+            .and_then(|root| find_context_menu_node(root, &self.arena.nodes, x, y, (0.0, 0.0)));
+
+        if let Some(owner) = hit {
+            self.context_menu = Some(ContextMenuState {
+                owner,
+                anchor: (x, y),
+                menu_rect: Rect::default(),
+                hovered_idx: None,
+                labels: Vec::new(),
+            });
+            return true;
+        }
+
+        if self.context_menu.take().is_some() {
+            return true;
+        }
         redraw
     }
 
     fn on_pointer_down(&mut self, x: f32, y: f32) -> (bool, WindowCommand) {
+        let mut redraw = self.clear_tooltip();
+
+        if let Some(cm) = self.context_menu.take() {
+            if cm.menu_rect.contains(x, y)
+                && let Some(idx) = cm.hovered_idx
+                && let Some(node) = self.arena.nodes.get_mut(cm.owner)
+                && let Some(item) = node.context_menu.get_mut(idx)
+                && let Some(cb) = &mut item.on_select
+            {
+                cb();
+            }
+            return (true, WindowCommand::None);
+        }
+
         if !self.open_dropdowns.is_empty() {
             let overlays = std::mem::take(&mut self.open_dropdowns);
             for (dd_id, menu_rect, count) in overlays.iter().rev().copied() {
@@ -1784,10 +2785,10 @@ where
                         signal.set(idx);
                         *is_open = false;
                     }
+                    self.hovered_dropdown_row = None;
                     return (true, WindowCommand::None);
                 }
             }
-            // Clicked outside: close all open dropdowns
             for (dd_id, _, _) in overlays {
                 if let Some(node) = self.arena.nodes.get_mut(dd_id)
                     && let WidgetPayload::Dropdown { is_open, .. } = &mut node.payload
@@ -1795,15 +2796,17 @@ where
                     *is_open = false;
                 }
             }
+            self.hovered_dropdown_row = None;
+            redraw = true;
         }
 
         let Some(hit) = self.hit_test(x, y) else {
             let focus_changed = self.arena.focus.set_focus(None);
             self.reset_caret_blink();
             if self.is_drag_region(x, y) {
-                return (false, WindowCommand::None);
+                return (redraw, WindowCommand::None);
             }
-            return (focus_changed, WindowCommand::None);
+            return (redraw || focus_changed, WindowCommand::None);
         };
 
         self.arena.focus.set_focus(Some(hit));
@@ -1837,6 +2840,25 @@ where
                     capture_target = true;
                     clicked = true;
                 }
+                WidgetPayload::SplitPane { .. } => {
+                    capture_target = true;
+                    clicked = true;
+                }
+                WidgetPayload::VirtualizedList { state } => {
+                    let mut st = state.borrow_mut();
+                    let stride = st.item_height + st.gap;
+                    let idx = ((y - node.bounds.y + st.scroll_y.value) / stride).floor() as isize;
+                    if idx >= 0 && (idx as usize) < st.item_count {
+                        let i = idx as usize;
+                        if let Some(sel) = st.selected {
+                            sel.set(i);
+                        }
+                        if let Some(cb) = &mut st.on_select {
+                            cb(i);
+                        }
+                        clicked = true;
+                    }
+                }
                 WidgetPayload::Tabs { signal, items, .. } => {
                     let tab_w = node.bounds.width / items.len().max(1) as f32;
                     let idx = ((x - node.bounds.x) / tab_w).floor().max(0.0) as usize;
@@ -1855,7 +2877,7 @@ where
                     char_offsets,
                     ..
                 } => {
-                    let val = signal.get();
+                    let val = signal.try_get().unwrap_or_default();
                     let rel_x = x - (node.bounds.x + 12.0);
                     let char_idx =
                         snap_char_boundary(&val, find_char_index_at_x(char_offsets, rel_x));
@@ -1875,7 +2897,7 @@ where
             self.captured = Some(hit);
             self.update_slider(hit, x);
         }
-        (clicked, WindowCommand::None)
+        (redraw || clicked, WindowCommand::None)
     }
 
     fn on_pointer_up(&mut self) -> bool {
@@ -1892,10 +2914,11 @@ where
 
     fn render(&mut self, ctx: &mut FrameContext<'_>) {
         let frame_start = FrameProfiler::begin_timer();
+        self.profiler.record_cadence(ctx.frame_dt);
 
         let mode = self
             .theme_signal
-            .map(|s| s.get())
+            .and_then(|s| s.try_get())
             .unwrap_or(ThemeMode::Light);
         let theme = MacTheme::from_mode(mode);
 
@@ -1925,7 +2948,7 @@ where
                         last_synced_text,
                         ..
                     } => {
-                        let text_val = signal.get();
+                        let text_val = signal.try_get().unwrap_or_default();
                         if *last_synced_text != text_val {
                             *last_synced_text = text_val.clone();
                             *cursor = snap_char_boundary(&text_val, *cursor);
@@ -1939,12 +2962,48 @@ where
             }
         }
 
+        let mut split_syncs = Vec::new();
+        for &sp_id in &self.arena.split_ids {
+            if let Some(node) = self.arena.nodes.get(sp_id)
+                && let WidgetPayload::SplitPane {
+                    direction,
+                    ratio,
+                    min_ratio,
+                    max_ratio,
+                    first_id,
+                    ..
+                } = &node.payload
+            {
+                let r = ratio.try_get().unwrap_or(0.3).clamp(*min_ratio, *max_ratio);
+                split_syncs.push((*first_id, *direction, r));
+            }
+        }
+        for (first_id, dir, r) in split_syncs {
+            if let Some(first_node) = self.arena.nodes.get_mut(first_id) {
+                let target_len = Length::Percent(r);
+                let changed = match dir {
+                    SplitDirection::Horizontal => first_node.layout_style.width != target_len,
+                    SplitDirection::Vertical => first_node.layout_style.height != target_len,
+                };
+                if changed {
+                    match dir {
+                        SplitDirection::Horizontal => first_node.layout_style.width = target_len,
+                        SplitDirection::Vertical => first_node.layout_style.height = target_len,
+                    }
+                    self.arena
+                        .layout
+                        .set_style(first_node.layout_node, first_node.layout_style);
+                    self.arena.needs_layout = true;
+                }
+            }
+        }
+
         if (ctx.width, ctx.height) != self.last_size {
             self.last_size = (ctx.width, ctx.height);
             self.arena.needs_layout = true;
         }
 
-        // Stage 2: Incremental Taffy Layout + ScrollView content_height calculation
+        // Stage 2: Incremental Taffy Layout + ScrollView content_height
         let layout_start = FrameProfiler::begin_timer();
         let mut did_layout = false;
         if self.arena.needs_layout
@@ -2014,25 +3073,92 @@ where
         }
         let layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
 
-        // Stage 3: Hierarchical Paint + Clamped Overlay Portals
+        if let Some(cm) = &mut self.context_menu
+            && cm.labels.is_empty()
+            && let Some(owner_node) = self.arena.nodes.get(cm.owner)
+        {
+            let te = ctx.text_engine();
+            for item in &owner_node.context_menu {
+                if let Some(lbl) = &item.label {
+                    let normal = TextBlock::new(
+                        te,
+                        lbl,
+                        TextStyle {
+                            font_size: 13.0,
+                            line_height: 18.0,
+                            color: theme.text_primary,
+                            weight: FontWeight::Medium,
+                        },
+                    );
+                    let selected = TextBlock::new(
+                        te,
+                        lbl,
+                        TextStyle {
+                            font_size: 13.0,
+                            line_height: 18.0,
+                            color: theme.text_on_accent,
+                            weight: FontWeight::Medium,
+                        },
+                    );
+                    cm.labels.push(Some((normal, selected)));
+                } else {
+                    cm.labels.push(None);
+                }
+            }
+        }
+
+        if self.tooltip_visible
+            && self.tooltip_cached_id != self.tooltip_id
+            && let Some(tid) = self.tooltip_id
+            && let Some(tt_text) = self.arena.nodes.get(tid).and_then(|n| n.tooltip.as_deref())
+        {
+            let te = ctx.text_engine();
+            let style = TextStyle {
+                font_size: 11.5,
+                line_height: 15.0,
+                color: theme.text_primary,
+                weight: FontWeight::Medium,
+            };
+            self.tooltip_block = Some(TextBlock::new(te, tt_text, style));
+            self.tooltip_cached_id = Some(tid);
+        }
+
+        // Stage 3: Hierarchical Paint + Overlays + Lazy SemanticTree
         let paint_start = FrameProfiler::begin_timer();
         let mut overlay_records = Vec::new();
         self.open_dropdowns.clear();
 
         if let Some(root) = self.arena.root {
             let scale = ctx.scale;
+            let time_secs = self.start_instant.elapsed().as_secs_f32();
+            let mut a11y_buf = if self.a11y_active {
+                Some(Vec::new())
+            } else {
+                None
+            };
             let mut pctx = PaintCtx {
                 ctx,
                 theme: &theme,
                 scale,
+                time_secs,
                 caret_visible: self.caret_visible,
                 hovered: self.hovered,
                 focused: self.arena.focus.focused,
                 overlays: &mut overlay_records,
+                a11y_records: a11y_buf.as_mut(),
             };
 
             paint_node(root, &self.arena.nodes, &mut pctx, (0.0, 0.0));
 
+            if let Some(records) = a11y_buf {
+                self.cached_semantic_tree = Some(SemanticTree {
+                    root,
+                    focus: self.arena.focus.focused,
+                    nodes: records,
+                });
+            }
+
+            // 3A. Open Dropdown Overlays
             for ov in overlay_records {
                 let row_h = 30.0;
                 let menu_w = ov.trigger_bounds.width.max(160.0).min(ctx.width - 16.0);
@@ -2057,7 +3183,7 @@ where
                     rect: snap_rect_to_pixels(menu_rect, scale),
                     radii: CornerRadii::all(10.0).scale(scale),
                     fill: Color::TRANSPARENT,
-                    shadow_color: Color::from_rgba8(0, 0, 0, 75),
+                    shadow_color: theme.shadow_elevated,
                     shadow_offset: [0.0, 8.0 * scale],
                     shadow_blur: 20.0 * scale,
                     ..Default::default()
@@ -2065,10 +3191,10 @@ where
                 ctx.push_glass(GlassQuad {
                     rect: snap_rect_to_pixels(menu_rect, scale),
                     radii: CornerRadii::all(10.0).scale(scale),
-                    tint: Color::from_rgba8(250, 250, 255, 185),
+                    tint: theme.popover_glass_tint,
                     border_color: theme.hairline,
                     border_width: 1.0,
-                    frost: 0.40,
+                    frost: 0.42,
                     specular: 0.85,
                     ..Default::default()
                 });
@@ -2084,11 +3210,16 @@ where
                         let ry = menu_y + 4.0 + i as f32 * row_h;
                         let row_rect = Rect::new(menu_x + 4.0, ry, menu_w - 8.0, row_h);
                         let is_sel = i == ov.selected;
-                        if is_sel {
+                        let is_hov = self.hovered_dropdown_row == Some((ov.source_id, i));
+                        if is_sel || is_hov {
                             ctx.push_sdf(SdfQuad {
                                 rect: snap_rect_to_pixels(row_rect, scale),
                                 radii: CornerRadii::all(6.0).scale(scale),
-                                fill: theme.accent,
+                                fill: if is_sel {
+                                    theme.accent
+                                } else {
+                                    theme.control_hover
+                                },
                                 ..Default::default()
                             });
                         }
@@ -2100,6 +3231,170 @@ where
                         ctx.push_text(block, row_rect.x + 10.0, row_rect.y + 6.0);
                     }
                 }
+            }
+
+            // 3B. Active Right-Click ContextMenu Overlay
+            if let Some(cm) = &mut self.context_menu
+                && !cm.labels.is_empty()
+            {
+                let menu_w = 196.0_f32.min(ctx.width - 16.0);
+                let menu_h = cm
+                    .labels
+                    .iter()
+                    .map(|l| if l.is_some() { 28.0 } else { 9.0 })
+                    .sum::<f32>()
+                    + 8.0;
+
+                let menu_x = if cm.anchor.0 + menu_w <= ctx.width - 8.0 {
+                    cm.anchor.0
+                } else {
+                    (cm.anchor.0 - menu_w).max(8.0)
+                };
+                let menu_y = if cm.anchor.1 + menu_h <= ctx.height - 8.0 {
+                    cm.anchor.1
+                } else {
+                    (cm.anchor.1 - menu_h).max(8.0)
+                };
+
+                let menu_rect = Rect::new(menu_x, menu_y, menu_w, menu_h);
+                cm.menu_rect = menu_rect;
+
+                ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(menu_rect, scale),
+                    radii: CornerRadii::all(10.0).scale(scale),
+                    fill: Color::TRANSPARENT,
+                    shadow_color: theme.shadow_elevated,
+                    shadow_offset: [0.0, 10.0 * scale],
+                    shadow_blur: 22.0 * scale,
+                    ..Default::default()
+                });
+                ctx.push_glass(GlassQuad {
+                    rect: snap_rect_to_pixels(menu_rect, scale),
+                    radii: CornerRadii::all(10.0).scale(scale),
+                    tint: theme.popover_glass_tint,
+                    border_color: theme.hairline,
+                    border_width: 1.0,
+                    frost: 0.45,
+                    specular: 0.85,
+                    ..Default::default()
+                });
+
+                let mut cur_y = menu_y + 4.0;
+                for (i, item_opt) in cm.labels.iter().enumerate() {
+                    if let Some((normal, selected)) = item_opt {
+                        let row_rect = Rect::new(menu_x + 4.0, cur_y, menu_w - 8.0, 28.0);
+                        let is_hov = cm.hovered_idx == Some(i);
+                        if is_hov {
+                            ctx.push_sdf(SdfQuad {
+                                rect: snap_rect_to_pixels(row_rect, scale),
+                                radii: CornerRadii::all(6.0).scale(scale),
+                                fill: theme.accent,
+                                ..Default::default()
+                            });
+                        }
+                        let blk = if is_hov { selected } else { normal };
+                        ctx.push_text(blk, row_rect.x + 10.0, row_rect.y + 5.0);
+                        cur_y += 28.0;
+                    } else {
+                        ctx.push_sdf(SdfQuad {
+                            rect: Rect::new(
+                                ((menu_x + 12.0) * scale).round(),
+                                ((cur_y + 4.0) * scale).round(),
+                                ((menu_w - 24.0) * scale).round(),
+                                1.0,
+                            ),
+                            fill: theme.hairline,
+                            ..Default::default()
+                        });
+                        cur_y += 9.0;
+                    }
+                }
+            }
+
+            // 3C. Hover-Delayed Tooltip Pill
+            if self.tooltip_visible
+                && let Some(tb) = &mut self.tooltip_block
+            {
+                let (tw, th) = tb.measure(ctx.text_engine(), Some(280.0));
+                let box_w = tw + 18.0;
+                let box_h = th + 10.0;
+                let tx = (self.tooltip_anchor.x + (self.tooltip_anchor.width - box_w) * 0.5)
+                    .clamp(8.0, (ctx.width - box_w - 8.0).max(8.0));
+                let below_y = self.tooltip_anchor.y + self.tooltip_anchor.height + 6.0;
+                let ty = if below_y + box_h <= ctx.height - 8.0 {
+                    below_y
+                } else {
+                    (self.tooltip_anchor.y - box_h - 6.0).max(8.0)
+                };
+
+                let tt_rect = Rect::new(tx, ty, box_w, box_h);
+                ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(tt_rect, scale),
+                    radii: CornerRadii::all(6.0).scale(scale),
+                    fill: theme.panel_bg,
+                    border_color: theme.hairline,
+                    border_width: 1.0,
+                    shadow_color: theme.shadow_soft,
+                    shadow_offset: [0.0, 4.0 * scale],
+                    shadow_blur: 12.0 * scale,
+                    ..Default::default()
+                });
+                ctx.push_text(tb, tt_rect.x + 9.0, tt_rect.y + 5.0);
+            }
+        }
+
+        if self.show_fps {
+            let m = self.profiler.metrics;
+            let should_refresh = self.fps_block.is_none()
+                || self.last_fps_update.elapsed() >= Duration::from_millis(200);
+            if should_refresh {
+                self.last_fps_update = Instant::now();
+                let fps_val = if m.effective_fps > 1.0 {
+                    m.effective_fps
+                } else {
+                    m.fps
+                };
+                let label = format!(
+                    "{:.0} FPS  •  {:.2} ms (L:{:.2} P:{:.2})",
+                    fps_val, m.frame_ms, m.layout_ms, m.paint_ms
+                );
+                let te = ctx.text_engine();
+                if let Some(blk) = &mut self.fps_block {
+                    blk.set_text(te, &label);
+                } else {
+                    self.fps_block = Some(TextBlock::new(
+                        te,
+                        label,
+                        TextStyle {
+                            font_size: 11.0,
+                            line_height: 14.0,
+                            color: theme.text_primary,
+                            weight: FontWeight::Medium,
+                        },
+                    ));
+                }
+            }
+
+            if let Some(blk) = &mut self.fps_block {
+                let (tw, _) = blk.measure(ctx.text_engine(), None);
+                let pill_w = tw + 16.0;
+                let pill_h = 22.0;
+                let pill_rect = Rect::new(
+                    (ctx.width - pill_w - 14.0).max(8.0),
+                    (ctx.height - pill_h - 10.0).max(8.0),
+                    pill_w,
+                    pill_h,
+                );
+                let scale = ctx.scale;
+                ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(pill_rect, scale),
+                    radii: CornerRadii::all(6.0).scale(scale),
+                    fill: theme.panel_bg,
+                    border_color: theme.hairline,
+                    border_width: 1.0,
+                    ..Default::default()
+                });
+                ctx.push_text(blk, pill_rect.x + 8.0, pill_rect.y + 4.0);
             }
         }
 
@@ -2132,11 +3427,75 @@ fn paint_node(
     let is_hovered = pctx.hovered == Some(wid);
     let is_focused = pctx.focused == Some(wid);
 
+    if let Some(a11y) = pctx.a11y_records.as_deref_mut() {
+        let (role, label, value, numeric_value, toggled, focusable, clickable) = match &node.payload
+        {
+            WidgetPayload::Text { block, .. } => (
+                A11yRole::Label,
+                node.tooltip.clone(),
+                Some(format!("{:.0}", block.style().font_size)),
+                None,
+                None,
+                false,
+                false,
+            ),
+            WidgetPayload::Button { .. } => (
+                A11yRole::Button,
+                node.tooltip.clone(),
+                None,
+                None,
+                None,
+                true,
+                true,
+            ),
+            WidgetPayload::Switch { signal } => (
+                A11yRole::Switch,
+                node.tooltip.clone().or_else(|| Some("Switch".into())),
+                None,
+                None,
+                signal.try_get(),
+                true,
+                true,
+            ),
+            WidgetPayload::Slider { signal, .. } => (
+                A11yRole::Slider,
+                node.tooltip.clone().or_else(|| Some("Slider".into())),
+                None,
+                signal.try_get().map(|v| v as f64),
+                None,
+                true,
+                false,
+            ),
+            WidgetPayload::TextInput { signal, .. } => (
+                A11yRole::TextInput,
+                node.tooltip.clone().or_else(|| Some("Text Input".into())),
+                signal.try_get(),
+                None,
+                None,
+                true,
+                true,
+            ),
+            _ => (A11yRole::Container, None, None, None, None, false, false),
+        };
+        a11y.push(A11yNodeRecord {
+            id: wid,
+            role,
+            label,
+            value,
+            numeric_value,
+            toggled,
+            focusable,
+            clickable,
+            bounds,
+            children: node.children.clone(),
+        });
+    }
+
     match &node.payload {
         WidgetPayload::Container {
             material, radius, ..
         } => {
-            render_material(pctx.ctx, bounds, *material, radius.get(), scale);
+            render_material(pctx.ctx, bounds, material.get(), radius.get(), scale);
             for &child in &node.children {
                 paint_node(child, nodes, pctx, offset);
             }
@@ -2170,7 +3529,7 @@ fn paint_node(
             pctx.ctx.push_text(label, bounds.x + 14.0, bounds.y + 6.0);
         }
         WidgetPayload::Switch { signal } => {
-            let on = signal.get();
+            let on = signal.try_get().unwrap_or(false);
             pctx.ctx.push_sdf(SdfQuad {
                 rect: snap_rect_to_pixels(bounds, scale),
                 radii: CornerRadii::all(11.0).scale(scale),
@@ -2193,7 +3552,7 @@ fn paint_node(
             });
         }
         WidgetPayload::Slider { signal, min, max } => {
-            let val = signal.get();
+            let val = signal.try_get().unwrap_or(*min);
             let frac = ((val - *min) / (*max - *min).max(0.0001)).clamp(0.0, 1.0);
             let track = Rect::new(
                 bounds.x,
@@ -2240,7 +3599,7 @@ fn paint_node(
             char_offsets,
             ..
         } => {
-            let val = signal.get();
+            let val = signal.try_get().unwrap_or_default();
             render_material(pctx.ctx, bounds, *material, 8.0, scale);
 
             if is_focused {
@@ -2253,6 +3612,14 @@ fn paint_node(
                     ..Default::default()
                 });
             }
+
+            let inner_clip = Rect::new(
+                bounds.x + 8.0,
+                bounds.y,
+                (bounds.width - 16.0).max(1.0),
+                bounds.height,
+            );
+            pctx.ctx.push_clip(inner_clip);
 
             let text_x = bounds.x + 12.0;
             let text_y = bounds.y + 8.0;
@@ -2290,10 +3657,13 @@ fn paint_node(
                     ..Default::default()
                 });
             }
+
+            pctx.ctx.pop_clip();
         }
         WidgetPayload::Tabs {
             items,
             labels,
+            label_widths,
             material,
             pill_spring,
             ..
@@ -2319,9 +3689,9 @@ fn paint_node(
 
             for (i, label) in labels.iter().enumerate() {
                 let item_cx = bounds.x + 2.0 + (i as f32 + 0.5) * tab_w;
-                let lw = label.style().font_size * 0.55 * items[i].len() as f32;
+                let lw = label_widths.get(i).copied().unwrap_or(0.0);
                 pctx.ctx
-                    .push_text(label, item_cx - lw * 0.5, bounds.y + 7.0);
+                    .push_text(label, item_cx - lw * 0.5, bounds.y + 6.0);
             }
         }
         WidgetPayload::Dropdown {
@@ -2334,12 +3704,15 @@ fn paint_node(
             ..
         } => {
             render_material(pctx.ctx, bounds, *material, 8.0, scale);
-            let selected = signal.get().min(items.len().saturating_sub(1));
+            let selected = signal
+                .try_get()
+                .unwrap_or(0)
+                .min(items.len().saturating_sub(1));
             if let Some(lbl) = labels.get(selected) {
                 pctx.ctx.push_text(lbl, bounds.x + 12.0, bounds.y + 7.0);
             }
             pctx.ctx
-                .push_text(chevron, bounds.x + bounds.width - 20.0, bounds.y + 7.0);
+                .push_text(chevron, bounds.x + bounds.width - 20.0, bounds.y + 8.0);
 
             if *is_open {
                 pctx.overlays.push(OverlayRenderRecord {
@@ -2347,6 +3720,179 @@ fn paint_node(
                     trigger_bounds: bounds,
                     selected,
                     item_count: items.len(),
+                });
+            }
+        }
+        WidgetPayload::CustomGpuSurface { radius, state, .. } => {
+            let snapped = snap_rect_to_pixels(bounds, scale);
+            let pw = (snapped.width as u32).max(1);
+            let ph = (snapped.height as u32).max(1);
+            let mut st = state.borrow_mut();
+
+            let gpu = pctx.ctx.gpu_mut();
+            if st.size != (pw, ph) || st.handle.is_none() {
+                if let Some(old_handle) = st.handle.take() {
+                    gpu.release_texture(old_handle);
+                }
+                let (view, handle) = gpu.create_render_texture(pw, ph, ATLAS_FORMAT);
+                st.view = Some(view);
+                st.handle = Some(handle);
+                st.size = (pw, ph);
+            }
+
+            let view = st.view.clone();
+            if let (Some(view), Some(handle)) = (view, st.handle) {
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("SteelUI CustomGpuSurface Encoder"),
+                        });
+                st.pass.render(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &view,
+                    ATLAS_FORMAT,
+                    pw,
+                    ph,
+                    pctx.time_secs,
+                );
+                gpu.queue.submit(std::iter::once(encoder.finish()));
+
+                pctx.ctx.push_image(ImageQuad {
+                    rect: snapped,
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    radii: CornerRadii::all(radius.get()).scale(scale),
+                    tint: Color::rgba(1.0, 1.0, 1.0, 1.0),
+                    texture: handle,
+                });
+            }
+        }
+        WidgetPayload::SplitPane {
+            direction,
+            divider_id,
+            divider_color,
+            ..
+        } => {
+            for &child in &node.children {
+                paint_node(child, nodes, pctx, offset);
+            }
+            if let Some(div) = nodes.get(*divider_id) {
+                let db = Rect::new(
+                    div.bounds.x + offset.0,
+                    div.bounds.y + offset.1,
+                    div.bounds.width,
+                    div.bounds.height,
+                );
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(db, scale),
+                    fill: divider_color.unwrap_or(theme.hairline),
+                    ..Default::default()
+                });
+                if is_hovered {
+                    let pill = match direction {
+                        SplitDirection::Horizontal => {
+                            Rect::new(db.x - 1.5, db.y + db.height * 0.5 - 18.0, 4.0, 36.0)
+                        }
+                        SplitDirection::Vertical => {
+                            Rect::new(db.x + db.width * 0.5 - 18.0, db.y - 1.5, 36.0, 4.0)
+                        }
+                    };
+                    pctx.ctx.push_sdf(SdfQuad {
+                        rect: snap_rect_to_pixels(pill, scale),
+                        radii: CornerRadii::all(2.0).scale(scale),
+                        fill: theme.accent,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        WidgetPayload::VirtualizedList { state } => {
+            let mut st = state.borrow_mut();
+            let viewport = bounds;
+            let stride = st.item_height + st.gap;
+            let total_h = if st.item_count == 0 {
+                0.0
+            } else {
+                st.item_count as f32 * stride - st.gap
+            };
+            let scroll_val = st.scroll_y.value.clamp(0.0, (total_h - viewport.height).max(0.0));
+
+            pctx.ctx.push_clip(viewport);
+
+            if st.item_count > 0 && viewport.height > 0.0 {
+                let first = (scroll_val / stride).floor().max(0.0) as usize;
+                let visible_n = (viewport.height / stride).ceil() as usize + 2;
+                let last = (first + visible_n).min(st.item_count);
+                let selected_idx = st.selected.and_then(|s| s.try_get());
+                let hovered_idx = st.hovered_row;
+                let item_h = st.item_height;
+                let pool_len = st.pool.len().max(1);
+
+                for idx in first..last {
+                    let slot_idx = idx % pool_len;
+                    let needs_build = st.pool[slot_idx].cached_index != Some(idx);
+                    if needs_build {
+                        let row_data = (st.row_builder)(idx);
+                        let te = pctx.ctx.text_engine();
+                        let slot = &mut st.pool[slot_idx];
+                        slot.cached_index = Some(idx);
+                        slot.title.set_text(te, &row_data.title);
+                        slot.subtitle.set_text(te, &row_data.subtitle);
+                        slot.badge.set_text(te, &row_data.badge);
+                        slot.badge_width = slot.badge.measure(te, None).0;
+                    }
+
+                    let row_y = viewport.y + idx as f32 * stride - scroll_val;
+                    let row_rect = Rect::new(viewport.x, row_y, viewport.width - 10.0, item_h);
+                    let is_sel = selected_idx == Some(idx);
+                    let is_hov = hovered_idx == Some(idx);
+
+                    let fill = if is_sel {
+                        theme.accent_soft
+                    } else if is_hov {
+                        theme.control_hover
+                    } else {
+                        Color::from_rgba8(255, 255, 255, 215)
+                    };
+
+                    pctx.ctx.push_sdf(SdfQuad {
+                        rect: snap_rect_to_pixels(row_rect, scale),
+                        radii: CornerRadii::all(8.0).scale(scale),
+                        fill,
+                        border_color: if is_sel { theme.accent } else { theme.hairline },
+                        border_width: 1.0,
+                        ..Default::default()
+                    });
+
+                    let slot = &mut st.pool[slot_idx];
+                    slot.title
+                        .set_color(if is_sel { theme.accent } else { theme.text_primary });
+                    pctx.ctx.push_text(&slot.title, row_rect.x + 14.0, row_rect.y + 7.0);
+                    pctx.ctx.push_text(&slot.subtitle, row_rect.x + 14.0, row_rect.y + 25.0);
+                    pctx.ctx.push_text(
+                        &slot.badge,
+                        row_rect.x + row_rect.width - slot.badge_width - 14.0,
+                        row_rect.y + (item_h - 16.0) * 0.5,
+                    );
+                }
+            }
+
+            pctx.ctx.pop_clip();
+
+            if total_h > viewport.height {
+                let track_h = viewport.height - 8.0;
+                let thumb_h = ((viewport.height / total_h) * track_h).clamp(24.0, track_h);
+                let max_scroll = (total_h - viewport.height).max(1.0);
+                let thumb_t = (scroll_val / max_scroll).clamp(0.0, 1.0);
+                let thumb_y = viewport.y + 4.0 + thumb_t * (track_h - thumb_h);
+                let thumb_rect =
+                    Rect::new(viewport.x + viewport.width - 6.0, thumb_y, 4.0, thumb_h);
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(thumb_rect, scale),
+                    radii: CornerRadii::all(2.0).scale(scale),
+                    fill: Color::from_rgba8(0, 0, 0, 75),
+                    ..Default::default()
                 });
             }
         }
@@ -2471,6 +4017,86 @@ fn paint_node(
     }
 }
 
+fn find_tooltip_node(
+    wid: WidgetId,
+    nodes: &SlotMap<WidgetId, WidgetNode>,
+    x: f32,
+    y: f32,
+    offset: (f32, f32),
+) -> Option<(WidgetId, Rect)> {
+    let node = nodes.get(wid)?;
+    let bounds = Rect::new(
+        node.bounds.x + offset.0,
+        node.bounds.y + offset.1,
+        node.bounds.width,
+        node.bounds.height,
+    );
+
+    if let WidgetPayload::ScrollView {
+        scroll_y,
+        content_id,
+        ..
+    } = &node.payload
+    {
+        if !bounds.contains(x, y) {
+            return None;
+        }
+        let child_offset = (offset.0, offset.1 - scroll_y.value);
+        return find_tooltip_node(*content_id, nodes, x, y, child_offset);
+    }
+
+    for &child in node.children.iter().rev() {
+        if let Some(res) = find_tooltip_node(child, nodes, x, y, offset) {
+            return Some(res);
+        }
+    }
+
+    if bounds.contains(x, y) && node.tooltip.is_some() {
+        return Some((wid, bounds));
+    }
+    None
+}
+
+fn find_context_menu_node(
+    wid: WidgetId,
+    nodes: &SlotMap<WidgetId, WidgetNode>,
+    x: f32,
+    y: f32,
+    offset: (f32, f32),
+) -> Option<WidgetId> {
+    let node = nodes.get(wid)?;
+    let bounds = Rect::new(
+        node.bounds.x + offset.0,
+        node.bounds.y + offset.1,
+        node.bounds.width,
+        node.bounds.height,
+    );
+
+    if let WidgetPayload::ScrollView {
+        scroll_y,
+        content_id,
+        ..
+    } = &node.payload
+    {
+        if !bounds.contains(x, y) {
+            return None;
+        }
+        let child_offset = (offset.0, offset.1 - scroll_y.value);
+        return find_context_menu_node(*content_id, nodes, x, y, child_offset);
+    }
+
+    for &child in node.children.iter().rev() {
+        if let Some(hit) = find_context_menu_node(child, nodes, x, y, offset) {
+            return Some(hit);
+        }
+    }
+
+    if bounds.contains(x, y) && !node.context_menu.is_empty() {
+        return Some(wid);
+    }
+    None
+}
+
 fn hit_test_node(
     wid: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
@@ -2485,6 +4111,32 @@ fn hit_test_node(
         node.bounds.width,
         node.bounds.height,
     );
+
+    if let WidgetPayload::SplitPane {
+        direction,
+        divider_id,
+        ..
+    } = &node.payload
+        && let Some(div) = nodes.get(*divider_id)
+    {
+        let div_bounds = Rect::new(
+            div.bounds.x + offset.0,
+            div.bounds.y + offset.1,
+            div.bounds.width,
+            div.bounds.height,
+        );
+        let hit_zone = match direction {
+            SplitDirection::Horizontal => {
+                Rect::new(div_bounds.x - 3.5, div_bounds.y, 8.0, div_bounds.height)
+            }
+            SplitDirection::Vertical => {
+                Rect::new(div_bounds.x, div_bounds.y - 3.5, div_bounds.width, 8.0)
+            }
+        };
+        if hit_zone.contains(x, y) {
+            return Some(wid);
+        }
+    }
 
     if let WidgetPayload::ScrollView {
         scroll_y,
@@ -2515,6 +4167,7 @@ fn hit_test_node(
                 | WidgetPayload::Tabs { .. }
                 | WidgetPayload::Dropdown { .. }
                 | WidgetPayload::TrafficLights { .. }
+                | WidgetPayload::VirtualizedList { .. }
         )
     {
         return Some(wid);
@@ -2674,7 +4327,6 @@ mod tests {
     #[test]
     fn utf8_boundary_snapping_prevents_mid_char_panics() {
         let s = "Café🦀";
-        // 'é' spans bytes 3..5; '🦀' spans bytes 5..9
         assert_eq!(snap_char_boundary(s, 4), 3);
         assert_eq!(snap_char_boundary(s, 7), 5);
         assert_eq!(snap_char_boundary(s, 99), s.len());

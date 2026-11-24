@@ -10,15 +10,14 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-authors = ["Shreya Thale <shreyasthale54@gmail.com>"]
+authors = ["Shreyas Thale"]
 repository = "https://github.com/ShreyasT123/steelui"
-homepage = "https://github.com/ShreyasT123/steelui"
 
 [workspace.dependencies]
 steelui = { path = "crates/steelui" }
 
-# Graphics, Windowing & Math
-wgpu = { version = "30.0", default-features = false, features = ["dx12", "metal", "vulkan", "std", "parking_lot", "wgsl"] }
+# Graphics & Windowing
+wgpu = "30.0"
 winit = "0.30"
 bytemuck = { version = "1.25", features = ["derive"] }
 
@@ -33,6 +32,7 @@ resvg = "0.50"
 
 # Platform & Accessibility
 accesskit = "0.25"
+accesskit_winit = "0.34"
 arboard = "3.7"
 rfd = "0.17"
 
@@ -42,3 +42,7 @@ pollster = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

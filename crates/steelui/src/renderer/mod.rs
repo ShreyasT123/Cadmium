@@ -9,8 +9,8 @@ use crate::assets::DecodedImage;
 use crate::core::{Color, CornerRadii, Rect, SteelError};
 use crate::text::{ShapedGlyph, TextBlock, TextEngine, swash_is_color};
 
-pub const CANONICAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-const INITIAL_ATLAS_SIZE: u32 = 512;
+pub const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+const INITIAL_ATLAS_SIZE: u32 = 256;
 const MAX_ATLAS_SIZE: u32 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -241,6 +241,7 @@ pub struct DrawList {
     glyph_scratch: Vec<ShapedGlyph>,
     batches: Vec<DrawBatch>,
     atlas_overflowed: bool,
+    has_liquid_glass: bool,
 }
 
 impl DrawList {
@@ -255,6 +256,7 @@ impl DrawList {
             glyph_scratch: Vec::new(),
             batches: Vec::new(),
             atlas_overflowed: false,
+            has_liquid_glass: false,
         }
     }
 
@@ -283,6 +285,9 @@ impl DrawList {
     }
 
     pub fn push_glass(&mut self, glass: GlassQuad) {
+        if glass.liquid_ripple > 0.001 || glass.conic_strength > 0.001 || glass.frost < 0.30 {
+            self.has_liquid_glass = true;
+        }
         let idx = self.glass_instances.len() as u32;
         self.glass_instances.push(RawGlassInstance::from(glass));
         self.batches.push(DrawBatch::Glass(idx));
@@ -427,7 +432,7 @@ impl GlyphAtlas {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: CANONICAL_FORMAT,
+            format: ATLAS_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -463,7 +468,6 @@ impl GlyphAtlas {
         if self.size < MAX_ATLAS_SIZE {
             self.size *= 2;
         }
-        // Always recreate a clean zeroed GPU texture on reset so stale glyphs never bleed
         let (texture, bind_group) = Self::create_storage(device, bgl, sampler, self.size);
         self.texture = texture;
         self.bind_group = bind_group;
@@ -509,7 +513,6 @@ impl GlyphAtlas {
             self.row_height = 0;
         }
         if self.cursor_y + h + 1 > self.size || w + 2 > self.size {
-            // Defer growth/reset to frame boundary so already-emitted quads keep valid UVs
             self.overflow_pending = true;
             return None;
         }
@@ -578,6 +581,15 @@ impl GlyphAtlas {
     }
 }
 
+struct FormatPipelines {
+    sdf: wgpu::RenderPipeline,
+    text: wgpu::RenderPipeline,
+    image: Option<wgpu::RenderPipeline>,
+    blur: Option<wgpu::RenderPipeline>,
+    glass: Option<wgpu::RenderPipeline>,
+    blit: Option<wgpu::RenderPipeline>,
+}
+
 pub struct GpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -595,14 +607,14 @@ pub struct GpuContext {
     nearest_sampler: wgpu::Sampler,
     linear_sampler: wgpu::Sampler,
 
-    sdf_pipeline: wgpu::RenderPipeline,
-    image_pipeline: wgpu::RenderPipeline,
-    text_pipeline: wgpu::RenderPipeline,
-    blur_pipeline: wgpu::RenderPipeline,
-    glass_pipeline: wgpu::RenderPipeline,
+    sdf_shader: wgpu::ShaderModule,
+    text_shader: wgpu::ShaderModule,
+    image_shader: Option<wgpu::ShaderModule>,
+    blur_shader: Option<wgpu::ShaderModule>,
+    glass_shader: Option<wgpu::ShaderModule>,
+    blit_shader: Option<wgpu::ShaderModule>,
 
-    blit_shader: wgpu::ShaderModule,
-    blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pipelines: HashMap<wgpu::TextureFormat, FormatPipelines>,
 }
 
 impl GpuContext {
@@ -658,12 +670,10 @@ impl GpuContext {
             }],
         });
 
-        let (blit_shader, tex_bgl, nearest_sampler, linear_sampler) = create_tex_resources(&device);
-        let sdf_pipeline = create_sdf_pipeline(&device, &globals_bgl);
-        let image_pipeline = create_image_pipeline(&device, &globals_bgl, &tex_bgl);
-        let text_pipeline = create_text_pipeline(&device, &globals_bgl, &tex_bgl);
-        let blur_pipeline = create_blur_pipeline(&device, &tex_bgl, &blur_bgl);
-        let glass_pipeline = create_glass_pipeline(&device, &globals_bgl, &tex_bgl);
+        let (tex_bgl, nearest_sampler, linear_sampler) = create_tex_resources(&device);
+        let sdf_shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/sdf.wgsl"));
+        let text_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../shaders/text.wgsl"));
         let glyph_atlas = GlyphAtlas::new(&device, &tex_bgl, &nearest_sampler);
 
         Ok(Self {
@@ -680,13 +690,13 @@ impl GpuContext {
             blur_bgl,
             nearest_sampler,
             linear_sampler,
-            sdf_pipeline,
-            image_pipeline,
-            text_pipeline,
-            blur_pipeline,
-            glass_pipeline,
-            blit_shader,
-            blit_pipelines: HashMap::new(),
+            sdf_shader,
+            text_shader,
+            image_shader: None,
+            blur_shader: None,
+            glass_shader: None,
+            blit_shader: None,
+            pipelines: HashMap::new(),
         })
     }
 
@@ -706,7 +716,7 @@ impl GpuContext {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: CANONICAL_FORMAT,
+            format: ATLAS_FORMAT,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -731,6 +741,36 @@ impl GpuContext {
             },
         );
 
+        self.register_texture(texture)
+    }
+
+    /// Allocates an offscreen render-target texture for `CustomGpuSurface` and binds it for `ImageQuad`.
+    pub fn create_render_texture(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> (wgpu::TextureView, TextureHandle) {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SteelUI CustomGpuSurface Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let handle = self.register_texture(texture);
+        (view, handle)
+    }
+
+    fn register_texture(&mut self, texture: wgpu::Texture) -> TextureHandle {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("SteelUI Image BG"),
@@ -770,131 +810,156 @@ impl GpuContext {
         }
     }
 
-    fn blit_pipeline_for(&mut self, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
-        self.blit_pipelines.entry(format).or_insert_with(|| {
-            let layout = self
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("SteelUI Blit Pipeline Layout"),
-                    bind_group_layouts: &[Some(&self.tex_bgl)],
-                    immediate_size: 0,
-                });
+    fn ensure_base_pipelines(&mut self, format: wgpu::TextureFormat) {
+        self.pipelines
+            .entry(format)
+            .or_insert_with(|| FormatPipelines {
+                sdf: create_sdf_pipeline(&self.device, &self.sdf_shader, &self.globals_bgl, format),
+                text: create_text_pipeline(
+                    &self.device,
+                    &self.text_shader,
+                    &self.globals_bgl,
+                    &self.tex_bgl,
+                    format,
+                ),
+                image: None,
+                blur: None,
+                glass: None,
+                blit: None,
+            });
+    }
 
+    fn ensure_image_pipeline(&mut self, format: wgpu::TextureFormat) {
+        self.ensure_base_pipelines(format);
+        let shader = self.image_shader.get_or_insert_with(|| {
             self.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("SteelUI Blit Pipeline"),
-                    layout: Some(&layout),
-                    vertex: wgpu::VertexState {
-                        module: &self.blit_shader,
-                        entry_point: Some("vs_main"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &self.blit_shader,
-                        entry_point: Some("fs_main"),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        unclipped_depth: false,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-        })
+                .create_shader_module(wgpu::include_wgsl!("../../shaders/textured.wgsl"))
+        });
+        let fp = self.pipelines.get_mut(&format).expect("format pipelines");
+        if fp.image.is_none() {
+            fp.image = Some(create_image_pipeline(
+                &self.device,
+                shader,
+                &self.globals_bgl,
+                &self.tex_bgl,
+                format,
+            ));
+        }
+    }
+
+    fn ensure_glass_pipelines(&mut self, format: wgpu::TextureFormat) {
+        self.ensure_base_pipelines(format);
+        let blur_shader = self.blur_shader.get_or_insert_with(|| {
+            self.device
+                .create_shader_module(wgpu::include_wgsl!("../../shaders/blur.wgsl"))
+        });
+        let glass_shader = self.glass_shader.get_or_insert_with(|| {
+            self.device
+                .create_shader_module(wgpu::include_wgsl!("../../shaders/glass.wgsl"))
+        });
+        let blit_shader = self.blit_shader.get_or_insert_with(|| {
+            self.device
+                .create_shader_module(wgpu::include_wgsl!("../../shaders/blit.wgsl"))
+        });
+        let fp = self.pipelines.get_mut(&format).expect("format pipelines");
+        if fp.blur.is_none() {
+            fp.blur = Some(create_blur_pipeline(
+                &self.device,
+                blur_shader,
+                &self.tex_bgl,
+                &self.blur_bgl,
+                format,
+            ));
+        }
+        if fp.glass.is_none() {
+            fp.glass = Some(create_glass_pipeline(
+                &self.device,
+                glass_shader,
+                &self.globals_bgl,
+                &self.tex_bgl,
+                format,
+            ));
+        }
+        if fp.blit.is_none() {
+            fp.blit = Some(create_blit_pipeline(
+                &self.device,
+                blit_shader,
+                &self.tex_bgl,
+                format,
+            ));
+        }
     }
 }
 
-struct GlassTargets {
-    backdrop_tex: wgpu::Texture,
-    backdrop_bg: wgpu::BindGroup,
+struct GlassOffscreen {
+    format: wgpu::TextureFormat,
+    canonical_tex: wgpu::Texture,
+    canonical_view: wgpu::TextureView,
+    canonical_blit_bg: wgpu::BindGroup,
+    canonical_linear_bg: wgpu::BindGroup,
+
     _mip1_tex: wgpu::Texture,
     mip1_view: wgpu::TextureView,
     mip1_bg: wgpu::BindGroup,
+
     _mip2_tex: wgpu::Texture,
     mip2_view: wgpu::TextureView,
     mip2_bg: wgpu::BindGroup,
-    blur_param_buffers: [wgpu::Buffer; 3],
+
     blur_param_bgs: [wgpu::BindGroup; 3],
+    liquid_backdrop: Option<(wgpu::Texture, wgpu::BindGroup)>,
 }
 
-impl GlassTargets {
-    fn new(gpu: &GpuContext, width: u32, height: u32) -> Self {
-        let (backdrop_tex, backdrop_bg) = create_backdrop_target(gpu, width, height);
+impl GlassOffscreen {
+    fn new(gpu: &GpuContext, width: u32, height: u32, format: wgpu::TextureFormat) -> Self {
+        let (canonical_tex, canonical_view, canonical_blit_bg, canonical_linear_bg) =
+            create_canonical_target(gpu, width, height, format);
+
         let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
         let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
 
-        let (mip1_tex, mip1_view, mip1_bg) = create_blur_target(gpu, w1, h1, "BlurMip1");
-        let (mip2_tex, mip2_view, mip2_bg) = create_blur_target(gpu, w2, h2, "BlurMip2");
+        let (mip1_tex, mip1_view, mip1_bg) = create_blur_target(gpu, w1, h1, format, "BlurMip1");
+        let (mip2_tex, mip2_view, mip2_bg) = create_blur_target(gpu, w2, h2, format, "BlurMip2");
 
         let uniforms = blur_pyramid_uniforms([width, height], [w1, h1], [w2, h2]);
-        let blur_param_buffers = uniforms.map(|u| {
-            gpu.device
+        let blur_param_bgs = std::array::from_fn(|i| {
+            let buf = gpu
+                .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("SteelUI Blur Params"),
-                    contents: bytemuck::bytes_of(&u),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                })
-        });
-        let blur_param_bgs = std::array::from_fn(|i| {
+                    contents: bytemuck::bytes_of(&uniforms[i]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
             gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SteelUI Blur Params BG"),
                 layout: &gpu.blur_bgl,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: blur_param_buffers[i].as_entire_binding(),
+                    resource: buf.as_entire_binding(),
                 }],
             })
         });
 
         Self {
-            backdrop_tex,
-            backdrop_bg,
+            format,
+            canonical_tex,
+            canonical_view,
+            canonical_blit_bg,
+            canonical_linear_bg,
             _mip1_tex: mip1_tex,
             mip1_view,
             mip1_bg,
             _mip2_tex: mip2_tex,
             mip2_view,
             mip2_bg,
-            blur_param_buffers,
             blur_param_bgs,
+            liquid_backdrop: None,
         }
     }
 
-    fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
-        let (btex, bbg) = create_backdrop_target(gpu, width, height);
-        self.backdrop_tex = btex;
-        self.backdrop_bg = bbg;
-
-        let (w1, h1) = ((width / 2).max(1), (height / 2).max(1));
-        let (w2, h2) = ((w1 / 2).max(1), (h1 / 2).max(1));
-
-        let (m1, mv1, mb1) = create_blur_target(gpu, w1, h1, "BlurMip1");
-        let (m2, mv2, mb2) = create_blur_target(gpu, w2, h2, "BlurMip2");
-        self._mip1_tex = m1;
-        self.mip1_view = mv1;
-        self.mip1_bg = mb1;
-        self._mip2_tex = m2;
-        self.mip2_view = mv2;
-        self.mip2_bg = mb2;
-
-        let uniforms = blur_pyramid_uniforms([width, height], [w1, h1], [w2, h2]);
-        for (i, u) in uniforms.into_iter().enumerate() {
-            gpu.queue
-                .write_buffer(&self.blur_param_buffers[i], 0, bytemuck::bytes_of(&u));
+    fn ensure_liquid_backdrop(&mut self, gpu: &GpuContext, width: u32, height: u32) {
+        if self.liquid_backdrop.is_none() {
+            self.liquid_backdrop = Some(create_backdrop_target(gpu, width, height, self.format));
         }
     }
 }
@@ -902,12 +967,7 @@ impl GlassTargets {
 pub struct WindowRenderTarget {
     width: u32,
     height: u32,
-    canonical_tex: wgpu::Texture,
-    canonical_view: wgpu::TextureView,
-    canonical_blit_bg: wgpu::BindGroup,
-    canonical_linear_bg: wgpu::BindGroup,
-
-    glass_targets: Option<GlassTargets>,
+    glass_offscreen: Option<GlassOffscreen>,
 
     globals_buffer: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
@@ -930,9 +990,6 @@ impl WindowRenderTarget {
         let width = width.max(1);
         let height = height.max(1);
 
-        let (canonical_tex, canonical_view, canonical_blit_bg, canonical_linear_bg) =
-            create_canonical_target(gpu, width, height);
-
         let globals = GlobalsUniform {
             viewport_size: [width as f32, height as f32],
             _pad: [0.0; 2],
@@ -954,29 +1011,25 @@ impl WindowRenderTarget {
             }],
         });
 
-        let sdf_capacity = 256;
+        let sdf_capacity = 128;
         let sdf_buffer = create_vertex_buffer::<RawSdfInstance>(&gpu.device, sdf_capacity, "SDF");
 
-        let image_capacity = 64;
+        let image_capacity = 32;
         let image_buffer =
             create_vertex_buffer::<RawImageInstance>(&gpu.device, image_capacity, "Image");
 
-        let glyph_capacity = 1024;
+        let glyph_capacity = 512;
         let glyph_buffer =
             create_vertex_buffer::<RawGlyphInstance>(&gpu.device, glyph_capacity, "Glyph");
 
-        let glass_capacity = 32;
+        let glass_capacity = 16;
         let glass_buffer =
             create_vertex_buffer::<RawGlassInstance>(&gpu.device, glass_capacity, "Glass");
 
         Self {
             width,
             height,
-            canonical_tex,
-            canonical_view,
-            canonical_blit_bg,
-            canonical_linear_bg,
-            glass_targets: None,
+            glass_offscreen: None,
             globals_buffer,
             globals_bg,
             sdf_buffer,
@@ -998,16 +1051,7 @@ impl WindowRenderTarget {
         }
         self.width = width;
         self.height = height;
-
-        let (tex, view, blit_bg, linear_bg) = create_canonical_target(gpu, width, height);
-        self.canonical_tex = tex;
-        self.canonical_view = view;
-        self.canonical_blit_bg = blit_bg;
-        self.canonical_linear_bg = linear_bg;
-
-        if let Some(gt) = &mut self.glass_targets {
-            gt.resize(gpu, width, height);
-        }
+        self.glass_offscreen = None;
 
         let globals = GlobalsUniform {
             viewport_size: [width as f32, height as f32],
@@ -1025,6 +1069,15 @@ impl WindowRenderTarget {
         clear_color: Color,
         draw_list: &DrawList,
     ) -> bool {
+        gpu.ensure_base_pipelines(surface_format);
+        if !draw_list.image_instances.is_empty() {
+            gpu.ensure_image_pipeline(surface_format);
+        }
+        let needs_glass = !draw_list.glass_instances.is_empty();
+        if needs_glass {
+            gpu.ensure_glass_pipelines(surface_format);
+        }
+
         if draw_list.sdf_instances.len() > self.sdf_capacity {
             let new_cap = draw_list.sdf_instances.len().next_power_of_two();
             self.sdf_buffer = create_vertex_buffer::<RawSdfInstance>(&gpu.device, new_cap, "SDF");
@@ -1080,10 +1133,46 @@ impl WindowRenderTarget {
             );
         }
 
+        if !needs_glass {
+            self.glass_offscreen = None;
+            return self.render_direct(gpu, surface_view, surface_format, clear_color, draw_list);
+        }
+
+        if self
+            .glass_offscreen
+            .as_ref()
+            .is_some_and(|g| g.format != surface_format)
+        {
+            self.glass_offscreen = None;
+        }
+        let width = self.width;
+        let height = self.height;
+        let bufs = BatchBuffers {
+            width,
+            height,
+            globals_bg: &self.globals_bg,
+            sdf_buffer: &self.sdf_buffer,
+            image_buffer: &self.image_buffer,
+            glyph_buffer: &self.glyph_buffer,
+        };
+        let go = self
+            .glass_offscreen
+            .get_or_insert_with(|| GlassOffscreen::new(gpu, width, height, surface_format));
+        if draw_list.has_liquid_glass {
+            go.ensure_liquid_backdrop(gpu, width, height);
+        } else {
+            go.liquid_backdrop = None;
+        }
+
+        let pipes = &gpu.pipelines[&surface_format];
+        let blur_pipe = pipes.blur.as_ref().expect("blur pipeline");
+        let glass_pipe = pipes.glass.as_ref().expect("glass pipeline");
+        let blit_pipe = pipes.blit.as_ref().expect("blit pipeline");
+
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("SteelUI Frame Encoder"),
+                label: Some("SteelUI Glass Frame Encoder"),
             });
 
         let mut is_first_pass = true;
@@ -1098,77 +1187,72 @@ impl WindowRenderTarget {
                 }
                 DrawBatch::Glass(idx) => {
                     if is_first_pass {
-                        let _ = begin_canonical_pass(
+                        let _ = begin_ui_pass(
                             &mut encoder,
-                            &self.canonical_view,
+                            &go.canonical_view,
                             wgpu::LoadOp::Clear(clear_color.to_wgpu()),
                         );
                         is_first_pass = false;
                     }
 
-                    let gt = self
-                        .glass_targets
-                        .get_or_insert_with(|| GlassTargets::new(gpu, self.width, self.height));
-
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &self.canonical_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &gt.backdrop_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                    if let Some((backdrop_tex, _)) = &go.liquid_backdrop {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &go.canonical_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: backdrop_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width,
+                                height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
 
                     run_blur_pass(
                         &mut encoder,
-                        &gpu.blur_pipeline,
-                        &self.canonical_linear_bg,
-                        &gt.blur_param_bgs[0],
-                        &gt.mip1_view,
+                        blur_pipe,
+                        &go.canonical_linear_bg,
+                        &go.blur_param_bgs[0],
+                        &go.mip1_view,
                     );
                     run_blur_pass(
                         &mut encoder,
-                        &gpu.blur_pipeline,
-                        &gt.mip1_bg,
-                        &gt.blur_param_bgs[1],
-                        &gt.mip2_view,
+                        blur_pipe,
+                        &go.mip1_bg,
+                        &go.blur_param_bgs[1],
+                        &go.mip2_view,
                     );
                     run_blur_pass(
                         &mut encoder,
-                        &gpu.blur_pipeline,
-                        &gt.mip2_bg,
-                        &gt.blur_param_bgs[2],
-                        &gt.mip1_view,
+                        blur_pipe,
+                        &go.mip2_bg,
+                        &go.blur_param_bgs[2],
+                        &go.mip1_view,
                     );
 
                     {
-                        let mut pass = begin_canonical_pass(
-                            &mut encoder,
-                            &self.canonical_view,
-                            wgpu::LoadOp::Load,
-                        );
-                        if apply_scissor(
-                            &mut pass,
-                            active_scissor,
-                            draw_list.scale,
-                            self.width,
-                            self.height,
-                        ) {
-                            pass.set_pipeline(&gpu.glass_pipeline);
+                        let mut pass =
+                            begin_ui_pass(&mut encoder, &go.canonical_view, wgpu::LoadOp::Load);
+                        if apply_scissor(&mut pass, active_scissor, draw_list.scale, width, height)
+                        {
+                            let sharp_bg = go
+                                .liquid_backdrop
+                                .as_ref()
+                                .map(|(_, bg)| bg)
+                                .unwrap_or(&go.mip1_bg);
+                            pass.set_pipeline(glass_pipe);
                             pass.set_bind_group(0, &self.globals_bg, &[]);
-                            pass.set_bind_group(1, &gt.backdrop_bg, &[]);
-                            pass.set_bind_group(2, &gt.mip1_bg, &[]);
+                            pass.set_bind_group(1, sharp_bg, &[]);
+                            pass.set_bind_group(2, &go.mip1_bg, &[]);
                             pass.set_vertex_buffer(0, self.glass_buffer.slice(..));
                             pass.draw(0..4, *idx..(*idx + 1));
                         }
@@ -1184,77 +1268,30 @@ impl WindowRenderTarget {
                     };
 
                     {
-                        let mut pass =
-                            begin_canonical_pass(&mut encoder, &self.canonical_view, load);
-                        let mut scissor_visible = apply_scissor(
+                        let mut pass = begin_ui_pass(&mut encoder, &go.canonical_view, load);
+                        i = record_standard_batches(
                             &mut pass,
-                            active_scissor,
-                            draw_list.scale,
-                            self.width,
-                            self.height,
+                            pipes,
+                            gpu,
+                            &bufs,
+                            draw_list,
+                            i,
+                            &mut active_scissor,
                         );
-                        while i < draw_list.batches.len() {
-                            match &draw_list.batches[i] {
-                                DrawBatch::SetScissor(sc) => {
-                                    active_scissor = *sc;
-                                    scissor_visible = apply_scissor(
-                                        &mut pass,
-                                        active_scissor,
-                                        draw_list.scale,
-                                        self.width,
-                                        self.height,
-                                    );
-                                    i += 1;
-                                }
-                                DrawBatch::Sdf(range) => {
-                                    if scissor_visible {
-                                        pass.set_pipeline(&gpu.sdf_pipeline);
-                                        pass.set_bind_group(0, &self.globals_bg, &[]);
-                                        pass.set_vertex_buffer(0, self.sdf_buffer.slice(..));
-                                        pass.draw(0..4, range.clone());
-                                    }
-                                    i += 1;
-                                }
-                                DrawBatch::Image { tex, range } => {
-                                    if scissor_visible
-                                        && let Some(Some(uploaded)) = gpu.textures.get(tex.0)
-                                    {
-                                        pass.set_pipeline(&gpu.image_pipeline);
-                                        pass.set_bind_group(0, &self.globals_bg, &[]);
-                                        pass.set_bind_group(1, &uploaded.bind_group, &[]);
-                                        pass.set_vertex_buffer(0, self.image_buffer.slice(..));
-                                        pass.draw(0..4, range.clone());
-                                    }
-                                    i += 1;
-                                }
-                                DrawBatch::Text(range) => {
-                                    if scissor_visible {
-                                        pass.set_pipeline(&gpu.text_pipeline);
-                                        pass.set_bind_group(0, &self.globals_bg, &[]);
-                                        pass.set_bind_group(1, &gpu.glyph_atlas.bind_group, &[]);
-                                        pass.set_vertex_buffer(0, self.glyph_buffer.slice(..));
-                                        pass.draw(0..4, range.clone());
-                                    }
-                                    i += 1;
-                                }
-                                DrawBatch::Glass(_) => break,
-                            }
-                        }
                     }
                 }
             }
         }
 
         if is_first_pass {
-            let _ = begin_canonical_pass(
+            let _ = begin_ui_pass(
                 &mut encoder,
-                &self.canonical_view,
+                &go.canonical_view,
                 wgpu::LoadOp::Clear(clear_color.to_wgpu()),
             );
         }
 
         {
-            let blit_pipeline = gpu.blit_pipeline_for(surface_format);
             let mut blit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SteelUI Final Blit Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1272,14 +1309,135 @@ impl WindowRenderTarget {
                 multiview_mask: None,
             });
 
-            blit_pass.set_pipeline(blit_pipeline);
-            blit_pass.set_bind_group(0, &self.canonical_blit_bg, &[]);
+            blit_pass.set_pipeline(blit_pipe);
+            blit_pass.set_bind_group(0, &go.canonical_blit_bg, &[]);
             blit_pass.draw(0..3, 0..1);
         }
 
         gpu.queue.submit(std::iter::once(encoder.finish()));
         draw_list.atlas_overflowed
     }
+
+    fn render_direct(
+        &self,
+        gpu: &GpuContext,
+        surface_view: &wgpu::TextureView,
+        surface_format: wgpu::TextureFormat,
+        clear_color: Color,
+        draw_list: &DrawList,
+    ) -> bool {
+        let pipes = &gpu.pipelines[&surface_format];
+        let bufs = BatchBuffers {
+            width: self.width,
+            height: self.height,
+            globals_bg: &self.globals_bg,
+            sdf_buffer: &self.sdf_buffer,
+            image_buffer: &self.image_buffer,
+            glyph_buffer: &self.glyph_buffer,
+        };
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("SteelUI Direct Frame Encoder"),
+            });
+
+        {
+            let mut pass = begin_ui_pass(
+                &mut encoder,
+                surface_view,
+                wgpu::LoadOp::Clear(clear_color.to_wgpu()),
+            );
+            let mut active_scissor: Option<Rect> = None;
+            let _ = record_standard_batches(
+                &mut pass,
+                pipes,
+                gpu,
+                &bufs,
+                draw_list,
+                0,
+                &mut active_scissor,
+            );
+        }
+
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+        draw_list.atlas_overflowed
+    }
+}
+
+struct BatchBuffers<'a> {
+    width: u32,
+    height: u32,
+    globals_bg: &'a wgpu::BindGroup,
+    sdf_buffer: &'a wgpu::Buffer,
+    image_buffer: &'a wgpu::Buffer,
+    glyph_buffer: &'a wgpu::Buffer,
+}
+
+fn record_standard_batches<'a>(
+    pass: &mut wgpu::RenderPass<'a>,
+    pipes: &'a FormatPipelines,
+    gpu: &'a GpuContext,
+    bufs: &BatchBuffers<'a>,
+    draw_list: &DrawList,
+    mut i: usize,
+    active_scissor: &mut Option<Rect>,
+) -> usize {
+    let mut scissor_visible = apply_scissor(
+        pass,
+        *active_scissor,
+        draw_list.scale,
+        bufs.width,
+        bufs.height,
+    );
+    while i < draw_list.batches.len() {
+        match &draw_list.batches[i] {
+            DrawBatch::SetScissor(sc) => {
+                *active_scissor = *sc;
+                scissor_visible = apply_scissor(
+                    pass,
+                    *active_scissor,
+                    draw_list.scale,
+                    bufs.width,
+                    bufs.height,
+                );
+                i += 1;
+            }
+            DrawBatch::Sdf(range) => {
+                if scissor_visible {
+                    pass.set_pipeline(&pipes.sdf);
+                    pass.set_bind_group(0, bufs.globals_bg, &[]);
+                    pass.set_vertex_buffer(0, bufs.sdf_buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                i += 1;
+            }
+            DrawBatch::Image { tex, range } => {
+                if scissor_visible
+                    && let Some(img_pipe) = &pipes.image
+                    && let Some(Some(uploaded)) = gpu.textures.get(tex.0)
+                {
+                    pass.set_pipeline(img_pipe);
+                    pass.set_bind_group(0, bufs.globals_bg, &[]);
+                    pass.set_bind_group(1, &uploaded.bind_group, &[]);
+                    pass.set_vertex_buffer(0, bufs.image_buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                i += 1;
+            }
+            DrawBatch::Text(range) => {
+                if scissor_visible {
+                    pass.set_pipeline(&pipes.text);
+                    pass.set_bind_group(0, bufs.globals_bg, &[]);
+                    pass.set_bind_group(1, &gpu.glyph_atlas.bind_group, &[]);
+                    pass.set_vertex_buffer(0, bufs.glyph_buffer.slice(..));
+                    pass.draw(0..4, range.clone());
+                }
+                i += 1;
+            }
+            DrawBatch::Glass(_) => break,
+        }
+    }
+    i
 }
 
 fn apply_scissor(
@@ -1330,13 +1488,13 @@ fn blur_pyramid_uniforms(full: [u32; 2], mip1: [u32; 2], mip2: [u32; 2]) -> [Blu
     ]
 }
 
-fn begin_canonical_pass<'a>(
+fn begin_ui_pass<'a>(
     encoder: &'a mut wgpu::CommandEncoder,
     view: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
 ) -> wgpu::RenderPass<'a> {
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("SteelUI Canonical UI Pass"),
+        label: Some("SteelUI UI Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view,
             resolve_target: None,
@@ -1395,6 +1553,7 @@ fn create_canonical_target(
     gpu: &GpuContext,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> (
     wgpu::Texture,
     wgpu::TextureView,
@@ -1411,7 +1570,7 @@ fn create_canonical_target(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: CANONICAL_FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
@@ -1457,6 +1616,7 @@ fn create_blur_target(
     gpu: &GpuContext,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
     label: &str,
 ) -> (wgpu::Texture, wgpu::TextureView, wgpu::BindGroup) {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -1469,7 +1629,7 @@ fn create_blur_target(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: CANONICAL_FORMAT,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -1497,6 +1657,7 @@ fn create_backdrop_target(
     gpu: &GpuContext,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::BindGroup) {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("SteelUI Sharp Backdrop Copy"),
@@ -1508,7 +1669,7 @@ fn create_backdrop_target(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: CANONICAL_FORMAT,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -1534,10 +1695,10 @@ fn create_backdrop_target(
 
 fn create_sdf_pipeline(
     device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
     globals_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/sdf.wgsl"));
-
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("SteelUI SDF Pipeline Layout"),
         bind_group_layouts: &[Some(globals_bgl)],
@@ -1595,17 +1756,17 @@ fn create_sdf_pipeline(
         label: Some("SteelUI SDF Pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[Some(instance_layout)],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: CANONICAL_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1628,11 +1789,11 @@ fn create_sdf_pipeline(
 
 fn create_image_pipeline(
     device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
     globals_bgl: &wgpu::BindGroupLayout,
     tex_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/textured.wgsl"));
-
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("SteelUI Image Pipeline Layout"),
         bind_group_layouts: &[Some(globals_bgl), Some(tex_bgl)],
@@ -1670,17 +1831,17 @@ fn create_image_pipeline(
         label: Some("SteelUI Image Pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[Some(instance_layout)],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: CANONICAL_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1703,11 +1864,11 @@ fn create_image_pipeline(
 
 fn create_text_pipeline(
     device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
     globals_bgl: &wgpu::BindGroupLayout,
     atlas_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/text.wgsl"));
-
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("SteelUI Text Pipeline Layout"),
         bind_group_layouts: &[Some(globals_bgl), Some(atlas_bgl)],
@@ -1740,17 +1901,17 @@ fn create_text_pipeline(
         label: Some("SteelUI Text Pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[Some(instance_layout)],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: CANONICAL_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1773,11 +1934,11 @@ fn create_text_pipeline(
 
 fn create_blur_pipeline(
     device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
     tex_bgl: &wgpu::BindGroupLayout,
     blur_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/blur.wgsl"));
-
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("SteelUI Blur Pipeline Layout"),
         bind_group_layouts: &[Some(tex_bgl), Some(blur_bgl)],
@@ -1788,17 +1949,17 @@ fn create_blur_pipeline(
         label: Some("SteelUI Blur Pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: CANONICAL_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1821,11 +1982,11 @@ fn create_blur_pipeline(
 
 fn create_glass_pipeline(
     device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
     globals_bgl: &wgpu::BindGroupLayout,
     tex_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/glass.wgsl"));
-
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("SteelUI Glass Pipeline Layout"),
         bind_group_layouts: &[Some(globals_bgl), Some(tex_bgl), Some(tex_bgl)],
@@ -1888,17 +2049,17 @@ fn create_glass_pipeline(
         label: Some("SteelUI Glass Pipeline"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &shader,
+            module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[Some(instance_layout)],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &shader,
+            module: shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: CANONICAL_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -1919,16 +2080,56 @@ fn create_glass_pipeline(
     })
 }
 
+fn create_blit_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    tex_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("SteelUI Blit Pipeline Layout"),
+        bind_group_layouts: &[Some(tex_bgl)],
+        immediate_size: 0,
+    });
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SteelUI Blit Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_tex_resources(
     device: &wgpu::Device,
-) -> (
-    wgpu::ShaderModule,
-    wgpu::BindGroupLayout,
-    wgpu::Sampler,
-    wgpu::Sampler,
-) {
-    let shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/blit.wgsl"));
-
+) -> (wgpu::BindGroupLayout, wgpu::Sampler, wgpu::Sampler) {
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("SteelUI Texture BGL"),
         entries: &[
@@ -1973,7 +2174,7 @@ fn create_tex_resources(
         ..Default::default()
     });
 
-    (shader, bgl, nearest, linear)
+    (bgl, nearest, linear)
 }
 
 #[cfg(test)]

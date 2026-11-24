@@ -106,17 +106,30 @@ impl<T: 'static> Clone for Signal<T> {
 impl<T: 'static> Copy for Signal<T> {}
 
 impl<T: 'static> Signal<T> {
+    pub fn is_alive(self) -> bool {
+        RUNTIME.with(|rt| rt.borrow().signals.contains_key(self.id))
+    }
+
+    pub fn try_get(self) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.try_with(Clone::clone)
+    }
+
     pub fn get(self) -> T
     where
         T: Clone,
     {
-        self.with(|v| v.clone())
+        self.with(Clone::clone)
     }
 
     pub fn try_with<R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        // Acquire and immediately drop RUNTIME borrow so `f` can read/write other signals freely
         let cell = RUNTIME.with(|rt| {
             let mut rt = rt.borrow_mut();
+            if !rt.signals.contains_key(self.id) {
+                return None;
+            }
             rt.record_read(self.id);
             rt.signals.get(self.id).cloned()
         })?;
@@ -152,6 +165,48 @@ impl<T: 'static> Signal<T> {
             let mut rt = rt.borrow_mut();
             rt.signals.remove(self.id);
             rt.subscribers.remove(&self.id);
+        });
+    }
+}
+
+/// RAII wrapper around a `Signal<T>` that automatically frees its slot on drop.
+pub struct OwnedSignal<T: 'static> {
+    inner: Signal<T>,
+}
+
+impl<T: 'static> OwnedSignal<T> {
+    pub fn new(initial: T) -> Self {
+        Self {
+            inner: create_signal(initial),
+        }
+    }
+
+    pub fn signal(&self) -> Signal<T> {
+        self.inner
+    }
+
+    pub fn get(&self) -> T
+    where
+        T: Clone,
+    {
+        self.inner.get()
+    }
+
+    pub fn set(&self, value: T) {
+        self.inner.set(value);
+    }
+
+    pub fn update(&self, f: impl FnOnce(&mut T)) {
+        self.inner.update(f);
+    }
+}
+
+impl<T: 'static> Drop for OwnedSignal<T> {
+    fn drop(&mut self) {
+        let _ = RUNTIME.try_with(|rt| {
+            let mut rt = rt.borrow_mut();
+            rt.signals.remove(self.inner.id);
+            rt.subscribers.remove(&self.inner.id);
         });
     }
 }
@@ -228,7 +283,6 @@ fn run_effect(id: EffectId) {
         if let Some(cb) = guard.func.as_mut() {
             cb();
         }
-        // Normal exit & unwinding both restore `tracking_stack` and `func` via `EffectRunGuard::drop`
     }
 }
 
@@ -315,6 +369,19 @@ mod tests {
     }
 
     #[test]
+    fn owned_signal_cleans_up_on_drop_and_try_get_is_safe() {
+        let handle = {
+            let owned = OwnedSignal::new(42);
+            let sig = owned.signal();
+            assert_eq!(sig.try_get(), Some(42));
+            assert!(sig.is_alive());
+            sig
+        };
+        assert!(!handle.is_alive());
+        assert_eq!(handle.try_get(), None);
+    }
+
+    #[test]
     fn nested_reads_inside_update_and_with_do_not_panic() {
         let a = create_signal(5);
         let b = create_signal(10);
@@ -347,7 +414,6 @@ mod tests {
         });
         assert_eq!(observed.get(), 1);
 
-        // Mutating trigger must not attribute clean_sig reads to the panicked effect
         clean_sig.set(7);
         flush_effects();
         assert_eq!(observed.get(), 7);

@@ -7,12 +7,14 @@ pub struct FrameMetrics {
     pub layout_ms: f32,
     pub paint_ms: f32,
     pub fps: f32,
+    pub effective_fps: f32,
     pub relayouts: u64,
     pub repaints: u64,
 }
 
 pub struct FrameProfiler {
     samples: VecDeque<f32>,
+    cadence_samples: VecDeque<f32>,
     max_samples: usize,
     pub metrics: FrameMetrics,
 }
@@ -21,6 +23,7 @@ impl FrameProfiler {
     pub fn new(max_samples: usize) -> Self {
         Self {
             samples: VecDeque::with_capacity(max_samples),
+            cadence_samples: VecDeque::with_capacity(max_samples),
             max_samples: max_samples.max(1),
             metrics: FrameMetrics::default(),
         }
@@ -28,6 +31,18 @@ impl FrameProfiler {
 
     pub fn begin_timer() -> Instant {
         Instant::now()
+    }
+
+    pub fn record_cadence(&mut self, frame_dt_secs: f32) {
+        if frame_dt_secs > 0.0005 && frame_dt_secs < 0.20 {
+            if self.cadence_samples.len() == self.max_samples {
+                self.cadence_samples.pop_front();
+            }
+            self.cadence_samples.push_back(frame_dt_secs);
+            let avg_dt =
+                self.cadence_samples.iter().sum::<f32>() / self.cadence_samples.len() as f32;
+            self.metrics.effective_fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 0.0 };
+        }
     }
 
     pub fn record_frame(&mut self, frame_ms: f32, layout_ms: f32, paint_ms: f32, did_layout: bool) {

@@ -9,10 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Custom GPU Surfaces:** `CustomGpuSurface` and `CustomGpuPass` let applications embed their own WGSL render passes inside rounded, clipped SteelUI layouts, with reactive radius binding and reusable render textures.
+- **Unicode-Safe Text Editing:** `TextInput` now snaps cursor and selection offsets to UTF-8 character boundaries and uses measured glyph advances for click-to-caret positioning.
+- **Reactive Runtime Hardening:** Reentrancy-safe signal access, panic-safe effect execution, disposal cleanup, cycle diagnostics, and per-arena dirty queues for multi-window isolation.
+- **Renderer Reliability:** Persistent clip stack, exact scissor intersection, lazy glass/blur targets, safe glyph atlas growth, and explicit texture release/reuse.
+- **Surface Resilience:** Zero-size surface guard, reconfiguration on DPI/size changes, and checked surface capability fallbacks.
+
 ### Planned
 - **Live `AccessKit` Adapter Wiring:** Publish incremental `TreeUpdate`s, route semantic actions, and synchronize focus/bounds with native screen readers.
 - **Dynamic Vector Paths (`lyon`):** Tessellate animated Bezier paths, splines, charts, and node wires into cached GPU geometry.
-- **`CustomGpuSurface`:** Embed application-owned `wgpu` render passes inside rounded, clipped SteelUI layouts.
 - **IME & Multiline `TextArea`:** Composition strings, OS candidate-window placement, wrapped vertical editing, and undo/redo stacks.
 
 ---

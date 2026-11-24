@@ -24,6 +24,7 @@ image.workspace = true
 resvg.workspace = true
 
 accesskit.workspace = true
+accesskit_winit.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 

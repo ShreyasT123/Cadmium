@@ -8,3 +8,5 @@ license.workspace = true
 steelui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true

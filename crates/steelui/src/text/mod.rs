@@ -58,7 +58,6 @@ impl TextEngine {
                 r"C:\Windows\Fonts\segoeui.ttf",
                 r"C:\Windows\Fonts\segoeuib.ttf",
                 r"C:\Windows\Fonts\segoeuisb.ttf",
-                r"C:\Windows\Fonts\seguisym.ttf",
             ] {
                 let _ = db.load_font_file(path);
             }
@@ -190,18 +189,6 @@ impl TextBlock {
                 });
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn collect_glyphs(
-        &self,
-        origin_x_px: f32,
-        origin_y_px: f32,
-        scale: f32,
-    ) -> Vec<ShapedGlyph> {
-        let mut out = Vec::new();
-        self.collect_glyphs_into(origin_x_px, origin_y_px, scale, &mut out);
-        out
     }
 
     pub(crate) fn collect_char_offsets(&self, out: &mut Vec<(usize, f32)>) {
