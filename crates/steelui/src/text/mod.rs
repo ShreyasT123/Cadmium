@@ -200,6 +200,51 @@ impl TextBlock {
             }
         }
     }
+
+    pub(crate) fn line_y(&self, line: usize) -> f32 {
+        self.buffer
+            .layout_runs()
+            .nth(line)
+            .map(|run| run.line_y)
+            .unwrap_or(line as f32 * self.style.line_height)
+    }
+
+    pub(crate) fn x_offset_for_byte(&self, line: usize, byte_idx: usize) -> f32 {
+        let Some(run) = self.buffer.layout_runs().nth(line) else {
+            return 0.0;
+        };
+        let mut x = 0.0;
+        for glyph in run.glyphs.iter() {
+            if glyph.end > byte_idx {
+                return glyph.x;
+            }
+            x = glyph.x + glyph.w;
+        }
+        x
+    }
+
+    pub(crate) fn byte_index_at_x(&self, line: usize, x: f32) -> usize {
+        let Some(run) = self.buffer.layout_runs().nth(line) else {
+            return 0;
+        };
+        let mut best = 0;
+        let mut best_dist = x.abs();
+        let mut end = 0;
+        for glyph in run.glyphs.iter() {
+            let dist = (glyph.x - x).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = end;
+            }
+            end = glyph.end;
+            let dist = (glyph.x + glyph.w - x).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best = end;
+            }
+        }
+        best
+    }
 }
 
 pub(crate) fn swash_is_color(content: SwashContent) -> bool {

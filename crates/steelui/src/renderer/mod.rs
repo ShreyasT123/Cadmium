@@ -3,6 +3,9 @@ use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use cosmic_text::CacheKey;
+use lyon::math::point;
+pub use lyon::path::Path as LyonPath;
+use lyon::tessellation::*;
 use wgpu::util::DeviceExt;
 
 use crate::assets::DecodedImage;
@@ -219,6 +222,78 @@ struct RawGlyphInstance {
     color: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct PathVertex {
+    pub position: [f32; 2],
+    pub color: [f32; 4],
+}
+
+impl PathVertex {
+    pub fn new(x: f32, y: f32, color: Color) -> Self {
+        Self {
+            position: [x, y],
+            color: color.to_array(),
+        }
+    }
+}
+
+pub struct PathBuilder {
+    builder: lyon::path::path::Builder,
+}
+
+impl PathBuilder {
+    pub fn new() -> Self {
+        Self {
+            builder: LyonPath::builder(),
+        }
+    }
+
+    pub fn move_to(&mut self, x: f32, y: f32) {
+        self.builder.begin(point(x, y));
+    }
+
+    pub fn line_to(&mut self, x: f32, y: f32) {
+        self.builder.line_to(point(x, y));
+    }
+
+    pub fn quadratic_bezier_to(&mut self, ctrl_x: f32, ctrl_y: f32, to_x: f32, to_y: f32) {
+        self.builder
+            .quadratic_bezier_to(point(ctrl_x, ctrl_y), point(to_x, to_y));
+    }
+
+    pub fn cubic_bezier_to(
+        &mut self,
+        c1_x: f32,
+        c1_y: f32,
+        c2_x: f32,
+        c2_y: f32,
+        to_x: f32,
+        to_y: f32,
+    ) {
+        self.builder
+            .cubic_bezier_to(point(c1_x, c1_y), point(c2_x, c2_y), point(to_x, to_y));
+    }
+
+    pub fn close(&mut self) {
+        self.builder.end(true);
+    }
+
+    pub fn finish(&mut self) {
+        self.builder.end(false);
+    }
+
+    pub fn build(self) -> LyonPath {
+        self.builder.build()
+    }
+}
+
+impl Default for PathBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum DrawBatch {
     Sdf(Range<u32>),
@@ -227,6 +302,10 @@ enum DrawBatch {
         range: Range<u32>,
     },
     Text(Range<u32>),
+    Path {
+        index_range: Range<u32>,
+        vertex_offset: i32,
+    },
     Glass(u32),
     SetScissor(Option<Rect>),
 }
@@ -237,6 +316,8 @@ pub struct DrawList {
     image_instances: Vec<RawImageInstance>,
     glyph_instances: Vec<RawGlyphInstance>,
     glass_instances: Vec<RawGlassInstance>,
+    path_vertices: Vec<PathVertex>,
+    path_indices: Vec<u32>,
     clip_stack: Vec<Rect>,
     glyph_scratch: Vec<ShapedGlyph>,
     batches: Vec<DrawBatch>,
@@ -252,6 +333,8 @@ impl DrawList {
             image_instances: Vec::new(),
             glyph_instances: Vec::new(),
             glass_instances: Vec::new(),
+            path_vertices: Vec::new(),
+            path_indices: Vec::new(),
             clip_stack: Vec::new(),
             glyph_scratch: Vec::new(),
             batches: Vec::new(),
@@ -306,6 +389,35 @@ impl DrawList {
         self.clip_stack.pop();
         self.batches
             .push(DrawBatch::SetScissor(self.clip_stack.last().copied()));
+    }
+
+    pub fn push_stroke_path(&mut self, path: &LyonPath, color: Color, width: f32) {
+        let v_start = self.path_vertices.len() as i32;
+        let i_start = self.path_indices.len() as u32;
+
+        let mut tessellator = StrokeTessellator::new();
+        let options = StrokeOptions::default().with_line_width(width);
+        let mut geometry: VertexBuffers<PathVertex, u32> = VertexBuffers::new();
+        let color_arr = color.to_array();
+
+        let res = tessellator.tessellate_path(
+            path,
+            &options,
+            &mut BuffersBuilder::new(&mut geometry, |pos: StrokeVertex| PathVertex {
+                position: [pos.position().x * self.scale, pos.position().y * self.scale],
+                color: color_arr,
+            }),
+        );
+
+        if res.is_ok() && !geometry.indices.is_empty() {
+            self.path_vertices.extend(geometry.vertices);
+            self.path_indices.extend(geometry.indices);
+            let i_end = self.path_indices.len() as u32;
+            self.batches.push(DrawBatch::Path {
+                index_range: i_start..i_end,
+                vertex_offset: v_start,
+            });
+        }
     }
 
     pub fn push_text(
@@ -583,6 +695,7 @@ impl GlyphAtlas {
 
 struct FormatPipelines {
     sdf: wgpu::RenderPipeline,
+    path: wgpu::RenderPipeline,
     text: wgpu::RenderPipeline,
     image: Option<wgpu::RenderPipeline>,
     blur: Option<wgpu::RenderPipeline>,
@@ -608,6 +721,7 @@ pub struct GpuContext {
     linear_sampler: wgpu::Sampler,
 
     sdf_shader: wgpu::ShaderModule,
+    path_shader: wgpu::ShaderModule,
     text_shader: wgpu::ShaderModule,
     image_shader: Option<wgpu::ShaderModule>,
     blur_shader: Option<wgpu::ShaderModule>,
@@ -672,6 +786,8 @@ impl GpuContext {
 
         let (tex_bgl, nearest_sampler, linear_sampler) = create_tex_resources(&device);
         let sdf_shader = device.create_shader_module(wgpu::include_wgsl!("../../shaders/sdf.wgsl"));
+        let path_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../shaders/path.wgsl"));
         let text_shader =
             device.create_shader_module(wgpu::include_wgsl!("../../shaders/text.wgsl"));
         let glyph_atlas = GlyphAtlas::new(&device, &tex_bgl, &nearest_sampler);
@@ -691,6 +807,7 @@ impl GpuContext {
             nearest_sampler,
             linear_sampler,
             sdf_shader,
+            path_shader,
             text_shader,
             image_shader: None,
             blur_shader: None,
@@ -815,6 +932,12 @@ impl GpuContext {
             .entry(format)
             .or_insert_with(|| FormatPipelines {
                 sdf: create_sdf_pipeline(&self.device, &self.sdf_shader, &self.globals_bgl, format),
+                path: create_path_pipeline(
+                    &self.device,
+                    &self.path_shader,
+                    &self.globals_bgl,
+                    format,
+                ),
                 text: create_text_pipeline(
                     &self.device,
                     &self.text_shader,
@@ -983,6 +1106,11 @@ pub struct WindowRenderTarget {
 
     glass_buffer: wgpu::Buffer,
     glass_capacity: usize,
+
+    path_vbuf: wgpu::Buffer,
+    path_vcapacity: usize,
+    path_ibuf: wgpu::Buffer,
+    path_icapacity: usize,
 }
 
 impl WindowRenderTarget {
@@ -1026,6 +1154,11 @@ impl WindowRenderTarget {
         let glass_buffer =
             create_vertex_buffer::<RawGlassInstance>(&gpu.device, glass_capacity, "Glass");
 
+        let path_vcapacity = 256;
+        let path_vbuf = create_vertex_buffer::<PathVertex>(&gpu.device, path_vcapacity, "Path");
+        let path_icapacity = 512;
+        let path_ibuf = create_index_buffer(&gpu.device, path_icapacity, "Path Indices");
+
         Self {
             width,
             height,
@@ -1040,6 +1173,10 @@ impl WindowRenderTarget {
             glyph_capacity,
             glass_buffer,
             glass_capacity,
+            path_vbuf,
+            path_vcapacity,
+            path_ibuf,
+            path_icapacity,
         }
     }
 
@@ -1133,6 +1270,31 @@ impl WindowRenderTarget {
             );
         }
 
+        if draw_list.path_vertices.len() > self.path_vcapacity {
+            let new_cap = draw_list.path_vertices.len().next_power_of_two();
+            self.path_vbuf = create_vertex_buffer::<PathVertex>(&gpu.device, new_cap, "Path");
+            self.path_vcapacity = new_cap;
+        }
+        if !draw_list.path_vertices.is_empty() {
+            gpu.queue.write_buffer(
+                &self.path_vbuf,
+                0,
+                bytemuck::cast_slice(&draw_list.path_vertices),
+            );
+        }
+        if draw_list.path_indices.len() > self.path_icapacity {
+            let new_cap = draw_list.path_indices.len().next_power_of_two();
+            self.path_ibuf = create_index_buffer(&gpu.device, new_cap, "Path Indices");
+            self.path_icapacity = new_cap;
+        }
+        if !draw_list.path_indices.is_empty() {
+            gpu.queue.write_buffer(
+                &self.path_ibuf,
+                0,
+                bytemuck::cast_slice(&draw_list.path_indices),
+            );
+        }
+
         if !needs_glass {
             self.glass_offscreen = None;
             return self.render_direct(gpu, surface_view, surface_format, clear_color, draw_list);
@@ -1154,6 +1316,8 @@ impl WindowRenderTarget {
             sdf_buffer: &self.sdf_buffer,
             image_buffer: &self.image_buffer,
             glyph_buffer: &self.glyph_buffer,
+            path_vbuf: &self.path_vbuf,
+            path_ibuf: &self.path_ibuf,
         };
         let go = self
             .glass_offscreen
@@ -1259,7 +1423,10 @@ impl WindowRenderTarget {
                     }
                     i += 1;
                 }
-                DrawBatch::Sdf(_) | DrawBatch::Image { .. } | DrawBatch::Text(_) => {
+                DrawBatch::Sdf(_)
+                | DrawBatch::Image { .. }
+                | DrawBatch::Text(_)
+                | DrawBatch::Path { .. } => {
                     let load = if is_first_pass {
                         is_first_pass = false;
                         wgpu::LoadOp::Clear(clear_color.to_wgpu())
@@ -1334,6 +1501,8 @@ impl WindowRenderTarget {
             sdf_buffer: &self.sdf_buffer,
             image_buffer: &self.image_buffer,
             glyph_buffer: &self.glyph_buffer,
+            path_vbuf: &self.path_vbuf,
+            path_ibuf: &self.path_ibuf,
         };
         let mut encoder = gpu
             .device
@@ -1371,6 +1540,8 @@ struct BatchBuffers<'a> {
     sdf_buffer: &'a wgpu::Buffer,
     image_buffer: &'a wgpu::Buffer,
     glyph_buffer: &'a wgpu::Buffer,
+    path_vbuf: &'a wgpu::Buffer,
+    path_ibuf: &'a wgpu::Buffer,
 }
 
 fn record_standard_batches<'a>(
@@ -1431,6 +1602,19 @@ fn record_standard_batches<'a>(
                     pass.set_bind_group(1, &gpu.glyph_atlas.bind_group, &[]);
                     pass.set_vertex_buffer(0, bufs.glyph_buffer.slice(..));
                     pass.draw(0..4, range.clone());
+                }
+                i += 1;
+            }
+            DrawBatch::Path {
+                index_range,
+                vertex_offset,
+            } => {
+                if scissor_visible {
+                    pass.set_pipeline(&pipes.path);
+                    pass.set_bind_group(0, bufs.globals_bg, &[]);
+                    pass.set_vertex_buffer(0, bufs.path_vbuf.slice(..));
+                    pass.set_index_buffer(bufs.path_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(index_range.clone(), *vertex_offset, 0..1);
                 }
                 i += 1;
             }
@@ -1691,6 +1875,74 @@ fn create_backdrop_target(
     });
 
     (texture, bg)
+}
+
+fn create_path_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    globals_bgl: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("SteelUI Path Pipeline Layout"),
+        bind_group_layouts: &[Some(globals_bgl)],
+        immediate_size: 0,
+    });
+
+    let vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PathVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+            wgpu::VertexAttribute {
+                offset: 8,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+        ],
+    };
+
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("SteelUI Path Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(vertex_layout)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_index_buffer(device: &wgpu::Device, capacity: usize, tag: &str) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(tag),
+        size: (capacity * std::mem::size_of::<u32>()) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 fn create_sdf_pipeline(

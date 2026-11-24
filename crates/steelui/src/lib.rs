@@ -27,14 +27,16 @@ pub use crate::platform::{Clipboard, FileDialog};
 pub use crate::reactive::{
     OwnedSignal, Signal, UiDispatcher, create_effect, create_signal, flush_effects,
 };
-pub use crate::renderer::{GlassQuad, GpuContext, ImageQuad, SdfQuad, TextureHandle};
+pub use crate::renderer::{
+    GlassQuad, GpuContext, ImageQuad, LyonPath, PathBuilder, PathVertex, SdfQuad, TextureHandle,
+};
 pub use crate::style::{MacTheme, Material, Shadow, ThemeMode};
 pub use crate::text::{FontWeight, TextBlock, TextEngine, TextStyle};
 pub use crate::widgets::{
     Button, Column, Container, CustomGpuPass, CustomGpuSurface, Divider, Dropdown, Element,
     GlassPanel, IntoElement, MenuItem, Row, ScrollView, Slider, Spacer, SplitDirection, SplitPane,
-    Switch, Tabs, Text, TextInput, TrafficLights, VirtualRow, VirtualizedList, WidgetArena,
-    WidgetWindow,
+    Switch, Tabs, Text, TextArea, TextInput, TrafficLights, VirtualRow, VirtualizedList,
+    WidgetArena, WidgetWindow,
 };
 pub use crate::window::{
     App, CursorStyle, FrameContext, WindowCommand, WindowDelegate, WindowSpec,

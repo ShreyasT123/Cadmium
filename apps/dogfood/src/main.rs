@@ -3,9 +3,9 @@ use std::time::Duration;
 use steelui::{
     AlignItems, App, Button, Clipboard, Color, Column, Container, CustomGpuPass, CustomGpuSurface,
     Dropdown, Edges, FileDialog, FontWeight, IntoElement, JustifyContent, Length, MacTheme,
-    Material, MenuItem, Row, Shadow, Signal, Slider, Spacer, SplitPane, Switch, Tabs, Text,
-    TextInput, TrafficLights, VirtualRow, VirtualizedList, WidgetWindow, WindowSpec,
-    create_effect, create_signal,
+    Material, MenuItem, PathBuilder, Row, Shadow, Signal, Slider, Spacer, SplitPane, Switch, Tabs,
+    Text, TextArea, TextInput, TrafficLights, VirtualRow, VirtualizedList, WidgetWindow,
+    WindowSpec, create_effect, create_signal,
 };
 
 const AURORA_WGSL: &str = r#"
@@ -468,6 +468,13 @@ fn main() {
             status_msg.set(format!("Selected Virtualized Row #{}", idx + 1));
         });
 
+        let code_text = create_signal(
+            "// SteelUI Shader Script\nfn main() {\n    let color = vec4(1.0);\n}".to_string(),
+        );
+        let code_editor = TextArea::new(code_text)
+            .height(Length::Px(140.0))
+            .placeholder("Shader script...");
+
         let main_area = Column::new()
             .flex_grow(1.0)
             .gap(12.0)
@@ -479,6 +486,7 @@ fn main() {
                     .color(theme.text_tertiary),
             )
             .child(feed_list)
+            .child(code_editor)
             .child(
                 Text::reactive(move || status_msg.get())
                     .size(12.5)
@@ -488,11 +496,7 @@ fn main() {
         let body = SplitPane::horizontal(split_ratio)
             .bounds(0.18, 0.45)
             .divider_color(theme.hairline)
-            .first(
-                Container::column()
-                    .padding(Edges::all(12.0))
-                    .child(sidebar),
-            )
+            .first(Container::column().padding(Edges::all(12.0)).child(sidebar))
             .second(
                 Container::column()
                     .padding(Edges::all(12.0))
@@ -504,6 +508,13 @@ fn main() {
             .child(toolbar)
             .child(body)
             .into_element()
+    })
+    .draw_paths(|ctx| {
+        let width = ctx.width;
+        let mut path = PathBuilder::new();
+        path.move_to(0.0, 50.0);
+        path.cubic_bezier_to(width * 0.2, 10.0, width * 0.45, 90.0, width * 0.7, 50.0);
+        ctx.push_stroke_path(&path.build(), Color::from_rgba8(59, 130, 246, 255), 2.5);
     })
     .show_fps(true);
 

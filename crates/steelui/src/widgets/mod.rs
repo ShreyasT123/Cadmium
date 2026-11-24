@@ -32,6 +32,7 @@ pub struct DirtyFlags {
 }
 
 type DirtyQueue = Rc<RefCell<Vec<(WidgetId, DirtyFlags)>>>;
+type PathDrawFn = Box<dyn FnMut(&mut FrameContext<'_>)>;
 
 fn push_dirty(queue: &DirtyQueue, id: WidgetId, flags: DirtyFlags) {
     queue.borrow_mut().push((id, flags));
@@ -72,6 +73,30 @@ fn lookup_offset_x(char_offsets: &[(usize, f32)], byte_idx: usize) -> f32 {
         }
     }
     char_offsets.last().map(|&(_, x)| x).unwrap_or(0.0)
+}
+
+fn line_index_at(s: &str, byte_idx: usize) -> usize {
+    let idx = byte_idx.min(s.len());
+    s.as_bytes()[..idx].iter().filter(|&&b| b == b'\n').count()
+}
+
+fn line_range(s: &str, line: usize) -> (usize, usize) {
+    let mut start = 0;
+    let mut current = 0;
+    for (i, ch) in s.char_indices() {
+        if ch == '\n' {
+            if current == line {
+                return (start, i);
+            }
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if current == line {
+        (start, s.len())
+    } else {
+        (s.len(), s.len())
+    }
 }
 
 pub struct MenuItem {
@@ -118,6 +143,7 @@ pub enum Element {
     Switch(Switch),
     Slider(Slider),
     TextInput(TextInput),
+    TextArea(TextArea),
     ScrollView(ScrollView),
     SplitPane(SplitPane),
     VirtualizedList(VirtualizedList),
@@ -618,6 +644,59 @@ impl IntoElement for TextInput {
     }
 }
 
+pub struct TextArea {
+    signal: Signal<String>,
+    placeholder: String,
+    material: Material,
+    width: Length,
+    height: Length,
+}
+
+impl TextArea {
+    pub fn new(signal: Signal<String>) -> Self {
+        Self {
+            signal,
+            placeholder: "Enter multiline text or code...".into(),
+            material: Material::Classic {
+                fill: Color::from_rgba8(255, 255, 255, 220),
+                fill_end: None,
+                gradient_dir: [0.0, 1.0],
+                border_color: Color::from_rgba8(0, 0, 0, 30),
+                border_width: 1.0,
+                shadow: None,
+            },
+            width: Length::Auto,
+            height: Length::Px(160.0),
+        }
+    }
+
+    pub fn placeholder(mut self, text: impl Into<String>) -> Self {
+        self.placeholder = text.into();
+        self
+    }
+
+    pub fn material(mut self, mat: Material) -> Self {
+        self.material = mat;
+        self
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.width = w;
+        self
+    }
+
+    pub fn height(mut self, h: Length) -> Self {
+        self.height = h;
+        self
+    }
+}
+
+impl IntoElement for TextArea {
+    fn into_element(self) -> Element {
+        Element::TextArea(self)
+    }
+}
+
 pub struct ScrollView {
     children: Vec<Element>,
     gap: f32,
@@ -1061,6 +1140,17 @@ enum WidgetPayload {
         char_offsets: Vec<(usize, f32)>,
         last_synced_text: String,
     },
+    TextArea {
+        signal: Signal<String>,
+        material: Material,
+        cursor: usize,
+        selection: Option<(usize, usize)>,
+        is_selecting: bool,
+        text_block: TextBlock,
+        placeholder_block: TextBlock,
+        last_synced_text: String,
+        scroll_y: f32,
+    },
     ScrollView {
         scroll_y: Spring,
         content_height: f32,
@@ -1476,6 +1566,73 @@ impl WidgetArena {
                 let q = self.dirty_queue.clone();
                 let eff = create_effect(move || {
                     let _ = ti.signal.try_get();
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: true,
+                            layout: false,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                self.layout_to_widget.insert(lnode, id);
+                self.focus.focus_order.push(id);
+                id
+            }
+            Element::TextArea(ta) => {
+                let lstyle = LayoutStyle {
+                    width: ta.width,
+                    height: ta.height,
+                    padding: Edges::all(10.0),
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+                let current_val = ta.signal.try_get().unwrap_or_default();
+                let text_block = TextBlock::new(
+                    text,
+                    &current_val,
+                    TextStyle {
+                        font_size: 13.5,
+                        line_height: 18.0,
+                        color: Color::from_rgba8(28, 28, 32, 255),
+                        weight: FontWeight::Regular,
+                    },
+                );
+                let placeholder_block = TextBlock::new(
+                    text,
+                    &ta.placeholder,
+                    TextStyle {
+                        font_size: 13.5,
+                        line_height: 18.0,
+                        color: Color::from_rgba8(142, 142, 147, 255),
+                        weight: FontWeight::Regular,
+                    },
+                );
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::TextArea {
+                        signal: ta.signal,
+                        material: ta.material,
+                        cursor: current_val.len(),
+                        selection: None,
+                        is_selecting: false,
+                        text_block,
+                        placeholder_block,
+                        last_synced_text: current_val,
+                        scroll_y: 0.0,
+                    },
+                });
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = ta.signal.try_get();
                     push_dirty(
                         &q,
                         id,
@@ -2079,6 +2236,7 @@ pub struct WidgetWindow<F> {
     start_instant: Instant,
     show_fps: bool,
     fps_block: Option<TextBlock>,
+    path_draw_fn: Option<PathDrawFn>,
     last_fps_update: Instant,
     last_cursor: (f32, f32),
     a11y_active: bool,
@@ -2112,6 +2270,7 @@ where
             start_instant: Instant::now(),
             show_fps: false,
             fps_block: None,
+            path_draw_fn: None,
             last_fps_update: Instant::now(),
             last_cursor: (0.0, 0.0),
             a11y_active: false,
@@ -2126,6 +2285,11 @@ where
 
     pub fn show_fps(mut self, show: bool) -> Self {
         self.show_fps = show;
+        self
+    }
+
+    pub fn draw_paths(mut self, f: impl FnMut(&mut FrameContext<'_>) + 'static) -> Self {
+        self.path_draw_fn = Some(Box::new(f));
         self
     }
 
@@ -2280,7 +2444,9 @@ where
                     direction: SplitDirection::Vertical,
                     ..
                 } => return CursorStyle::RowResize,
-                WidgetPayload::TextInput { .. } => return CursorStyle::Default,
+                WidgetPayload::TextInput { .. } | WidgetPayload::TextArea { .. } => {
+                    return CursorStyle::Default;
+                }
                 _ => return CursorStyle::Pointer,
             }
         }
@@ -2558,6 +2724,189 @@ where
             }
         }
 
+        if !handled
+            && let WidgetPayload::TextArea {
+                signal,
+                cursor,
+                selection,
+                text_block,
+                ..
+            } = &mut node.payload
+        {
+            let Some(mut val) = signal.try_get() else {
+                return false;
+            };
+            *cursor = snap_char_boundary(&val, *cursor);
+            *selection = normalize_selection(&val, *selection);
+
+            let is_ctrl = modifiers.ctrl || modifiers.super_key;
+            let is_shortcut_char = |ch: &str| -> bool {
+                matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(ch))
+            };
+            let delete_sel =
+                |val: &mut String, cursor: &mut usize, sel: &mut Option<(usize, usize)>| -> bool {
+                    if let Some((start, end)) = sel.take() {
+                        let s = snap_char_boundary(val, start.min(end));
+                        let e = snap_char_boundary(val, start.max(end));
+                        if s < e {
+                            val.drain(s..e);
+                        }
+                        *cursor = s;
+                        return true;
+                    }
+                    false
+                };
+
+            if is_ctrl && is_shortcut_char("a") {
+                *selection = Some((0, val.len()));
+                *cursor = val.len();
+                handled = true;
+            } else if is_ctrl && is_shortcut_char("c") {
+                if let Some((start, end)) = *selection {
+                    let s = snap_char_boundary(&val, start.min(end));
+                    let e = snap_char_boundary(&val, start.max(end));
+                    let _ = Clipboard::set_text(&val[s..e]);
+                    handled = true;
+                }
+            } else if is_ctrl && is_shortcut_char("x") {
+                if let Some((start, end)) = *selection {
+                    let s = snap_char_boundary(&val, start.min(end));
+                    let e = snap_char_boundary(&val, start.max(end));
+                    let _ = Clipboard::set_text(&val[s..e]);
+                    delete_sel(&mut val, cursor, selection);
+                    signal.set(val);
+                    handled = true;
+                }
+            } else if is_ctrl && is_shortcut_char("v") {
+                if let Ok(pasted) = Clipboard::get_text() {
+                    delete_sel(&mut val, cursor, selection);
+                    val.insert_str(*cursor, &pasted);
+                    *cursor += pasted.len();
+                    signal.set(val);
+                    handled = true;
+                }
+            } else {
+                match key {
+                    Key::Enter => {
+                        delete_sel(&mut val, cursor, selection);
+                        val.insert(*cursor, '\n');
+                        *cursor += 1;
+                        signal.set(val);
+                        handled = true;
+                    }
+                    Key::Backspace => {
+                        if delete_sel(&mut val, cursor, selection) {
+                            signal.set(val);
+                            handled = true;
+                        } else if *cursor > 0 {
+                            let prev = val[..*cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            val.drain(prev..*cursor);
+                            *cursor = prev;
+                            signal.set(val);
+                            handled = true;
+                        }
+                    }
+                    Key::Delete => {
+                        if delete_sel(&mut val, cursor, selection) {
+                            signal.set(val);
+                            handled = true;
+                        } else if *cursor < val.len() {
+                            let next = val[*cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| *cursor + i)
+                                .unwrap_or(val.len());
+                            val.drain(*cursor..next);
+                            signal.set(val);
+                            handled = true;
+                        }
+                    }
+                    Key::ArrowLeft => {
+                        *selection = None;
+                        if *cursor > 0 {
+                            *cursor = val[..*cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            handled = true;
+                        }
+                    }
+                    Key::ArrowRight => {
+                        *selection = None;
+                        if *cursor < val.len() {
+                            *cursor = val[*cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| *cursor + i)
+                                .unwrap_or(val.len());
+                            handled = true;
+                        }
+                    }
+                    Key::ArrowUp | Key::ArrowDown => {
+                        let line = line_index_at(&val, *cursor);
+                        let target = if *key == Key::ArrowUp {
+                            line.saturating_sub(1)
+                        } else {
+                            line + 1
+                        };
+                        let (start, end) = line_range(&val, target);
+                        if start <= end && end <= val.len() {
+                            let desired_x = text_block.x_offset_for_byte(line, *cursor);
+                            let mut best = start;
+                            let mut best_dist = f32::MAX;
+                            let mut idx = start;
+                            loop {
+                                let dist =
+                                    (text_block.x_offset_for_byte(target, idx) - desired_x).abs();
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    best = idx;
+                                }
+                                if idx >= end {
+                                    break;
+                                }
+                                idx = val[idx..]
+                                    .char_indices()
+                                    .nth(1)
+                                    .map(|(i, _)| idx + i)
+                                    .unwrap_or(end);
+                            }
+                            *selection = None;
+                            *cursor = best;
+                            handled = true;
+                        }
+                    }
+                    Key::Home => {
+                        *selection = None;
+                        *cursor = line_range(&val, line_index_at(&val, *cursor)).0;
+                        handled = true;
+                    }
+                    Key::End => {
+                        *selection = None;
+                        *cursor = line_range(&val, line_index_at(&val, *cursor)).1;
+                        handled = true;
+                    }
+                    _ => {
+                        if !is_ctrl
+                            && let Some(ch_str) = text
+                            && !ch_str.chars().any(|c| c.is_control())
+                        {
+                            delete_sel(&mut val, cursor, selection);
+                            val.insert_str(*cursor, ch_str);
+                            *cursor += ch_str.len();
+                            signal.set(val);
+                            handled = true;
+                        }
+                    }
+                }
+            }
+        }
+
         if handled {
             self.reset_caret_blink();
         }
@@ -2577,12 +2926,8 @@ where
             } = &node.payload
         {
             let next_r = match direction {
-                SplitDirection::Horizontal => {
-                    (x - node.bounds.x) / node.bounds.width.max(1.0)
-                }
-                SplitDirection::Vertical => {
-                    (y - node.bounds.y) / node.bounds.height.max(1.0)
-                }
+                SplitDirection::Horizontal => (x - node.bounds.x) / node.bounds.width.max(1.0),
+                SplitDirection::Vertical => (y - node.bounds.y) / node.bounds.height.max(1.0),
             }
             .clamp(*min_ratio, *max_ratio);
             ratio.set(next_r);
@@ -2604,6 +2949,34 @@ where
             let rel_x = x - (node.bounds.x + 12.0);
             let anchor = snap_char_boundary(&val, selection.map(|s| s.0).unwrap_or(*cursor));
             let new_cursor = snap_char_boundary(&val, find_char_index_at_x(char_offsets, rel_x));
+            *cursor = new_cursor;
+            *selection = if anchor != new_cursor {
+                Some((anchor, new_cursor))
+            } else {
+                None
+            };
+            return true;
+        }
+        if let Some(cap) = self.captured
+            && let Some(node) = self.arena.nodes.get_mut(cap)
+            && let WidgetPayload::TextArea {
+                signal,
+                cursor,
+                selection,
+                is_selecting,
+                text_block,
+                ..
+            } = &mut node.payload
+            && *is_selecting
+        {
+            let val = signal.try_get().unwrap_or_default();
+            let rel_x = x - (node.bounds.x + 10.0);
+            let rel_y = y - (node.bounds.y + 10.0);
+            let line = (rel_y / 18.0).floor().max(0.0) as usize;
+            let (start, end) = line_range(&val, line);
+            let anchor = snap_char_boundary(&val, selection.map(|s| s.0).unwrap_or(*cursor));
+            let idx = text_block.byte_index_at_x(line, rel_x).clamp(start, end);
+            let new_cursor = snap_char_boundary(&val, idx);
             *cursor = new_cursor;
             *selection = if anchor != new_cursor {
                 Some((anchor, new_cursor))
@@ -2887,6 +3260,26 @@ where
                     capture_target = true;
                     clicked = true;
                 }
+                WidgetPayload::TextArea {
+                    signal,
+                    cursor,
+                    selection,
+                    is_selecting,
+                    text_block,
+                    ..
+                } => {
+                    let val = signal.try_get().unwrap_or_default();
+                    let rel_x = x - (node.bounds.x + 10.0);
+                    let rel_y = y - (node.bounds.y + 10.0);
+                    let line = (rel_y / 18.0).floor().max(0.0) as usize;
+                    let (start, end) = line_range(&val, line);
+                    let idx = text_block.byte_index_at_x(line, rel_x).clamp(start, end);
+                    *cursor = snap_char_boundary(&val, idx);
+                    *selection = None;
+                    *is_selecting = true;
+                    capture_target = true;
+                    clicked = true;
+                }
                 _ => {}
             }
         }
@@ -2904,9 +3297,16 @@ where
         let mut was = self.captured.is_some();
         if let Some(cap) = self.captured.take()
             && let Some(node) = self.arena.nodes.get_mut(cap)
-            && let WidgetPayload::TextInput { is_selecting, .. } = &mut node.payload
+            && matches!(
+                node.payload,
+                WidgetPayload::TextInput { .. } | WidgetPayload::TextArea { .. }
+            )
         {
-            *is_selecting = false;
+            match &mut node.payload {
+                WidgetPayload::TextInput { is_selecting, .. }
+                | WidgetPayload::TextArea { is_selecting, .. } => *is_selecting = false,
+                _ => {}
+            }
             was = true;
         }
         was
@@ -2955,6 +3355,22 @@ where
                             *selection = normalize_selection(&text_val, *selection);
                             text_block.set_text(ctx.text_engine(), &text_val);
                             text_block.collect_char_offsets(char_offsets);
+                        }
+                    }
+                    WidgetPayload::TextArea {
+                        signal,
+                        cursor,
+                        selection,
+                        text_block,
+                        last_synced_text,
+                        ..
+                    } => {
+                        let text_val = signal.try_get().unwrap_or_default();
+                        if *last_synced_text != text_val {
+                            *last_synced_text = text_val.clone();
+                            *cursor = snap_char_boundary(&text_val, *cursor);
+                            *selection = normalize_selection(&text_val, *selection);
+                            text_block.set_text(ctx.text_engine(), &text_val);
                         }
                     }
                     _ => {}
@@ -3032,6 +3448,9 @@ where
                     };
                     match &mut node.payload {
                         WidgetPayload::Text { block, .. } => block.measure(text_engine, avail_w),
+                        WidgetPayload::TextArea { text_block, .. } => {
+                            text_block.measure(text_engine, avail_w.map(|w| (w - 20.0).max(1.0)))
+                        }
                         WidgetPayload::Button { label, .. } => {
                             let (w, _) = label.measure(text_engine, None);
                             (w + 28.0, 30.0)
@@ -3127,6 +3546,10 @@ where
         let paint_start = FrameProfiler::begin_timer();
         let mut overlay_records = Vec::new();
         self.open_dropdowns.clear();
+
+        if let Some(draw) = &mut self.path_draw_fn {
+            draw(ctx);
+        }
 
         if let Some(root) = self.arena.root {
             let scale = ctx.scale;
@@ -3475,6 +3898,15 @@ fn paint_node(
                 true,
                 true,
             ),
+            WidgetPayload::TextArea { signal, .. } => (
+                A11yRole::TextInput,
+                node.tooltip.clone().or_else(|| Some("Text Area".into())),
+                signal.try_get(),
+                None,
+                None,
+                true,
+                true,
+            ),
             _ => (A11yRole::Container, None, None, None, None, false, false),
         };
         a11y.push(A11yNodeRecord {
@@ -3660,6 +4092,95 @@ fn paint_node(
 
             pctx.ctx.pop_clip();
         }
+        WidgetPayload::TextArea {
+            signal,
+            material,
+            cursor,
+            selection,
+            text_block,
+            placeholder_block,
+            scroll_y,
+            ..
+        } => {
+            let val = signal.try_get().unwrap_or_default();
+            render_material(pctx.ctx, bounds, *material, 8.0, scale);
+
+            if is_focused {
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    radii: CornerRadii::all(8.0).scale(scale),
+                    fill: Color::TRANSPARENT,
+                    border_color: theme.accent,
+                    border_width: 2.0 * scale,
+                    ..Default::default()
+                });
+            }
+
+            let inner_clip = Rect::new(
+                bounds.x + 4.0,
+                bounds.y + 4.0,
+                (bounds.width - 8.0).max(1.0),
+                (bounds.height - 8.0).max(1.0),
+            );
+            pctx.ctx.push_clip(inner_clip);
+
+            let text_x = bounds.x + 10.0;
+            let text_y = bounds.y + 10.0 - *scroll_y;
+
+            if let Some((start, end)) = *selection {
+                let s = snap_char_boundary(&val, start.min(end));
+                let e = snap_char_boundary(&val, start.max(end));
+                if s < e {
+                    for line in line_index_at(&val, s)..=line_index_at(&val, e) {
+                        let (ls, le) = line_range(&val, line);
+                        let line_s = s.max(ls).min(le);
+                        let line_e = e.min(le).max(line_s);
+                        if line_s < line_e {
+                            let x1 = text_block.x_offset_for_byte(line, line_s);
+                            let x2 = text_block.x_offset_for_byte(line, line_e);
+                            let sel_rect = Rect::new(
+                                text_x + x1,
+                                text_y + text_block.line_y(line) - 2.0,
+                                (x2 - x1).max(2.0),
+                                18.0,
+                            );
+                            pctx.ctx.push_sdf(SdfQuad {
+                                rect: snap_rect_to_pixels(sel_rect, scale),
+                                radii: CornerRadii::all(3.0).scale(scale),
+                                fill: Color::rgba(
+                                    theme.accent.r,
+                                    theme.accent.g,
+                                    theme.accent.b,
+                                    0.28,
+                                ),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+
+            if val.is_empty() {
+                pctx.ctx.push_text(placeholder_block, text_x, text_y);
+            } else {
+                pctx.ctx.push_text(text_block, text_x, text_y);
+            }
+
+            if is_focused && pctx.caret_visible {
+                let safe_cursor = snap_char_boundary(&val, *cursor);
+                let line = line_index_at(&val, safe_cursor);
+                let caret_x = text_x + text_block.x_offset_for_byte(line, safe_cursor);
+                let caret_y = text_y + text_block.line_y(line) + 1.0;
+                let caret_rect = Rect::new(caret_x, caret_y, 1.5, 16.0);
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(caret_rect, scale),
+                    fill: theme.accent,
+                    ..Default::default()
+                });
+            }
+
+            pctx.ctx.pop_clip();
+        }
         WidgetPayload::Tabs {
             items,
             labels,
@@ -3816,7 +4337,10 @@ fn paint_node(
             } else {
                 st.item_count as f32 * stride - st.gap
             };
-            let scroll_val = st.scroll_y.value.clamp(0.0, (total_h - viewport.height).max(0.0));
+            let scroll_val = st
+                .scroll_y
+                .value
+                .clamp(0.0, (total_h - viewport.height).max(0.0));
 
             pctx.ctx.push_clip(viewport);
 
@@ -3866,10 +4390,15 @@ fn paint_node(
                     });
 
                     let slot = &mut st.pool[slot_idx];
-                    slot.title
-                        .set_color(if is_sel { theme.accent } else { theme.text_primary });
-                    pctx.ctx.push_text(&slot.title, row_rect.x + 14.0, row_rect.y + 7.0);
-                    pctx.ctx.push_text(&slot.subtitle, row_rect.x + 14.0, row_rect.y + 25.0);
+                    slot.title.set_color(if is_sel {
+                        theme.accent
+                    } else {
+                        theme.text_primary
+                    });
+                    pctx.ctx
+                        .push_text(&slot.title, row_rect.x + 14.0, row_rect.y + 7.0);
+                    pctx.ctx
+                        .push_text(&slot.subtitle, row_rect.x + 14.0, row_rect.y + 25.0);
                     pctx.ctx.push_text(
                         &slot.badge,
                         row_rect.x + row_rect.width - slot.badge_width - 14.0,

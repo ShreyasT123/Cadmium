@@ -80,6 +80,15 @@ impl<'a> FrameContext<'a> {
         self.draw_list.push_glass(glass);
     }
 
+    pub fn push_stroke_path(
+        &mut self,
+        path: &crate::renderer::LyonPath,
+        color: crate::core::Color,
+        width: f32,
+    ) {
+        self.draw_list.push_stroke_path(path, color, width);
+    }
+
     pub fn push_clip(&mut self, rect: crate::core::Rect) {
         self.draw_list.push_clip(rect);
     }
@@ -272,9 +281,7 @@ impl WindowContext {
         gpu.begin_frame();
 
         let present_now = Instant::now();
-        let frame_dt = present_now
-            .duration_since(self.last_present)
-            .as_secs_f32();
+        let frame_dt = present_now.duration_since(self.last_present).as_secs_f32();
 
         let mut frame_ctx = FrameContext {
             width: logical_w,
