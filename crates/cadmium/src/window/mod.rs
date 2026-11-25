@@ -277,6 +277,9 @@ impl WindowContext {
                     self.handle_surface_fault(gpu);
                     return;
                 }
+                // Size matches but surface is suboptimal (e.g. Wayland fractional
+                // scaling flap).  Present this frame then reconfigure on the *next*
+                // frame to avoid a busy-loop of reconfigure → suboptimal → reconfigure.
                 (frame, true)
             }
             wgpu::CurrentSurfaceTexture::Outdated => {

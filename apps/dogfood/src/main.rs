@@ -175,22 +175,18 @@ fn main() {
     let muted = Color::from_rgba8(163, 163, 170, 255);
     let subtle_border = Color::from_rgba8(255, 255, 255, 22);
 
-    let glass_panel_mat = Material::Frosted {
-        tint: Color::from_rgba8(28, 22, 25, 138),
-        frost: 0.62,
-        specular: 0.65,
+    let glass_panel_mat = Material::Classic {
+        fill: Color::from_rgba8(24, 20, 22, 240),
+        fill_end: None,
+        gradient_dir: [0.0, 0.0],
         border_color: subtle_border,
         border_width: 1.0,
         shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 145), 32.0, 14.0)),
     };
-    let liquid_dock_mat = Material::Liquid {
-        tint: Color::from_rgba8(20, 16, 18, 196),
-        frost: 0.45,
-        ripple: 0.35,
-        specular: 0.90,
-        rim_angle: -1.309,
-        sheen_progress: 0.0,
-        conic_strength: 0.0,
+    let liquid_dock_mat = Material::Classic {
+        fill: Color::from_rgba8(20, 16, 18, 245),
+        fill_end: None,
+        gradient_dir: [0.0, 0.0],
         border_color: Color::from_rgba8(255, 255, 255, 36),
         border_width: 1.0,
         shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 190), 36.0, 14.0)),
@@ -302,18 +298,18 @@ fn main() {
                     .gap(12.0)
                     .drag_region()
                     .child(TrafficLights::new())
-                    .child(Button::icon_only(ICO_CHEVRON_L, 14.0).glass())
-                    .child(Button::icon_only(ICO_CHEVRON_R, 14.0).glass())
+                    .child(Button::icon_only(ICO_CHEVRON_L, 14.0))
+                    .child(Button::icon_only(ICO_CHEVRON_R, 14.0))
                     .child(Spacer::flex())
-                    .child(Button::icon_only(ICO_HOME, 15.0).glass())
+                    .child(Button::icon_only(ICO_HOME, 15.0))
                     .child(
                         TextInput::new(search)
                             .placeholder("What do you want to play?")
                             .width(Length::Px(380.0))
-                            .material(Material::Frosted {
-                                tint: Color::from_rgba8(255, 255, 255, 16),
-                                frost: 0.35,
-                                specular: 0.45,
+                            .material(Material::Classic {
+                                fill: Color::from_rgba8(255, 255, 255, 18),
+                                fill_end: None,
+                                gradient_dir: [0.0, 0.0],
                                 border_color: subtle_border,
                                 border_width: 1.0,
                                 shadow: None,
@@ -388,7 +384,7 @@ fn main() {
                     .child(
                         Row::new()
                             .gap(8.0)
-                            .child(Button::new("Playlists").glass().pill())
+                            .child(Button::new("Playlists").pill())
                             .child(Button::new("Albums").ghost().pill())
                             .child(Button::new("Artists").ghost().pill()),
                     )
@@ -470,7 +466,6 @@ fn main() {
                         } else {
                             "Follow"
                         })
-                        .glass()
                         .pill()
                         .on_click(move || following.update(|f| *f = !*f)),
                     )

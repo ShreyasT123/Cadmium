@@ -118,7 +118,12 @@ impl TextBlock {
         let attrs = Attrs::new()
             .family(Family::SansSerif)
             .weight(style.weight.into());
-        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+        let shaping = if text.is_ascii() {
+            Shaping::Basic
+        } else {
+            Shaping::Advanced
+        };
+        buffer.set_text(&text, &attrs, shaping, None);
         buffer.shape_until_scroll(&mut engine.font_system, false);
 
         Self {
@@ -147,7 +152,12 @@ impl TextBlock {
         let attrs = Attrs::new()
             .family(Family::SansSerif)
             .weight(self.style.weight.into());
-        self.buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        let shaping = if text.is_ascii() {
+            Shaping::Basic
+        } else {
+            Shaping::Advanced
+        };
+        self.buffer.set_text(text, &attrs, shaping, None);
         self.buffer
             .shape_until_scroll(&mut engine.font_system, false);
     }

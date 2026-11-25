@@ -372,6 +372,21 @@ impl DrawList {
     }
 
     pub fn push_glass(&mut self, glass: GlassQuad) {
+        if let Some(clip) = self.clip_stack.last().copied() {
+            let scaled_clip = Rect::new(
+                clip.x * self.scale,
+                clip.y * self.scale,
+                clip.width * self.scale,
+                clip.height * self.scale,
+            );
+            let ix = glass.rect.x.max(scaled_clip.x);
+            let iy = glass.rect.y.max(scaled_clip.y);
+            let ir = (glass.rect.x + glass.rect.width).min(scaled_clip.x + scaled_clip.width);
+            let ib = (glass.rect.y + glass.rect.height).min(scaled_clip.y + scaled_clip.height);
+            if ir <= ix || ib <= iy {
+                return;
+            }
+        }
         if glass.liquid_ripple > 0.001 || glass.conic_strength > 0.001 || glass.frost < 0.30 {
             self.has_liquid_glass = true;
         }

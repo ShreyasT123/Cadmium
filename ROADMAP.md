@@ -70,10 +70,11 @@ Fix all Critical/High defects from the 2026-11-25 audit before expanding surface
   - `FillTessellator` + path geometry cache + edge AA for `lyon` dynamic paths.
   - Premultiplied-alpha flag on `ImageQuad` for translucent `CustomGpuSurface` compositing.
 - [ ] **Tier 1 Controls Completion:**
-  - `ProgressBar` / `ScrubberBar` (interactive seek bar with hover thumb & time tooltip).
-  - `Checkbox`, `RadioButton`, `Badge`, `Popover`, `Modal` / `Dialog`.
+  - `ProgressBar` / `ScrubberBar` (interactive seek bar with hover thumb & time tooltip) & `ProgressIndicator` (indeterminate spinner / circular ring).
+  - `Checkbox`, `RadioButton`, `Badge`, `Card`, `Link`, `Accordion` / `Disclosure`, `NumberInput` / `Stepper`, `Popover`, `Modal` / `Dialog`.
   - `Button` / `IconButton` variants (Ghost, Glass Pill, Accent, Secondary) + icon-leading buttons.
   - `ScrollView` horizontal support + inner-first scroll capture + parent-offset hit-testing.
+  - Standalone `Tooltip` (rich content) & `ContextMenu` widgets (beyond node-level attributes).
 - [ ] **Typography, IME & Input Polish:**
   - `Text` alignment (`Left`/`Center`/`Right`), ellipsis truncation, font family/italic/letter-spacing, embedded font loading (`load_font_bytes`), and rich-text spans.
   - Full IME support (`set_ime_allowed`, `set_ime_cursor_area`, `Ime::Preedit` underline, `Ime::Commit`).
@@ -103,11 +104,12 @@ Fix all Critical/High defects from the 2026-11-25 audit before expanding surface
 - [ ] **Multi-Window & Device Resilience:**
   - Dynamic runtime window creation (`WindowCommand::OpenWindow`) + `DockArea` panel tear-off.
   - `wgpu` device-lost recovery (`GpuContext` rebuild) + Wayland `Suboptimal` guard.
-- [ ] **Tier 2 Workspace Widgets:**
+- [ ] **Tier 2 Workspace & Rich Input Widgets:**
+  - `Grid` (2D CSS-Grid layout container backed by `taffy`), `NavigationSidebar`, `RichText` (mixed-style/color inline spans).
   - `TreeView` (virtualized expandable key/file tree with indent guides & keyboard nav).
   - `Table` (virtualized multi-column resizable/sortable grid).
   - `DockArea` (multi-pane docking, tab groups, tear-off windows).
-  - `CommandPalette` (`Cmd/Ctrl+K` fuzzy filter overlay), `MenuBar`, `Toolbar`, `Toast` / `Notification`, `SegmentedControl`, `SkeletonLoader`, `Avatar`.
+  - `CommandPalette` (`Cmd/Ctrl+K` fuzzy filter overlay), `MenuBar`, `Toolbar`, `Toast` / `Notification`, `SegmentedControl`, `SkeletonLoader`, `Avatar`, `DatePicker`, `ColorPicker`.
 - [ ] **Full `AccessKit` Coverage:**
   - All Tier 1 & Tier 2 roles, `disabled`/`expanded`/`selected` states, `SetValue`/`Increment`/`Decrement`, and incremental `TreeUpdate` deltas.
 
@@ -127,7 +129,13 @@ Fix all Critical/High defects from the 2026-11-25 audit before expanding surface
 - [ ] **Headless Visual Regression CI:**
   - Offscreen `wgpu` (WARP/SwiftShader/Lavapipe + hardware) golden-image diff suite on Windows, Linux, and macOS.
   - WGSL validation tests (`naga`) in CI for all shaders.
-- [ ] **Public API Lockdown (`v1.0.0`):**
+- [ ] **Codebase Modularization & Readability (Break Up Single-File Modules):**
+  - Split `widgets/mod.rs` (~251 KB / 7,000+ lines) into focused submodules: `arena.rs`, `window.rs`, `paint.rs`, `hit_test.rs`, `layout_sync.rs`, and per-widget files (`container.rs`, `button.rs`, `text_input.rs`, `text_area.rs`, `virtual_list.rs`, `controls.rs`, `overlays.rs`).
+  - Split `renderer/mod.rs` (~85 KB / 2,500+ lines) into `gpu_context.rs`, `draw_list.rs`, `atlas.rs`, `glass.rs`, `pipelines.rs`, `render_target.rs`.
+  - Split `window/mod.rs` (~31 KB) into `app.rs`, `context.rs`, `delegate.rs`, `events.rs`.
+- [ ] **Developer-Friendly Public API & Ergonomics (`v1.0.0`):**
+  - Add `cadmium::prelude` (`use cadmium::prelude::*;`) for one-line imports of core widgets, signals, layout, and theme tokens.
+  - Add ergonomic app bootstrap (`cadmium::run(...)` / `App::builder()`) and unified builder traits across widgets (`.padding()`, `.margin()`, `.width()`, `.height()`, `.disabled()`, `.on_click()`, `.on_hover()`, `.tooltip()`).
   - Change internal subsystems in `lib.rs` from `pub mod` to `mod` with clean curated `pub use` + controlled `gpu` escape-hatch module.
   - Rename `SteelError` → `CadmiumError` and wrap `winit`/`cosmic-text`/`taffy`/`accesskit`/`arboard`/`rfd` completely.
   - Complete `LICENSE-APACHE` full text, commit `Cargo.lock`, add MSRV CI check, reconcile `README.md` / `CHANGELOG.md` / `docs/`, and publish `v1.0.0`.

@@ -1964,80 +1964,97 @@ impl WidgetArena {
         self.nodes.len()
     }
 
+    /// Iterative post-order unmount of the subtree rooted at `id`.
+    ///
+    /// The old implementation was recursive — deep widget trees could overflow
+    /// the stack.  We now do a two-phase iterative traversal:
+    ///   1. BFS/DFS to collect all descendant IDs in post-order (leaves first).
+    ///   2. Remove each node in that order, freeing effects and GPU handles.
     pub fn unmount_subtree(&mut self, id: WidgetId) {
-        let Some(node) = self.nodes.get(id) else {
-            return;
-        };
-        let children = node.children.clone();
-        for child in children {
-            self.unmount_subtree(child);
+        // Phase 1: collect all nodes in the subtree, leaves first (post-order).
+        let mut order: Vec<WidgetId> = Vec::new();
+        let mut stack: Vec<WidgetId> = vec![id];
+        while let Some(wid) = stack.pop() {
+            let Some(node) = self.nodes.get(wid) else { continue };
+            // Push children so they appear before the parent in `order`.
+            for &child in &node.children {
+                stack.push(child);
+            }
+            order.push(wid);
         }
-
-        let Some(node) = self.nodes.remove(id) else {
-            return;
-        };
-
-        for eff in node.owned_effects {
-            dispose_effect(eff);
-        }
+        // `order` is currently root-first; reverse for post-order (leaves first).
+        order.reverse();
 
         let mut released: std::collections::HashSet<TextureHandle> =
             std::collections::HashSet::new();
-        match node.payload {
-            WidgetPayload::CustomGpuSurface { state, .. } => {
-                if let Some(handle) = state.into_inner().handle
-                    && released.insert(handle) {
-                        self.pending_texture_releases.push(handle);
-                    }
+
+        // Phase 2: remove each node.
+        for wid in order {
+            let Some(node) = self.nodes.remove(wid) else { continue };
+
+            for eff in node.owned_effects {
+                dispose_effect(eff);
             }
-            WidgetPayload::Image { state, .. } => {
-                let st = state.into_inner();
-                if let Some(handle) = st.handle {
-                    let should_release = if let Some(key) = st.source_key {
-                        if let Some((_, refs)) = self.decoded_tex_cache.get_mut(&key) {
-                            *refs = refs.saturating_sub(1);
-                            if *refs == 0 {
-                                self.decoded_tex_cache.remove(&key);
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    if should_release && released.insert(handle) {
+
+            match node.payload {
+                WidgetPayload::CustomGpuSurface { state, .. } => {
+                    if let Some(handle) = state.into_inner().handle
+                        && released.insert(handle)
+                    {
                         self.pending_texture_releases.push(handle);
                     }
                 }
-            }
-            WidgetPayload::Icon { state, .. } => {
-                if let Some(handle) = state.into_inner().handle
-                    && released.insert(handle) {
+                WidgetPayload::Image { state, .. } => {
+                    let st = state.into_inner();
+                    if let Some(handle) = st.handle {
+                        let should_release = if let Some(key) = st.source_key {
+                            if let Some((_, refs)) = self.decoded_tex_cache.get_mut(&key) {
+                                *refs = refs.saturating_sub(1);
+                                if *refs == 0 {
+                                    self.decoded_tex_cache.remove(&key);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+                        if should_release && released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                    }
+                }
+                WidgetPayload::Icon { state, .. } => {
+                    if let Some(handle) = state.into_inner().handle
+                        && released.insert(handle)
+                    {
                         self.pending_texture_releases.push(handle);
                     }
-            }
-            WidgetPayload::Button { icon_state, .. } => {
-                if let Some(handle) = icon_state.into_inner().handle
-                    && released.insert(handle) {
+                }
+                WidgetPayload::Button { icon_state, .. } => {
+                    if let Some(handle) = icon_state.into_inner().handle
+                        && released.insert(handle)
+                    {
                         self.pending_texture_releases.push(handle);
                     }
+                }
+                _ => {}
             }
-            _ => {}
-        }
 
-        self.layout_to_widget.remove(&node.layout_node);
-        self.layout.remove(node.layout_node);
-        self.scroll_ids.retain(|&x| x != id);
-        self.tab_ids.retain(|&x| x != id);
-        self.traffic_ids.retain(|&x| x != id);
-        self.custom_surface_ids.retain(|&x| x != id);
-        self.split_ids.retain(|&x| x != id);
-        self.virtual_list_ids.retain(|&x| x != id);
-        self.switcher_ids.retain(|&x| x != id);
-        self.dirty_layout_roots.retain(|&x| x != id);
+            self.layout_to_widget.remove(&node.layout_node);
+            self.layout.remove(node.layout_node);
+            self.scroll_ids.retain(|&x| x != wid);
+            self.tab_ids.retain(|&x| x != wid);
+            self.traffic_ids.retain(|&x| x != wid);
+            self.custom_surface_ids.retain(|&x| x != wid);
+            self.split_ids.retain(|&x| x != wid);
+            self.virtual_list_ids.retain(|&x| x != wid);
+            self.switcher_ids.retain(|&x| x != wid);
+            self.dirty_layout_roots.retain(|&x| x != wid);
+        }
     }
 
     pub fn bench_layout_pass(&mut self, width: f32, height: f32, text: &mut TextEngine) {
@@ -2089,7 +2106,7 @@ impl WidgetArena {
             });
 
         let rects = self.layout.collect_logical_rects(root_lnode);
-        for (lnode, rect) in rects {
+        for (&lnode, &rect) in rects {
             if let Some(&wid) = self.layout_to_widget.get(&lnode)
                 && let Some(node) = self.nodes.get_mut(wid)
             {
@@ -5135,7 +5152,7 @@ where
             );
 
             let rects = self.arena.layout.collect_logical_rects(root_lnode);
-            for (lnode, rect) in rects {
+            for (&lnode, &rect) in rects {
                 if let Some(&wid) = self.arena.layout_to_widget.get(&lnode)
                     && let Some(node) = self.arena.nodes.get_mut(wid)
                 {
@@ -5548,6 +5565,9 @@ where
                 || self.last_fps_update.elapsed() >= Duration::from_millis(150);
             if should_refresh {
                 self.last_fps_update = Instant::now();
+                // Only show presented FPS when actively animating (springs /
+                // shaders) so event-driven interactions don't display CPU-only
+                // `1000 / frame_ms` spikes (4000+ FPS) or typing-rate numbers.
                 let label = if self.was_animating && m.effective_fps > 10.0 {
                     format!(
                         "{:.0} FPS  •  {:.2} ms (L:{:.2} P:{:.2})",
@@ -6551,313 +6571,335 @@ fn paint_node(
     }
 }
 
+/// Iterative DFS: finds the innermost widget with a tooltip under (x, y).
 fn find_tooltip_node(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
     x: f32,
     y: f32,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> Option<(WidgetId, Rect)> {
-    let node = nodes.get(wid)?;
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    let mut result: Option<(WidgetId, Rect)> = None;
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
+        );
 
-    if let WidgetPayload::ScrollView {
-        scroll_y,
-        content_id,
-        ..
-    } = &node.payload
-    {
-        if !bounds.contains(x, y) {
-            return None;
+        if let WidgetPayload::ScrollView {
+            scroll_y,
+            content_id,
+            ..
+        } = &node.payload
+        {
+            if bounds.contains(x, y) {
+                stack.push((*content_id, (offset.0, offset.1 - scroll_y.value)));
+            }
+            continue;
         }
-        let child_offset = (offset.0, offset.1 - scroll_y.value);
-        return find_tooltip_node(*content_id, nodes, x, y, child_offset);
-    }
 
-    for &child in node.children.iter().rev() {
-        if let Some(res) = find_tooltip_node(child, nodes, x, y, offset) {
-            return Some(res);
+        for &child in &node.children {
+            stack.push((child, offset));
+        }
+
+        if bounds.contains(x, y) && node.tooltip.is_some() {
+            result = Some((wid, bounds));
         }
     }
-
-    if bounds.contains(x, y) && node.tooltip.is_some() {
-        return Some((wid, bounds));
-    }
-    None
+    result
 }
 
+/// Iterative DFS: finds the innermost widget with a context menu under (x, y).
 fn find_context_menu_node(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
     x: f32,
     y: f32,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> Option<WidgetId> {
-    let node = nodes.get(wid)?;
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    let mut result: Option<WidgetId> = None;
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
+        );
 
-    if let WidgetPayload::ScrollView {
-        scroll_y,
-        content_id,
-        ..
-    } = &node.payload
-    {
-        if !bounds.contains(x, y) {
-            return None;
+        if let WidgetPayload::ScrollView {
+            scroll_y,
+            content_id,
+            ..
+        } = &node.payload
+        {
+            if bounds.contains(x, y) {
+                stack.push((*content_id, (offset.0, offset.1 - scroll_y.value)));
+            }
+            continue;
         }
-        let child_offset = (offset.0, offset.1 - scroll_y.value);
-        return find_context_menu_node(*content_id, nodes, x, y, child_offset);
-    }
 
-    for &child in node.children.iter().rev() {
-        if let Some(hit) = find_context_menu_node(child, nodes, x, y, offset) {
-            return Some(hit);
+        for &child in &node.children {
+            stack.push((child, offset));
+        }
+
+        if bounds.contains(x, y) && !node.context_menu.is_empty() {
+            result = Some(wid);
         }
     }
-
-    if bounds.contains(x, y) && !node.context_menu.is_empty() {
-        return Some(wid);
-    }
-    None
+    result
 }
 
+/// Iterative DFS: returns screen bounds of a specific target widget.
 fn widget_screen_bounds(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
     target: WidgetId,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> Option<Rect> {
-    let node = nodes.get(wid)?;
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
-    if wid == target {
-        return Some(bounds);
-    }
-    let child_offset = match &node.payload {
-        WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
-        _ => offset,
-    };
-    for &child in &node.children {
-        if let Some(found) = widget_screen_bounds(child, nodes, target, child_offset) {
-            return Some(found);
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
+        );
+        if wid == target {
+            return Some(bounds);
+        }
+        let child_offset = match &node.payload {
+            WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
+            _ => offset,
+        };
+        for &child in &node.children {
+            stack.push((child, child_offset));
         }
     }
     None
 }
 
+/// Iterative DFS: dispatch a scroll delta to the innermost scrollable widget
+/// under (cx, cy).  Needs `&mut` access, so we collect the candidate path
+/// first, then mutate from the deepest match outward.
 fn dispatch_scroll_node(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &mut SlotMap<WidgetId, WidgetNode>,
     cx: f32,
     cy: f32,
     delta_y: f32,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> bool {
-    let Some(node) = nodes.get(wid) else {
-        return false;
-    };
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
-    if !bounds.contains(cx, cy) {
-        return false;
+    // Phase 1: find the deepest node under the cursor, recording the path with
+    // per-node bounds so we can scroll the innermost scrollable widget.
+    let mut path: Vec<(WidgetId, Rect)> = Vec::new();
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
+        );
+        if !bounds.contains(cx, cy) {
+            continue;
+        }
+        path.push((wid, bounds));
+
+        let child_offset = match &node.payload {
+            WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
+            _ => offset,
+        };
+        // Push children in reverse so the topmost child is popped first.
+        for &child in node.children.iter().rev() {
+            stack.push((child, child_offset));
+        }
     }
 
-    let child_offset = match &node.payload {
-        WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
-        _ => offset,
-    };
-
-    let children = node.children.clone();
-    for child in children.into_iter().rev() {
-        if dispatch_scroll_node(child, nodes, cx, cy, delta_y, child_offset) {
-            return true;
+    // Phase 2: try to scroll from innermost outward.
+    for (wid, bounds) in path.into_iter().rev() {
+        let Some(node) = nodes.get_mut(wid) else { continue };
+        match &mut node.payload {
+            WidgetPayload::VirtualizedList { state } => {
+                let mut st = state.borrow_mut();
+                let stride = st.item_height + st.gap;
+                let total_h = if st.item_count == 0 {
+                    0.0
+                } else {
+                    st.item_count as f32 * stride - st.gap
+                };
+                let max_scroll = (total_h - bounds.height).max(0.0);
+                if max_scroll > 0.0 {
+                    let next = (st.scroll_y.target - delta_y).clamp(0.0, max_scroll);
+                    st.scroll_y.set_target(next);
+                    return true;
+                }
+            }
+            WidgetPayload::ScrollView {
+                scroll_y,
+                content_height,
+                ..
+            } => {
+                let max_scroll = (*content_height - bounds.height).max(0.0);
+                if max_scroll > 0.0 {
+                    let next = (scroll_y.target - delta_y).clamp(0.0, max_scroll);
+                    scroll_y.set_target(next);
+                    return true;
+                }
+            }
+            WidgetPayload::TextArea {
+                text_block,
+                scroll_y,
+                ..
+            } => {
+                let line_count = text_block.line_start_offsets().len().max(1);
+                let content_h = line_count as f32 * text_block.style().line_height;
+                let max_scroll = (content_h - (bounds.height - 20.0)).max(0.0);
+                if max_scroll > 0.0 {
+                    *scroll_y = (*scroll_y - delta_y).clamp(0.0, max_scroll);
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
-
-    let Some(node) = nodes.get_mut(wid) else {
-        return false;
-    };
-    match &mut node.payload {
-        WidgetPayload::VirtualizedList { state } => {
-            let mut st = state.borrow_mut();
-            let stride = st.item_height + st.gap;
-            let total_h = if st.item_count == 0 {
-                0.0
-            } else {
-                st.item_count as f32 * stride - st.gap
-            };
-            let max_scroll = (total_h - bounds.height).max(0.0);
-            if max_scroll > 0.0 {
-                let next = (st.scroll_y.target - delta_y).clamp(0.0, max_scroll);
-                st.scroll_y.set_target(next);
-                return true;
-            }
-            false
-        }
-        WidgetPayload::ScrollView {
-            scroll_y,
-            content_height,
-            ..
-        } => {
-            let max_scroll = (*content_height - bounds.height).max(0.0);
-            if max_scroll > 0.0 {
-                let next = (scroll_y.target - delta_y).clamp(0.0, max_scroll);
-                scroll_y.set_target(next);
-                return true;
-            }
-            false
-        }
-        WidgetPayload::TextArea {
-            text_block,
-            scroll_y,
-            ..
-        } => {
-            let line_count = text_block.line_start_offsets().len().max(1);
-            let content_h = line_count as f32 * text_block.style().line_height;
-            let max_scroll = (content_h - (bounds.height - 20.0)).max(0.0);
-            if max_scroll > 0.0 {
-                *scroll_y = (*scroll_y - delta_y).clamp(0.0, max_scroll);
-                return true;
-            }
-            false
-        }
-        _ => false,
-    }
+    false
 }
 
+/// Iterative post-order hit-test: finds the topmost (last-painted) interactive
+/// widget that contains (x, y).  Accounts for `ScrollView` offset.
 fn hit_test_node(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
     x: f32,
     y: f32,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> Option<WidgetId> {
-    let node = nodes.get(wid)?;
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
-
-    if let WidgetPayload::SplitPane {
-        direction,
-        divider_id,
-        ..
-    } = &node.payload
-        && let Some(div) = nodes.get(*divider_id)
-    {
-        let div_bounds = Rect::new(
-            div.bounds.x + offset.0,
-            div.bounds.y + offset.1,
-            div.bounds.width,
-            div.bounds.height,
+    // Stack entries: (widget_id, accumulated_offset)
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    // We want the topmost (last-painted = deepest in z-order) hit.
+    // Paint visits children front-to-back, so we process children in reverse
+    // push order and return the first matching leaf.
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
         );
-        let hit_zone = match direction {
-            SplitDirection::Horizontal => {
-                Rect::new(div_bounds.x - 3.5, div_bounds.y, 8.0, div_bounds.height)
+
+        // SplitPane: check the drag divider zone first.
+        if let WidgetPayload::SplitPane {
+            direction,
+            divider_id,
+            ..
+        } = &node.payload
+            && let Some(div) = nodes.get(*divider_id)
+        {
+            let div_bounds = Rect::new(
+                div.bounds.x + offset.0,
+                div.bounds.y + offset.1,
+                div.bounds.width,
+                div.bounds.height,
+            );
+            let hit_zone = match direction {
+                SplitDirection::Horizontal => {
+                    Rect::new(div_bounds.x - 3.5, div_bounds.y, 8.0, div_bounds.height)
+                }
+                SplitDirection::Vertical => {
+                    Rect::new(div_bounds.x, div_bounds.y - 3.5, div_bounds.width, 8.0)
+                }
+            };
+            if hit_zone.contains(x, y) {
+                return Some(wid);
             }
-            SplitDirection::Vertical => {
-                Rect::new(div_bounds.x, div_bounds.y - 3.5, div_bounds.width, 8.0)
+        }
+
+        // ScrollView: clip test + offset adjustment for content.
+        if let WidgetPayload::ScrollView {
+            scroll_y,
+            content_id,
+            ..
+        } = &node.payload
+        {
+            if !bounds.contains(x, y) {
+                continue;
             }
-        };
-        if hit_zone.contains(x, y) {
+            stack.push((*content_id, (offset.0, offset.1 - scroll_y.value)));
+            continue;
+        }
+
+        // Push children in forward order so the last child (topmost) is
+        // processed first (LIFO stack = reverse iteration order).
+        for &child in &node.children {
+            stack.push((child, offset));
+        }
+
+        // Leaf check: is this node interactive and under the cursor?
+        if bounds.contains(x, y)
+            && matches!(
+                node.payload,
+                WidgetPayload::Button { .. }
+                    | WidgetPayload::Switch { .. }
+                    | WidgetPayload::Slider { .. }
+                    | WidgetPayload::TextInput { .. }
+                    | WidgetPayload::TextArea { .. }
+                    | WidgetPayload::Tabs { .. }
+                    | WidgetPayload::Dropdown { .. }
+                    | WidgetPayload::TrafficLights { .. }
+                    | WidgetPayload::VirtualizedList { .. }
+                    | WidgetPayload::Image {
+                        on_click: Some(_),
+                        ..
+                    }
+                    | WidgetPayload::Container {
+                        on_click: Some(_),
+                        ..
+                    }
+            )
+        {
             return Some(wid);
         }
     }
-
-    if let WidgetPayload::ScrollView {
-        scroll_y,
-        content_id,
-        ..
-    } = &node.payload
-    {
-        if !bounds.contains(x, y) {
-            return None;
-        }
-        let child_offset = (offset.0, offset.1 - scroll_y.value);
-        return hit_test_node(*content_id, nodes, x, y, child_offset);
-    }
-
-    for &child in node.children.iter().rev() {
-        if let Some(hit) = hit_test_node(child, nodes, x, y, offset) {
-            return Some(hit);
-        }
-    }
-
-    if bounds.contains(x, y)
-        && matches!(
-            node.payload,
-            WidgetPayload::Button { .. }
-                | WidgetPayload::Switch { .. }
-                | WidgetPayload::Slider { .. }
-                | WidgetPayload::TextInput { .. }
-                | WidgetPayload::TextArea { .. }
-                | WidgetPayload::Tabs { .. }
-                | WidgetPayload::Dropdown { .. }
-                | WidgetPayload::TrafficLights { .. }
-                | WidgetPayload::VirtualizedList { .. }
-                | WidgetPayload::Image {
-                    on_click: Some(_),
-                    ..
-                }
-                | WidgetPayload::Container {
-                    on_click: Some(_),
-                    ..
-                }
-        )
-    {
-        return Some(wid);
-    }
-
     None
 }
 
+/// Iterative search: finds the topmost `Container` with `is_drag_region` that
+/// contains (x, y).
 fn is_drag_node(
-    wid: WidgetId,
+    root: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
     x: f32,
     y: f32,
-    offset: (f32, f32),
+    start_offset: (f32, f32),
 ) -> bool {
-    let Some(node) = nodes.get(wid) else {
-        return false;
-    };
-    let bounds = Rect::new(
-        node.bounds.x + offset.0,
-        node.bounds.y + offset.1,
-        node.bounds.width,
-        node.bounds.height,
-    );
-    if let WidgetPayload::Container {
-        is_drag_region: true,
-        ..
-    } = &node.payload
-        && bounds.contains(x, y)
-    {
-        return true;
-    }
-    for &child in &node.children {
-        if is_drag_node(child, nodes, x, y, offset) {
+    let mut stack: Vec<(WidgetId, (f32, f32))> = vec![(root, start_offset)];
+    while let Some((wid, offset)) = stack.pop() {
+        let Some(node) = nodes.get(wid) else { continue };
+        let bounds = Rect::new(
+            node.bounds.x + offset.0,
+            node.bounds.y + offset.1,
+            node.bounds.width,
+            node.bounds.height,
+        );
+        if let WidgetPayload::Container {
+            is_drag_region: true,
+            ..
+        } = &node.payload
+            && bounds.contains(x, y)
+        {
             return true;
+        }
+        for &child in &node.children {
+            stack.push((child, offset));
         }
     }
     false

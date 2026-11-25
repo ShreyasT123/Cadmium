@@ -257,6 +257,9 @@ impl From<LayoutStyle> for Style {
 pub struct LayoutEngine {
     tree: TaffyTree<()>,
     rect_scratch: Vec<(LayoutNode, Rect)>,
+    /// Reusable scratch HashMap so `collect_logical_rects` doesn't allocate
+    /// on every relayout.  Cleared in-place, not dropped and re-created.
+    rect_map_scratch: HashMap<LayoutNode, Rect>,
 }
 
 impl LayoutEngine {
@@ -264,6 +267,7 @@ impl LayoutEngine {
         Self {
             tree: TaffyTree::new(),
             rect_scratch: Vec::new(),
+            rect_map_scratch: HashMap::new(),
         }
     }
 
@@ -396,10 +400,14 @@ impl LayoutEngine {
         }
     }
 
-    pub fn collect_logical_rects(&self, root: LayoutNode) -> HashMap<LayoutNode, Rect> {
-        let mut out = HashMap::new();
-        self.walk_rects(root.0, 0.0, 0.0, &mut out);
-        out
+    pub fn collect_logical_rects(&mut self, root: LayoutNode) -> &HashMap<LayoutNode, Rect> {
+        self.rect_map_scratch.clear();
+        // Temporarily take the scratch map out to avoid a simultaneous borrow
+        // of `self` (needed by `walk_rects`) and `self.rect_map_scratch`.
+        let mut map = std::mem::take(&mut self.rect_map_scratch);
+        self.walk_rects(root.0, 0.0, 0.0, &mut map);
+        self.rect_map_scratch = map;
+        &self.rect_map_scratch
     }
 
     fn walk_rects(

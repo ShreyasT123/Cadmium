@@ -6,14 +6,25 @@ pub struct FrameMetrics {
     pub frame_ms: f32,
     pub layout_ms: f32,
     pub paint_ms: f32,
+    /// Frames-per-second based purely on frame execution time (how fast
+    /// `render()` runs), regardless of whether the loop was idle.
     pub fps: f32,
+    /// Frames-per-second based on the wall-clock cadence between consecutive
+    /// frames that the event loop actually requested (i.e. true throughput).
+    /// For interactive apps this equals `fps` during animation and is 0 / idle
+    /// when no work is pending.
     pub effective_fps: f32,
     pub relayouts: u64,
     pub repaints: u64,
 }
 
 pub struct FrameProfiler {
+    /// Rolling window of frame execution times (ms).
     samples: VecDeque<f32>,
+    /// Rolling window of wall-clock inter-frame intervals (s), used only for
+    /// effective_fps.  We keep a *separate* counter for the "true FPS" path so
+    /// that keystroke frames (dt ≈ 0) are recorded without the cadence filter
+    /// dropping them.
     cadence_samples: VecDeque<f32>,
     max_samples: usize,
     pub metrics: FrameMetrics,
@@ -33,6 +44,13 @@ impl FrameProfiler {
         Instant::now()
     }
 
+    /// Record the wall-clock interval between two consecutive presents.
+    ///
+    /// Intervals >= 0.045 s (< ~22 FPS) represent idle gaps between discrete
+    /// user inputs or caret blinks rather than continuous rendering, so they
+    /// clear the cadence window (`effective_fps = 0.0`).  Intervals <= 0.001 s
+    /// (duplicate scheduler wakeups) are ignored so `effective_fps` never
+    /// spikes to thousands of FPS.
     pub fn record_cadence(&mut self, frame_dt_secs: f32) {
         if frame_dt_secs >= 0.045 {
             self.cadence_samples.clear();
@@ -86,5 +104,18 @@ mod tests {
         assert_eq!(p.metrics.relayouts, 1);
         assert_eq!(p.metrics.repaints, 2);
         assert!((p.metrics.fps - 62.5).abs() < 0.1);
+    }
+
+    #[test]
+    fn cadence_records_active_frames_and_clears_on_idle_gap() {
+        let mut p = FrameProfiler::new(10);
+        for _ in 0..10 {
+            p.record_cadence(0.008);
+        }
+        assert!((p.metrics.effective_fps - 125.0).abs() < 1.0, "got {}", p.metrics.effective_fps);
+
+        // An idle gap (>= 45 ms, e.g. caret blink or typing pause) clears cadence.
+        p.record_cadence(0.530);
+        assert_eq!(p.metrics.effective_fps, 0.0);
     }
 }
