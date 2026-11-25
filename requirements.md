@@ -1,6 +1,6 @@
 ---
 
-# SteelUI — Product Requirements Document
+# cadmium — Product Requirements Document
 
 **Version:** 1.1  
 **Status:** Architecture-aligned specification  
@@ -12,15 +12,15 @@
 
 # 1. Project Vision
 
-SteelUI is a custom, GPU-accelerated GUI framework written in Rust and built on top of `wgpu`.
+cadmium is a custom, GPU-accelerated GUI framework written in Rust and built on top of `wgpu`.
 
 Its objective is to enable developers to build visually sophisticated, high-performance desktop applications—ranging from knowledge tools and IDEs to real-time communication and creative media software—with consistent appearance and behaviour across Windows, Linux, and macOS.
 
-The design philosophy takes inspiration from macOS: refined typography, rounded geometry, subtle transparency, fluid animations, smooth transitions, carefully designed spacing, and sophisticated visual effects. However, SteelUI must establish its own design language rather than directly reproducing Apple's proprietary interface.
+The design philosophy takes inspiration from macOS: refined typography, rounded geometry, subtle transparency, fluid animations, smooth transitions, carefully designed spacing, and sophisticated visual effects. However, cadmium must establish its own design language rather than directly reproducing Apple's proprietary interface.
 
-**Fundamental principle:** The same SteelUI application should look and behave consistently regardless of the underlying operating system.
+**Fundamental principle:** The same cadmium application should look and behave consistently regardless of the underlying operating system.
 
-SteelUI must not rely on native OS widgets for its visual interface. It owns its rendering, widget tree, layout integration, styling, reactivity, animation, and event systems, while isolating specialised OS integrations behind internal abstractions.
+cadmium must not rely on native OS widgets for its visual interface. It owns its rendering, widget tree, layout integration, styling, reactivity, animation, and event systems, while isolating specialised OS integrations behind internal abstractions.
 
 ---
 
@@ -58,14 +58,14 @@ Requirements:
 
 # 4. Technology Stack & Dependency Policy
 
-SteelUI implements its core GUI systems internally while using established crates for specialised low-level or platform-specific capabilities:
+cadmium implements its core GUI systems internally while using established crates for specialised low-level or platform-specific capabilities:
 
 | Subsystem | Technology | Role & Boundary |
 |---|---|---|
 | Programming language | Rust | Core framework |
 | GPU rendering | `wgpu` | GPU abstraction (exposed only via controlled custom-surface APIs) |
 | Window management | `winit` | Cross-platform window creation and OS event loop |
-| Layout solver | `taffy` | Internal Flex/Grid layout calculation behind SteelUI's layout API |
+| Layout solver | `taffy` | Internal Flex/Grid layout calculation behind cadmium's layout API |
 | Text shaping | `cosmic-text` | Font discovery, shaping, bidi, wrapping, and line layout |
 | Font rasterization | `swash` | Glyph rasterization (colour + alpha masks) |
 | Static SVG rendering | `resvg` | Internal SVG parsing/rasterization into cached GPU textures |
@@ -79,16 +79,16 @@ SteelUI implements its core GUI systems internally while using established crate
 | Logging & profiling | `tracing` | Structured diagnostics and frame telemetry |
 | Error handling | `thiserror` | Ergonomic internal/public error types |
 
-**Dependency isolation rule:** Types from `taffy`, `winit`, `cosmic-text`, `accesskit`, `arboard`, `rfd`, and `resvg` must remain internal implementation details and must not leak into SteelUI's public widget or application APIs.
+**Dependency isolation rule:** Types from `taffy`, `winit`, `cosmic-text`, `accesskit`, `arboard`, `rfd`, and `resvg` must remain internal implementation details and must not leak into cadmium's public widget or application APIs.
 
 ---
 
 # 5. Programming Model & Reactivity Architecture
 
-SteelUI uses a **hybrid retained and fine-grained reactive programming model**.
+cadmium uses a **hybrid retained and fine-grained reactive programming model**.
 
 ## 5.1 Retained Tree & Ownership
-- SteelUI maintains a persistent retained widget tree stored in an **arena / slotmap architecture** with stable handle-based IDs.
+- cadmium maintains a persistent retained widget tree stored in an **arena / slotmap architecture** with stable handle-based IDs.
 - Stable node IDs enable predictable Rust ownership without `Rc`/`RefCell` reference cycles, clean parent-child traversal, and persistent mapping to Taffy layout nodes and `AccessKit` semantic nodes.
 - Applications avoid full-tree reconstruction when local state changes; only affected components or dynamic child slots update.
 
@@ -139,7 +139,7 @@ Separate from SDF primitives, dedicated to arbitrary geometry:
 
 ## 6.5 Custom GPU Surfaces
 - Widgets can embed **custom `wgpu` rendering surfaces** (e.g., video viewports, 3D previews, shader canvases, audio waveforms).
-- Custom surfaces render into SteelUI-managed offscreen texture targets sized to the widget's laid-out bounds, then composite through SteelUI's render graph so rounded corners, overlays, popovers, and tooltips layer cleanly on top.
+- Custom surfaces render into cadmium-managed offscreen texture targets sized to the widget's laid-out bounds, then composite through cadmium's render graph so rounded corners, overlays, popovers, and tooltips layer cleanly on top.
 
 ## 6.6 Multi-Window Resource Sharing & Format Strategy
 - GPU state is split between a process-wide **`GpuContext`** (Device, Queue, compiled pipelines, glyph/icon/image caches) and per-window **`WindowContext`** (Surface, swapchain configuration).
@@ -150,7 +150,7 @@ Separate from SDF primitives, dedicated to arbitrary geometry:
 
 # 7. Layout Engine
 
-SteelUI implements its own layout abstraction backed internally by **`taffy`**.
+cadmium implements its own layout abstraction backed internally by **`taffy`**.
 
 ## 7.1 Layout Models
 - Horizontal (`Row`) and Vertical (`Column`) Flexbox-style layouts.
@@ -168,7 +168,7 @@ Every applicable widget supports:
 - Overflow behaviour (visible, clip, scroll).
 
 ## 7.3 Integration Responsibilities
-SteelUI's layout layer owns:
+cadmium's layout layer owns:
 - **Leaf Measurement Bridge:** Connecting `taffy` measurement callbacks to `cosmic-text` (wrapped text bounds), images, and custom viewports without borrow conflicts.
 - **Relayout Boundaries & Dirty Subtrees:** Avoiding full-window layout recalculation when localized content changes.
 - **Viewport Virtualization Contract:** Supporting lists, trees, and tables with 100,000+ items by computing visible scroll windows and mounting only visible item nodes (plus overscan) into `taffy`.
@@ -178,7 +178,7 @@ SteelUI's layout layer owns:
 
 # 8. Widget System
 
-All widgets are composable, themeable, keyboard-accessible, and built on SteelUI's retained/reactive core.
+All widgets are composable, themeable, keyboard-accessible, and built on cadmium's retained/reactive core.
 
 ## 8.1 Tier 1 — Core Layout & Interactive Widgets (v1.0 MVP)
 **Layout & Structure:**
@@ -204,7 +204,7 @@ All widgets are composable, themeable, keyboard-accessible, and built on SteelUI
 
 # 9. Typography & Text Input System
 
-Typography is central to SteelUI's visual identity.
+Typography is central to cadmium's visual identity.
 
 Requirements:
 - Custom font loading (embedded or filesystem) and system font discovery.
@@ -239,7 +239,7 @@ Requirements:
 
 # 11. Animation System
 
-SteelUI includes a central, time-based animation engine integrated with the render loop:
+cadmium includes a central, time-based animation engine integrated with the render loop:
 - Animated properties: position, size, opacity, colour, transforms, blur radius, and border radius.
 - Spring physics animations and standard easing curves.
 - Sequencing, staggering, cancellation, and seamless reversal mid-flight.
@@ -261,7 +261,7 @@ Unified cross-platform event pipeline:
 
 # 13. Window Management (Multi-Window from Day One)
 
-SteelUI separates process-wide GPU/app state from per-window state from initial implementation:
+cadmium separates process-wide GPU/app state from per-window state from initial implementation:
 - **`GpuContext` (Singleton):** Shared device, queue, pipelines, texture/glyph/SVG caches.
 - **`WindowContext` (Per-Window):** `winit` window handle, `wgpu` surface, surface configuration, DPI scale factor, window root widget subtree, focus/IME state, and `AccessKit` adapter.
 
@@ -270,7 +270,7 @@ Capabilities:
 - Detached toolbars, floating panels, and multi-window docking tear-off.
 - Transparent windows and configurable decorations / custom client-side titlebars.
 - Display/monitor enumeration and per-window DPI change handling.
-- System clipboard (`arboard`) and native file dialogs (`rfd`) behind SteelUI platform traits.
+- System clipboard (`arboard`) and native file dialogs (`rfd`) behind cadmium platform traits.
 
 ---
 
@@ -319,7 +319,7 @@ Accessibility is built into the retained widget architecture from Phase 3 onward
 
 # 18. Architecture and Modularity
 
-SteelUI is organized into decoupled internal subsystems (maintained as logical modules first, split into workspace crates only as compile-time or dependency boundaries dictate):
+cadmium is organized into decoupled internal subsystems (maintained as logical modules first, split into workspace crates only as compile-time or dependency boundaries dictate):
 
 - `core` — App lifecycle, `GpuContext`, async waker bridge, IDs, geometry primitives.
 - `reactive` — Signals, derived state, subscriptions, 3-stage dirty queue.
@@ -362,7 +362,7 @@ SteelUI is organized into decoupled internal subsystems (maintained as logical m
 
 Long-term architectural benchmarks include applications on the scale of **Notion, VS Code, Discord, and DaVinci Resolve**.
 
-To validate SteelUI before v1.0 stabilization, development will drive a **multi-pane Workspace & Creative Inspector dogfood application** designed to stress-test all core bets simultaneously:
+To validate cadmium before v1.0 stabilization, development will drive a **multi-pane Workspace & Creative Inspector dogfood application** designed to stress-test all core bets simultaneously:
 - **Multi-pane docking, splitters, and tabs** (including tearing off a panel into a second OS window).
 - **A virtualized file/node tree** (10,000+ rows, icons, keyboard navigation, selection).
 - **An inspector & document panel** (nested Taffy layouts, text editing, sliders, dropdowns, scrolling, async background updates).
@@ -396,7 +396,7 @@ To validate SteelUI before v1.0 stabilization, development will drive a **multi-
 - Light/Dark themes, global design tokens, runtime theme switching.
 - Rich text, `TextArea` multiline editing, platform shortcuts, clipboard (`arboard`), file dialogs (`rfd`).
 - Time-based animation engine (springs, easings, transitions, reduced-motion support).
-- **Milestone:** SteelUI's signature visual identity, fluid motion, and complete editing experience.
+- **Milestone:** cadmium's signature visual identity, fluid motion, and complete editing experience.
 
 ## Phase 5 — Advanced Workspace Widgets & Dogfood Application
 - Tier 2 widgets (`VirtualizedList`, `TreeView`, `Table`, `SplitPane`, `DockArea`, `CommandPalette`, `MenuBar`, `ColorPicker`, `Toast`).
@@ -408,13 +408,13 @@ To validate SteelUI before v1.0 stabilization, development will drive a **multi-
 - CPU/GPU profiling, memory/allocation audits, 120–144 FPS tuning.
 - Cross-platform visual regression suite and automated benchmarks.
 - Documentation, examples, and public API stabilization.
-- **Milestone:** SteelUI 1.0.
+- **Milestone:** cadmium 1.0.
 
 ---
 
 # 23. Acceptance Criteria
 
-SteelUI reaches v1.0 readiness when:
+cadmium reaches v1.0 readiness when:
 1. Complete multi-window desktop applications can be built without touching `wgpu`, `taffy`, or `winit` directly (except when opting into `CustomGpuSurface`).
 2. Visual appearance and layout behaviour are consistent across Windows, Linux, and macOS, including fractional DPI scaling.
 3. The 3-stage reactive pipeline prevents full-tree rebuilds/relayouts on localized state changes and achieves zero GPU redraws when idle.
@@ -426,4 +426,4 @@ SteelUI reaches v1.0 readiness when:
 
 ---
 
-**SteelUI — A unified, reactive, GPU-native interface system for every desktop platform.**
+**cadmium — A unified, reactive, GPU-native interface system for every desktop platform.**

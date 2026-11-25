@@ -1,6 +1,7 @@
 struct Globals {
     viewport_size: vec2<f32>,
-    _pad: vec2<f32>,
+    scale: f32,
+    _pad: f32,
 }
 
 @group(0) @binding(0)
@@ -115,7 +116,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let normal = select(vec2<f32>(0.0, -1.0), grad / max(g_len, 0.0001), g_len > 0.0001);
 
     // Monotonic convex lens bevel (26px rim, strictly positive derivative -> zero folding/creases)
-    let bevel = min(26.0, min(in.half_size.x, in.half_size.y) * 0.48);
+    let s = max(globals.scale, 1.0);
+    let bevel = min(26.0 * s, min(in.half_size.x, in.half_size.y) * 0.48);
     let rim_t = smoothstep(-bevel, 0.0, dist);
     let bend = rim_t * rim_t;
 
@@ -125,11 +127,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
                + 0.45 * cos(in.local_pos.y * 0.039 - in.local_pos.x * 0.014);
     let wave_y = cos(in.local_pos.x * 0.022 - in.local_pos.y * 0.009)
                + 0.45 * sin(in.local_pos.x * 0.037 + in.local_pos.y * 0.013);
-    let organic_px = vec2<f32>(wave_x, wave_y) * ripple * 7.5;
+    let organic_px = vec2<f32>(wave_x, wave_y) * ripple * 7.5 * s;
 
-    let uv_offset = (normal * bend * 14.5 + organic_px) / globals.viewport_size;
-    // Optical prism dispersion (~3.6px RGB split on curved bevel)
-    let disp = (normal * bend * 3.6 + organic_px * 0.18) / globals.viewport_size;
+    let uv_offset = (normal * bend * 14.5 * s + organic_px) / globals.viewport_size;
+    let disp = (normal * bend * 3.6 * s + organic_px * 0.18) / globals.viewport_size;
     let screen_uv = in.clip_pos.xy / globals.viewport_size;
 
     let uv_r = clamp(screen_uv + uv_offset - disp, vec2<f32>(0.001), vec2<f32>(0.999));
@@ -193,8 +194,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let corner_glow = tl_peak + br_peak;
 
         // Crisp 3.5px opposing-corner specular bevel (matches CodePen --edge)
-        let soft_inset = smoothstep(-3.8, -0.4, dist);
-        let rim_line = smoothstep(-1.8, -0.6, dist) * (1.0 - smoothstep(-0.6, 0.2, dist));
+        let soft_inset = smoothstep(-3.8 * s, -0.4 * s, dist);
+        let rim_line = smoothstep(-1.8 * s, -0.6 * s, dist) * (1.0 - smoothstep(-0.6 * s, 0.2 * s, dist));
 
         let edge_white = (soft_inset * 0.34 * corner_glow + rim_line * (0.14 + 0.40 * corner_glow)) * in.specular;
         surface_rgb = mix(surface_rgb, vec3<f32>(1.0), clamp(edge_white, 0.0, 0.82));

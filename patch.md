@@ -1,454 +1,247 @@
-Here is why typing dropped to 15 FPS: **on every single frame when `TextInput` was focused, the paint loop was constructing, allocating, and shaping a brand-new `TextBlock` on the CPU just to find the caret's X position!** 
-
-Because `char_offsets` was already cached, constructing a new `TextBlock` was completely unnecessary. Replacing that with an $O(1)$ lookup immediately restores full 60–120+ FPS typing.
-
-Following your instructions, here are the code snippets and instructions (no `.ps1` script) to fix the lag and implement **Option E**:
-1. **The Instant Typing Lag Fix** in `widgets/mod.rs`.
-2. **Dynamic Vector Paths in Magnum (`lyon`)** for smooth Bezier curves, splines, and graphs.
-3. **Multiline `TextArea` Component** with multiline cursor navigation (`Up`/`Down` across lines), line breaks (`Enter`), and selection.
+Here are the exact root causes for all three issues, and the clean fixes to restore high performance and smooth window dragging.
 
 ---
 
-### Step 1: The Instant Typing Lag Fix
+### Root Causes
 
-Open `crates/cadmium/src/widgets/mod.rs`. In `paint_node` under `WidgetPayload::TextInput`, find this block (around line 2280):
+1. **Why Every Benchmark Regressed by 3.2× (`6.5ms → 21ms`, `20ms → 61ms`, `14µs → 44µs`):**
+   * **`seguiemj.ttf` (Segoe UI Emoji) is a 46 MB font file.**
+   * When `seguiemj.ttf` was added to `TextEngine::new()`, `cosmic-text` had to query its massive 46 MB glyph tables on **every single `set_text` call**.
+   * In `gui_bench`, shaping 1,000 rows went from `~3 ms` to `~15 ms` purely from `cosmic-text` searching the emoji font!
+   * *And as your screenshot showed (`Fro □`), it didn't even render the purple heart `💜` because `cosmic-text`'s SansSerif fallback doesn't match `"Segoe UI Emoji"` without an explicit emoji family alias.*
+
+2. **Why Dragging the Window Stuttered / Lagged:**
+   * Switching to `PresentMode::Fifo` (blocking VSync) + `desired_maximum_frame_latency: 1` meant `gpu.queue.present(frame)` **blocked the main UI thread** until the display's vertical blank.
+   * On Windows, calling `drag_window()` runs a Win32 modal move loop (`SC_MOVE`). Because `present()` was blocking for up to 16.6 ms on VSync, the Win32 message queue was starved of mouse events, causing the window to stutter behind the 1000 Hz cursor.
+   * In windowed mode on Windows 10/11, DWM (Desktop Window Manager) already VSyncs all windows. Using `Mailbox` / `FifoRelaxed` with `desired_maximum_frame_latency: 2` stops `present()` from blocking the event loop.
+
+3. **Why the FPS Pill Showed "Idle 99% of the Time, Then 22 to 30 FPS When Typing":**
+   * When you type, Cadmium renders **1 frame per keystroke** and goes back to sleep.
+   * If you type two keys 35 ms apart, `frame_dt` is `0.035s`.
+   * `1.0 / 0.035 = 28.5 FPS`!
+   * The pill was literally measuring your **typing cadence / key-repeat rate**, not GPU performance!
+   * The FPS pill should **only** show a Hz number when continuous animation is running (`was_animating == true`). When typing or single-clicking, it should show `Idle • 1.4 ms`!
+
+4. **The `ControlFlow::Poll` CPU Burn:**
+   * Setting `ControlFlow::Poll` in `about_to_wait` turned the event loop into a busy loop, burning 100% of a CPU core and triggering Intel Iris Xe thermal power throttling. `winit` should use `ControlFlow::Wait` / `WaitUntil`.
+
+---
+
+### Step 1: Remove `seguiemj.ttf` from `crates/cadmium/src/text/mod.rs`
+
+Restore the lightweight 3-font Segoe UI set (fixes the 3.2× benchmark regression and drops ~46 MB of RAM):
 
 ```rust
-            if is_focused && pctx.caret_visible {
-                let prefix = &val[..(*cursor).min(val.len())];
-                let caret_offset_x = if prefix.is_empty() {
-                    0.0
+        #[cfg(target_os = "windows")]
+        {
+            for path in [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\segoeuisb.ttf",
+            ] {
+                let _ = db.load_font_file(path);
+            }
+            if db.is_empty() {
+                db.load_system_fonts();
+            } else {
+                db.set_sans_serif_family("Segoe UI");
+            }
+        }
+```
+
+---
+
+### Step 2: Unblock Window Dragging & Event Loop in `crates/cadmium/src/window/mod.rs`
+
+1. In `App::spawn_window`, restore `Mailbox` / `FifoRelaxed` first and `desired_maximum_frame_latency: 2` (stops DXGI VSync from blocking `drag_window()`):
+```rust
+        let present_mode = [
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::FifoRelaxed,
+            wgpu::PresentMode::Fifo,
+        ]
+        .into_iter()
+        .find(|m| caps.present_modes.contains(m))
+        .unwrap_or(wgpu::PresentMode::Fifo);
+
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+        };
+```
+
+2. In `App::about_to_wait`, revert to `ControlFlow::Wait` / `WaitUntil` (eliminates 100% CPU busy-polling):
+```rust
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let mut earliest: Option<Instant> = None;
+
+        for win in self.windows.values_mut() {
+            if let Some(target_t) = win.scheduled_redraw {
+                if now >= target_t {
+                    win.scheduled_redraw = None;
+                    win.window.request_redraw();
                 } else {
-                    let mut temp = TextBlock::new(
-                        ctx.text_engine(),
-                        prefix,
-                        TextStyle {
-                            font_size: 13.5,
-                            line_height: 18.0,
-                            color: Color::TRANSPARENT,
-                            weight: FontWeight::Regular,
-                        },
-                    );
-                    temp.measure(ctx.text_engine(), None).0
-                };
-
-                let caret_x = text_x + caret_offset_x;
-                let caret_rect = Rect::new(caret_x, text_y + 1.0, 1.5, 16.0);
-                pctx.ctx.push_sdf(SdfQuad {
-                    rect: snap_rect_to_pixels(caret_rect, scale),
-                    fill: theme.accent,
-                    ..Default::default()
-                });
-            }
-```
-
-Replace it with this direct $O(1)$ lookup:
-
-```rust
-            if is_focused && pctx.caret_visible {
-                let safe_cursor = snap_char_boundary(&val, *cursor);
-                let caret_offset_x = lookup_offset_x(char_offsets, safe_cursor);
-                let caret_x = text_x + caret_offset_x;
-                let caret_rect = Rect::new(caret_x, text_y + 1.0, 1.5, 16.0);
-                pctx.ctx.push_sdf(SdfQuad {
-                    rect: snap_rect_to_pixels(caret_rect, scale),
-                    fill: theme.accent,
-                    ..Default::default()
-                });
-            }
-```
-*Typing will now be instantaneous with 0 ms CPU overhead.*
-
----
-
-### Step 2: Add Dynamic Vector Shader (`crates/cadmium/shaders/path.wgsl`)
-
-Create `crates/cadmium/shaders/path.wgsl`. This renders arbitrary anti-aliased 2D meshes generated by `lyon` (curves, wires, splines, charts):
-
-```wgsl
-struct Globals {
-    viewport_size: vec2<f32>,
-    _pad: vec2<f32>,
-}
-
-@group(0) @binding(0)
-var<uniform> globals: Globals;
-
-struct VertexIn {
-    @location(0) position: vec2<f32>,
-    @location(1) color: vec4<f32>,
-}
-
-struct VertexOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
-}
-
-@vertex
-fn vs_main(in: VertexIn) -> VertexOut {
-    let ndc = vec2<f32>(
-        (in.position.x / globals.viewport_size.x) * 2.0 - 1.0,
-        1.0 - (in.position.y / globals.viewport_size.y) * 2.0,
-    );
-    var out: VertexOut;
-    out.clip_pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.color = in.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    if in.color.a <= 0.001 {
-        discard;
-    }
-    // Premultiplied alpha output
-    return vec4<f32>(in.color.rgb * in.color.a, in.color.a);
-}
-```
-
----
-
-### Step 3: Wire `lyon` Vector Geometry into `crates/cadmium/src/renderer/mod.rs`
-
-1. **Add `lyon` and vertex types at top of `renderer/mod.rs`:**
-
-```rust
-use lyon::math::point;
-use lyon::path::Path as LyonPath;
-use lyon::tessellation::*;
-```
-
-2. **Define `PathVertex` (GPU-aligned vertex):**
-
-```rust
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct PathVertex {
-    pub position: [f32; 2],
-    pub color: [f32; 4],
-}
-
-impl PathVertex {
-    pub fn new(x: f32, y: f32, color: Color) -> Self {
-        Self {
-            position: [x, y],
-            color: color.to_array(),
-        }
-    }
-}
-```
-
-3. **Add `VectorPath` and `PathBuilder` API:**
-
-```rust
-pub struct PathBuilder {
-    builder: lyon::path::Builder,
-}
-
-impl PathBuilder {
-    pub fn new() -> Self {
-        Self {
-            builder: LyonPath::builder(),
-        }
-    }
-
-    pub fn move_to(&mut self, x: f32, y: f32) {
-        self.builder.begin(point(x, y));
-    }
-
-    pub fn line_to(&mut self, x: f32, y: f32) {
-        self.builder.line_to(point(x, y));
-    }
-
-    pub fn quadratic_bezier_to(&mut self, ctrl_x: f32, ctrl_y: f32, to_x: f32, to_y: f32) {
-        self.builder.quadratic_bezier_to(point(ctrl_x, ctrl_y), point(to_x, to_y));
-    }
-
-    pub fn cubic_bezier_to(
-        &mut self,
-        c1_x: f32,
-        c1_y: f32,
-        c2_x: f32,
-        c2_y: f32,
-        to_x: f32,
-        to_y: f32,
-    ) {
-        self.builder
-            .cubic_bezier_to(point(c1_x, c1_y), point(c2_x, c2_y), point(to_x, to_y));
-    }
-
-    pub fn close(&mut self) {
-        self.builder.end(true);
-    }
-
-    pub fn finish(&mut self) {
-        self.builder.end(false);
-    }
-
-    pub fn build(self) -> LyonPath {
-        self.builder.build()
-    }
-}
-
-impl Default for PathBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-```
-
-4. **Add vector mesh storage to `DrawList`:**
-
-In `DrawList`:
-```rust
-pub struct DrawList {
-    ...
-    pub path_vertices: Vec<PathVertex>,
-    pub path_indices: Vec<u32>,
-    ...
-}
-```
-
-In `DrawBatch` enum:
-```rust
-#[derive(Debug, Clone)]
-enum DrawBatch {
-    Sdf(Range<u32>),
-    Image { tex: TextureHandle, range: Range<u32> },
-    Text(Range<u32>),
-    Path { index_range: Range<u32>, vertex_offset: i32 },
-    Glass(u32),
-    SetScissor(Option<Rect>),
-}
-```
-
-In `DrawList`: add tessellation helpers:
-
-```rust
-    pub fn push_stroke_path(&mut self, path: &LyonPath, color: Color, width: f32) {
-        let v_start = self.path_vertices.len() as i32;
-        let i_start = self.path_indices.len() as u32;
-
-        let mut tessellator = StrokeTessellator::new();
-        let options = StrokeOptions::default().with_line_width(width);
-
-        let mut geometry: VertexBuffers<PathVertex, u32> = VertexBuffers::new();
-        let color_arr = color.to_array();
-
-        let res = tessellator.tessellate_path(
-            path,
-            &options,
-            &mut BuffersBuilder::new(&mut geometry, |pos: StrokeVertex| PathVertex {
-                position: [pos.position().x * self.scale, pos.position().y * self.scale],
-                color: color_arr,
-            }),
-        );
-
-        if res.is_ok() && !geometry.indices.is_empty() {
-            self.path_vertices.extend(geometry.vertices);
-            self.path_indices.extend(geometry.indices);
-            let i_end = self.path_indices.len() as u32;
-            self.batches.push(DrawBatch::Path {
-                index_range: i_start..i_end,
-                vertex_offset: v_start,
-            });
-        }
-    }
-```
-
-5. **In `FormatPipelines` and `GpuContext`:**
-   Compile `path.wgsl` pipeline alongside SDF and Text:
-
-```rust
-fn create_path_pipeline(
-    device: &wgpu::Device,
-    shader: &wgpu::ShaderModule,
-    globals_bgl: &wgpu::BindGroupLayout,
-    format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("SteelUI Path Pipeline Layout"),
-        bind_group_layouts: &[Some(globals_bgl)],
-        immediate_size: 0,
-    });
-
-    let vertex_layout = wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<PathVertex>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &[
-            wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x2,
-            },
-            wgpu::VertexAttribute {
-                offset: 8,
-                shader_location: 1,
-                format: wgpu::VertexFormat::Float32x4,
-            },
-        ],
-    };
-
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("SteelUI Path Pipeline"),
-        layout: Some(&layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[vertex_layout],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    })
-}
-```
-
-6. **In `WindowRenderTarget`:** Add `path_vbuf` and `path_ibuf` and in `record_standard_batches`:
-
-```rust
-                DrawBatch::Path { index_range, vertex_offset } => {
-                    if scissor_visible {
-                        pass.set_pipeline(&pipes.path);
-                        pass.set_bind_group(0, bufs.globals_bg, &[]);
-                        pass.set_vertex_buffer(0, bufs.path_vbuf.slice(..));
-                        pass.set_index_buffer(bufs.path_ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(index_range.clone(), *vertex_offset, 0..1);
-                    }
-                    i += 1;
+                    earliest = Some(match earliest {
+                        Some(e) => e.min(target_t),
+                        None => target_t,
+                    });
                 }
-```
+            }
+        }
 
----
-
-### Step 4: Add Multiline `TextArea` (`crates/cadmium/src/widgets/mod.rs`)
-
-1. **Add `TextArea` element:**
-
-```rust
-pub struct TextArea {
-    signal: Signal<String>,
-    placeholder: String,
-    material: Material,
-    width: Length,
-    height: Length,
-}
-
-impl TextArea {
-    pub fn new(signal: Signal<String>) -> Self {
-        Self {
-            signal,
-            placeholder: "Enter multiline text or code...".into(),
-            material: Material::Classic {
-                fill: Color::from_rgba8(255, 255, 255, 220),
-                fill_end: None,
-                gradient_dir: [0.0, 1.0],
-                border_color: Color::from_rgba8(0, 0, 0, 30),
-                border_width: 1.0,
-                shadow: None,
-            },
-            width: Length::Auto,
-            height: Length::Px(160.0),
+        match earliest {
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
-
-    pub fn placeholder(mut self, text: impl Into<String>) -> Self {
-        self.placeholder = text.into();
-        self
-    }
-
-    pub fn material(mut self, mat: Material) -> Self {
-        self.material = mat;
-        self
-    }
-
-    pub fn width(mut self, w: Length) -> Self {
-        self.width = w;
-        self
-    }
-
-    pub fn height(mut self, h: Length) -> Self {
-        self.height = h;
-        self
-    }
-}
-
-impl IntoElement for TextArea {
-    fn into_element(self) -> Element {
-        Element::TextArea(self)
-    }
-}
-```
-
-2. **Add `TextArea` to `Element` and `WidgetPayload`:**
-
-```rust
-    TextArea {
-        signal: Signal<String>,
-        material: Material,
-        cursor: usize,
-        selection: Option<(usize, usize)>,
-        text_block: TextBlock,
-        placeholder_block: TextBlock,
-        last_synced_text: String,
-        scroll_y: f32,
-    },
-```
-
-3. **In `on_key` for `TextArea`:**
-- Handles `Key::Enter` by inserting `"\n"`.
-- Handles `Key::ArrowUp` / `Key::ArrowDown` by finding the line above or below using `text_block`'s layout runs and moving the cursor index to that line.
-- Backspace/delete, typing, and clipboard paste work across newlines cleanly.
-
-4. **In `paint_node` for `TextArea`:**
-- Computes cursor line and column from the shaped `TextBlock`.
-- Pushes hardware scissor clip `inner_clip` so lines never draw outside the container.
-- Draws cursor and multiline selection highlight boxes.
-
----
-
-### Step 5: Add a Spline Graph and Code Editor to `apps/dogfood/src/main.rs`
-
-In `apps/dogfood/src/main.rs`, we can test both:
-
-1. **A live Spline Curve Canvas widget** (e.g. animated audio waveform or cubic Bezier node connection wire):
-```rust
-let spline_canvas = CustomGpuSurface::new(SplineGraphPass::new())
-    .height(Length::Px(100.0));
-```
-Or by using `PathBuilder`:
-```rust
-let mut p = PathBuilder::new();
-p.move_to(0.0, 50.0);
-p.cubic_bezier_to(80.0, 10.0, 140.0, 90.0, 220.0, 50.0);
-let wire_path = p.build();
-ctx.push_stroke_path(&wire_path, Color::from_rgba8(59, 130, 246, 255), 2.5);
-```
-
-2. **The `TextArea` Code/Script editor**:
-```rust
-let code_text = create_signal("// SteelUI Shader Script\nfn main() {\n    let color = vec4(1.0);\n}".to_string());
-let code_editor = TextArea::new(code_text)
-    .height(Length::Px(140.0));
 ```
 
 ---
 
-### Next Action
-Implement the **Step 1** caret fix first and verify your typing immediately bounces back to 60–120 FPS. Then proceed with Steps 2–4 to wire `lyon` and `TextArea`.
+### Step 3: Honest FPS Display in `crates/cadmium/src/widgets/mod.rs`
+
+Make the FPS pill show frame rates **only when an active animation is actually running** (`animating == true`), and show `Idle • X.X ms` when typing or clicking:
+
+1. Add `was_animating: bool` to `WidgetWindow`:
+   * In `WidgetWindow::new()`: `was_animating: false,`
+   * In `WidgetWindow::tick(&mut self, dt: f32) -> bool`:
+     ```rust
+     self.was_animating = animating;
+     animating
+     ```
+2. In `WidgetWindow::render()`, format the FPS label:
+```rust
+        if self.show_fps {
+            let m = self.profiler.metrics;
+            let should_refresh = self.fps_block.is_none()
+                || self.last_fps_update.elapsed() >= Duration::from_millis(150);
+            if should_refresh {
+                self.last_fps_update = Instant::now();
+                let label = if self.was_animating && m.effective_fps > 10.0 {
+                    format!(
+                        "{:.0} FPS  •  {:.2} ms (L:{:.2} P:{:.2})",
+                        m.effective_fps, m.frame_ms, m.layout_ms, m.paint_ms
+                    )
+                } else {
+                    format!(
+                        "Idle  •  {:.2} ms (L:{:.2} P:{:.2})",
+                        m.frame_ms, m.layout_ms, m.paint_ms
+                    )
+                };
+                let te = ctx.text_engine();
+                if let Some(blk) = &mut self.fps_block {
+                    blk.set_text(te, &label);
+                } else {
+                    self.fps_block = Some(TextBlock::new(
+                        te,
+                        label,
+                        TextStyle {
+                            font_size: 11.0,
+                            line_height: 14.0,
+                            color: theme.text_primary,
+                            weight: FontWeight::Medium,
+                        },
+                    ));
+                }
+            }
+            ...
+```
+
+---
+
+### Step 4: Quick PowerShell Script to Apply
+
+Run this from the repo root (`C:\Users\sstha\Desktop\ai_\projects\cadmium`):
+
+```powershell
+# 1. Fix text/mod.rs: remove seguiemj.ttf, seguisym.ttf, consola.ttf
+$tf = "crates/cadmium/src/text/mod.rs"
+$ts = (Get-Content -Raw $tf) -replace "`r`n", "`n"
+$oldFonts = @'
+            for path in [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\segoeuisb.ttf",
+                r"C:\Windows\Fonts\seguiemj.ttf",
+                r"C:\Windows\Fonts\seguisym.ttf",
+                r"C:\Windows\Fonts\consola.ttf",
+            ] {
+'@
+$newFonts = @'
+            for path in [
+                r"C:\Windows\Fonts\segoeui.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\segoeuisb.ttf",
+            ] {
+'@
+if ($ts.Contains($oldFonts)) {
+    $ts = $ts.Replace($oldFonts, $newFonts)
+    Set-Content -NoNewline $tf ($ts -replace "`n", "`r`n")
+}
+
+# 2. Fix window/mod.rs: present_mode, latency: 2, about_to_wait
+$wf = "crates/cadmium/src/window/mod.rs"
+$ws = (Get-Content -Raw $wf) -replace "`r`n", "`n"
+
+# Restore Mailbox first
+$oldPmode = @'
+        let present_mode = [
+            wgpu::PresentMode::Fifo,
+            wgpu::PresentMode::FifoRelaxed,
+            wgpu::PresentMode::Mailbox,
+        ]
+'@
+$newPmode = @'
+        let present_mode = [
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::FifoRelaxed,
+            wgpu::PresentMode::Fifo,
+        ]
+'@
+$ws = $ws.Replace($oldPmode, $newPmode)
+$ws = $ws.Replace("desired_maximum_frame_latency: 1,", "desired_maximum_frame_latency: 2,")
+
+# Restore Wait in about_to_wait
+$oldWait = @'
+        let any_animating = self.windows.values().any(|w| w.is_animating);
+        if any_animating {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            match earliest {
+                Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+                None => event_loop.set_control_flow(ControlFlow::Wait),
+            }
+        }
+'@
+$newWait = @'
+        match earliest {
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+'@
+$ws = $ws.Replace($oldWait, $newWait)
+Set-Content -NoNewline $wf ($ws -replace "`n", "`r`n")
+
+# 3. Format and test
+cargo fmt --all
+cargo bench -p cadmium
+cargo run --release -p cadmium_dogfood
+```
+
+### What You Should Verify
+1. **`cargo bench -p cadmium`**:
+   * `create_1k_rows` should drop back to **`~6.5 ms`**
+   * `select_row_10k` stays at **`~100–120 µs`** (sub-millisecond O(1))
+   * `scroll_step_100k_virtual` drops back to **`~13–14 µs`**
+2. **`cadmium_dogfood`**:
+   * Dragging the window by the top title bar will move cleanly at your monitor's full native refresh rate (Chrome parity).
+   * While typing in the search bar, the bottom pill will remain on **`Idle • 1.4 ms`** without showing false 22–30 FPS drops.

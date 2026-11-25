@@ -1,18 +1,21 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use slotmap::SlotMap;
 
 use crate::accessibility::{A11yAction, A11yNodeRecord, A11yRole, SemanticTree};
 use crate::animation::Spring;
+use crate::assets::{DecodedImage, cover_uv_rect, load_image_file, rasterize_svg};
 use crate::core::{Color, CornerRadii, Rect};
 use crate::debug::FrameProfiler;
 use crate::events::{FocusManager, Key, Modifiers, WidgetId};
 use crate::layout::{
-    AlignItems, Edges, FlexDir, JustifyContent, LayoutEngine, LayoutNode, LayoutStyle, Length,
-    snap_rect_to_pixels,
+    AlignItems, Edges, FlexDir, Inset, JustifyContent, LayoutEngine, LayoutNode, LayoutStyle,
+    Length, PositionMode, snap_rect_to_pixels,
 };
 use crate::platform::Clipboard;
 use crate::reactive::{EffectId, Signal, create_effect, dispose_effect};
@@ -50,6 +53,64 @@ fn normalize_selection(s: &str, sel: Option<(usize, usize)>) -> Option<(usize, u
     sel.map(|(a, b)| (snap_char_boundary(s, a), snap_char_boundary(s, b)))
 }
 
+fn word_prev(s: &str, cursor: usize) -> usize {
+    let c = snap_char_boundary(s, cursor);
+    let mut it = s[..c].char_indices().rev().peekable();
+    while let Some(&(_, ch)) = it.peek() {
+        if ch.is_whitespace() {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    let mut pos = 0;
+    for (idx, ch) in it {
+        if ch.is_whitespace() {
+            pos = idx + ch.len_utf8();
+            break;
+        }
+    }
+    pos
+}
+
+fn word_next(s: &str, cursor: usize) -> usize {
+    let c = snap_char_boundary(s, cursor);
+    let mut it = s[c..].char_indices().peekable();
+    while let Some(&(_, ch)) = it.peek() {
+        if !ch.is_whitespace() {
+            it.next();
+        } else {
+            break;
+        }
+    }
+    while let Some(&(idx, ch)) = it.peek() {
+        if ch.is_whitespace() {
+            it.next();
+        } else {
+            return c + idx;
+        }
+    }
+    s.len()
+}
+
+fn ensure_textarea_caret_visible(node: &mut WidgetNode) {
+    if let WidgetPayload::TextArea {
+        cursor,
+        text_block,
+        scroll_y,
+        ..
+    } = &mut node.payload
+    {
+        let (cy, _) = text_block.caret_pos_for_byte(*cursor);
+        let view_h = (node.bounds.height - 20.0).max(18.0);
+        if cy < *scroll_y {
+            *scroll_y = cy;
+        } else if cy + 18.0 > *scroll_y + view_h {
+            *scroll_y = (cy + 18.0 - view_h).max(0.0);
+        }
+    }
+}
+
 fn find_char_index_at_x(char_offsets: &[(usize, f32)], rel_x: f32) -> usize {
     if rel_x <= 0.0 || char_offsets.is_empty() {
         return 0;
@@ -66,7 +127,7 @@ fn find_char_index_at_x(char_offsets: &[(usize, f32)], rel_x: f32) -> usize {
     best_idx
 }
 
-fn lookup_offset_x(char_offsets: &[(usize, f32)], byte_idx: usize) -> f32 {
+fn _lookup_offset_x(char_offsets: &[(usize, f32)], byte_idx: usize) -> f32 {
     for &(idx, x_pos) in char_offsets {
         if idx >= byte_idx {
             return x_pos;
@@ -139,14 +200,20 @@ pub enum Element {
     Container(Container),
     Glass(GlassPanel),
     Text(Text),
+    Image(Image),
+    Icon(Icon),
     Button(Button),
     Switch(Switch),
     Slider(Slider),
+    ProgressBar(ProgressBar),
     TextInput(TextInput),
     TextArea(TextArea),
     ScrollView(ScrollView),
     SplitPane(SplitPane),
     VirtualizedList(VirtualizedList),
+    Switcher(Switcher),
+    Show(Show),
+    ForEach(ForEach),
     Tabs(Tabs),
     Dropdown(Dropdown),
     CustomGpuSurface(CustomGpuSurface),
@@ -174,6 +241,8 @@ pub struct Container {
     is_drag_region: bool,
     tooltip: Option<String>,
     context_menu: Vec<MenuItem>,
+    hover_fill: Option<Color>,
+    on_click: Option<Box<dyn FnMut()>>,
     children: Vec<Element>,
 }
 
@@ -188,6 +257,8 @@ impl Container {
             is_drag_region: false,
             tooltip: None,
             context_menu: Vec::new(),
+            hover_fill: None,
+            on_click: None,
             children: Vec::new(),
         }
     }
@@ -237,6 +308,41 @@ impl Container {
 
     pub fn justify(mut self, justify: JustifyContent) -> Self {
         self.layout.justify_content = Some(justify);
+        self
+    }
+
+    pub fn max_width(mut self, w: Length) -> Self {
+        self.layout.max_width = w;
+        self
+    }
+
+    pub fn max_height(mut self, h: Length) -> Self {
+        self.layout.max_height = h;
+        self
+    }
+
+    pub fn margin(mut self, m: Edges) -> Self {
+        self.layout.margin = m;
+        self
+    }
+
+    pub fn absolute(mut self) -> Self {
+        self.layout.position = PositionMode::Absolute;
+        self
+    }
+
+    pub fn inset(mut self, inset: Inset) -> Self {
+        self.layout.inset = inset;
+        self
+    }
+
+    pub fn hover_fill(mut self, color: Color) -> Self {
+        self.hover_fill = Some(color);
+        self
+    }
+
+    pub fn on_click(mut self, f: impl FnMut() + 'static) -> Self {
+        self.on_click = Some(Box::new(f));
         self
     }
 
@@ -370,6 +476,14 @@ impl Row {
     }
 }
 
+pub struct Stack;
+impl Stack {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> Container {
+        Container::new()
+    }
+}
+
 pub struct GlassPanel {
     inner: Container,
 }
@@ -450,6 +564,27 @@ impl IntoElement for GlassPanel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTone {
+    Custom,
+    Primary,
+    Secondary,
+    Tertiary,
+    OnAccent,
+}
+
+impl TextTone {
+    pub fn resolve(self, theme: &MacTheme, fallback: Color) -> Color {
+        match self {
+            Self::Custom => fallback,
+            Self::Primary => theme.text_primary,
+            Self::Secondary => theme.text_secondary,
+            Self::Tertiary => theme.text_tertiary,
+            Self::OnAccent => theme.text_on_accent,
+        }
+    }
+}
+
 enum TextSource {
     Static(String),
     Reactive(Box<dyn FnMut() -> String>),
@@ -458,6 +593,7 @@ enum TextSource {
 pub struct Text {
     source: TextSource,
     style: TextStyle,
+    tone: TextTone,
 }
 
 impl Text {
@@ -465,6 +601,7 @@ impl Text {
         Self {
             source: TextSource::Static(text.into()),
             style: TextStyle::default(),
+            tone: TextTone::Custom,
         }
     }
 
@@ -472,6 +609,7 @@ impl Text {
         Self {
             source: TextSource::Reactive(Box::new(f)),
             style: TextStyle::default(),
+            tone: TextTone::Custom,
         }
     }
 
@@ -490,6 +628,11 @@ impl Text {
         self.style.color = color;
         self
     }
+
+    pub fn tone(mut self, tone: TextTone) -> Self {
+        self.tone = tone;
+        self
+    }
 }
 
 impl IntoElement for Text {
@@ -498,11 +641,184 @@ impl IntoElement for Text {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFit {
+    Cover,
+    Contain,
+    Stretch,
+}
+
+#[derive(Clone)]
+pub enum ImageSource {
+    File(PathBuf),
+    Svg {
+        data: String,
+        width: u32,
+        height: u32,
+    },
+    Decoded(Arc<DecodedImage>),
+}
+
+pub struct Image {
+    source: ImageSource,
+    layout: LayoutStyle,
+    radius: f32,
+    fit: ImageFit,
+    tint: Color,
+    shadow: Option<Shadow>,
+    tooltip: Option<String>,
+    context_menu: Vec<MenuItem>,
+    on_click: Option<Box<dyn FnMut()>>,
+}
+
+impl Image {
+    pub fn new(source: ImageSource) -> Self {
+        Self {
+            source,
+            layout: LayoutStyle::default(),
+            radius: 0.0,
+            fit: ImageFit::Cover,
+            tint: Color::from_rgba8(255, 255, 255, 255),
+            shadow: None,
+            tooltip: None,
+            context_menu: Vec::new(),
+            on_click: None,
+        }
+    }
+
+    pub fn from_decoded(img: Arc<DecodedImage>) -> Self {
+        Self::new(ImageSource::Decoded(img))
+    }
+    pub fn flex_grow(mut self, g: f32) -> Self {
+        self.layout.flex_grow = g;
+        self
+    }
+    pub fn from_file(path: impl Into<PathBuf>) -> Self {
+        Self::new(ImageSource::File(path.into()))
+    }
+
+    pub fn svg(data: impl Into<String>, width: u32, height: u32) -> Self {
+        Self::new(ImageSource::Svg {
+            data: data.into(),
+            width,
+            height,
+        })
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.layout.width = w;
+        self
+    }
+
+    pub fn height(mut self, h: Length) -> Self {
+        self.layout.height = h;
+        self
+    }
+
+    pub fn radius(mut self, r: f32) -> Self {
+        self.radius = r;
+        self
+    }
+
+    pub fn fit(mut self, fit: ImageFit) -> Self {
+        self.fit = fit;
+        self
+    }
+
+    pub fn tint(mut self, tint: Color) -> Self {
+        self.tint = tint;
+        self
+    }
+
+    pub fn shadow(mut self, color: Color, blur: f32, offset_y: f32) -> Self {
+        self.shadow = Some(Shadow::new(color, blur, offset_y));
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+
+    pub fn context_menu<I>(mut self, items: I) -> Self
+    where
+        I: IntoIterator<Item = MenuItem>,
+    {
+        self.context_menu.extend(items);
+        self
+    }
+
+    pub fn on_click(mut self, f: impl FnMut() + 'static) -> Self {
+        self.on_click = Some(Box::new(f));
+        self
+    }
+}
+
+impl IntoElement for Image {
+    fn into_element(self) -> Element {
+        Element::Image(self)
+    }
+}
+
+pub struct Icon {
+    svg: String,
+    size: f32,
+    tone: TextTone,
+    color: Color,
+    tooltip: Option<String>,
+}
+
+impl Icon {
+    pub fn svg(data: impl Into<String>, size: f32) -> Self {
+        Self {
+            svg: data.into(),
+            size,
+            color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+            tone: TextTone::Primary,
+            tooltip: None,
+        }
+    }
+    pub fn color(mut self, color: Color) -> Self {
+        self.tone = TextTone::Custom;
+        self.color = color; // or `self.tint = color;` if the field is named `tint`
+        self
+    }
+    pub fn tone(mut self, tone: TextTone) -> Self {
+        self.tone = tone;
+        self
+    }
+
+    pub fn tooltip(mut self, text: impl Into<String>) -> Self {
+        self.tooltip = Some(text.into());
+        self
+    }
+}
+
+impl IntoElement for Icon {
+    fn into_element(self) -> Element {
+        Element::Icon(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonVariant {
+    Secondary,
+    Primary,
+    Ghost,
+    Glass,
+}
+
 pub struct Button {
     label: String,
     accent: bool,
+    variant: ButtonVariant,
     tooltip: Option<String>,
     on_click: Option<Box<dyn FnMut()>>,
+    svg_icon: Option<String>,
+    icon_size: f32,
+    width: Length,
+    height: Length,
+    pill: bool,
 }
 
 impl Button {
@@ -510,13 +826,56 @@ impl Button {
         Self {
             label: label.into(),
             accent: false,
+            variant: ButtonVariant::Secondary,
             tooltip: None,
             on_click: None,
+            svg_icon: None,
+            icon_size: 14.0,
+            width: Length::Auto,
+            height: Length::Px(30.0),
+            pill: false,
         }
+    }
+
+    pub fn icon_only(svg: impl Into<String>, icon_size: f32) -> Self {
+        let mut b = Self::new("");
+        b.svg_icon = Some(svg.into());
+        b.icon_size = icon_size;
+        b.width = Length::Px(30.0);
+        b.height = Length::Px(30.0);
+        b
+    }
+
+    pub fn icon(mut self, svg: impl Into<String>, icon_size: f32) -> Self {
+        self.svg_icon = Some(svg.into());
+        self.icon_size = icon_size;
+        self
     }
 
     pub fn primary(mut self) -> Self {
         self.accent = true;
+        self.variant = ButtonVariant::Primary;
+        self
+    }
+
+    pub fn ghost(mut self) -> Self {
+        self.variant = ButtonVariant::Ghost;
+        self
+    }
+
+    pub fn glass(mut self) -> Self {
+        self.variant = ButtonVariant::Glass;
+        self
+    }
+
+    pub fn pill(mut self) -> Self {
+        self.pill = true;
+        self
+    }
+
+    pub fn size(mut self, w: Length, h: Length) -> Self {
+        self.width = w;
+        self.height = h;
         self
     }
 
@@ -595,6 +954,45 @@ impl Slider {
 impl IntoElement for Slider {
     fn into_element(self) -> Element {
         Element::Slider(self)
+    }
+}
+
+pub struct ProgressBar {
+    signal: Signal<f32>,
+    width: Length,
+    height: f32,
+    color: Option<Color>,
+}
+
+impl ProgressBar {
+    pub fn new(signal: Signal<f32>) -> Self {
+        Self {
+            signal,
+            width: Length::Auto,
+            height: 4.0,
+            color: None,
+        }
+    }
+
+    pub fn width(mut self, w: Length) -> Self {
+        self.width = w;
+        self
+    }
+
+    pub fn height(mut self, h: f32) -> Self {
+        self.height = h.max(2.0);
+        self
+    }
+
+    pub fn color(mut self, c: Color) -> Self {
+        self.color = Some(c);
+        self
+    }
+}
+
+impl IntoElement for ProgressBar {
+    fn into_element(self) -> Element {
+        Element::ProgressBar(self)
     }
 }
 
@@ -861,6 +1259,7 @@ pub struct CustomGpuSurface {
     animate_signal: Option<Signal<bool>>,
     tooltip: Option<String>,
     context_menu: Vec<MenuItem>,
+    resolution_scale: f32,
     pass: Box<dyn CustomGpuPass>,
 }
 
@@ -873,6 +1272,7 @@ impl CustomGpuSurface {
             animate_signal: None,
             tooltip: None,
             context_menu: Vec::new(),
+            resolution_scale: 1.0,
             pass: Box::new(pass),
         }
     }
@@ -905,6 +1305,11 @@ impl CustomGpuSurface {
 
     pub fn animate_when(mut self, sig: Signal<bool>) -> Self {
         self.animate_signal = Some(sig);
+        self
+    }
+
+    pub fn resolution_scale(mut self, s: f32) -> Self {
+        self.resolution_scale = s.clamp(0.1, 1.0);
         self
     }
 
@@ -1047,6 +1452,156 @@ impl IntoElement for VirtualizedList {
     }
 }
 
+pub struct Switcher {
+    signal: Signal<usize>,
+    children: Vec<Element>,
+}
+
+impl Switcher {
+    pub fn new(signal: Signal<usize>, children: Vec<Element>) -> Self {
+        Self { signal, children }
+    }
+}
+
+impl IntoElement for Switcher {
+    fn into_element(self) -> Element {
+        Element::Switcher(self)
+    }
+}
+
+pub struct Show {
+    condition: Signal<bool>,
+    when_true: Option<Box<dyn FnMut() -> Element>>,
+    when_false: Option<Box<dyn FnMut() -> Element>>,
+    layout: LayoutStyle,
+}
+
+impl Show {
+    pub fn new(condition: Signal<bool>, when_true: impl FnMut() -> Element + 'static) -> Self {
+        Self {
+            condition,
+            when_true: Some(Box::new(when_true)),
+            when_false: None,
+            layout: LayoutStyle::default(),
+        }
+    }
+
+    pub fn fallback(mut self, when_false: impl FnMut() -> Element + 'static) -> Self {
+        self.when_false = Some(Box::new(when_false));
+        self
+    }
+}
+
+impl IntoElement for Show {
+    fn into_element(self) -> Element {
+        Element::Show(self)
+    }
+}
+
+type ForEachReconcile = Box<dyn FnMut(&mut WidgetArena, &mut TextEngine, WidgetId)>;
+
+pub struct ForEach {
+    layout: LayoutStyle,
+    reconcile: ForEachReconcile,
+    bind_signal: Box<dyn FnOnce(DirtyQueue, WidgetId) -> EffectId>,
+}
+
+impl ForEach {
+    pub fn new<T: 'static>(
+        items: Signal<Vec<T>>,
+        mut key_fn: impl FnMut(&T) -> u64 + 'static,
+        mut item_builder: impl FnMut(&T) -> Element + 'static,
+    ) -> Self {
+        let mut mounted_keys: HashMap<u64, WidgetId> = HashMap::new();
+
+        let reconcile = Box::new(
+            move |arena: &mut WidgetArena, text: &mut TextEngine, parent_id: WidgetId| {
+                let mut next_children: Vec<WidgetId> = Vec::new();
+                let mut next_map: HashMap<u64, WidgetId> = HashMap::new();
+
+                let _ = items.try_with(|list| {
+                    next_children.reserve(list.len());
+                    next_map.reserve(list.len());
+                    for item in list.iter() {
+                        let k = key_fn(item);
+                        let child_id = if let Some(existing) = mounted_keys.remove(&k) {
+                            existing
+                        } else {
+                            let elem = item_builder(item);
+                            let cid = arena.mount_node(elem, text);
+                            if let Some(node) = arena.nodes.get_mut(cid) {
+                                node.parent = Some(parent_id);
+                            }
+                            cid
+                        };
+                        next_children.push(child_id);
+                        next_map.insert(k, child_id);
+                    }
+                });
+
+                for (_, stale_id) in mounted_keys.drain() {
+                    arena.unmount_subtree(stale_id);
+                }
+                mounted_keys = next_map;
+
+                let child_lnodes: Vec<LayoutNode> = next_children
+                    .iter()
+                    .filter_map(|id| arena.nodes.get(*id).map(|n| n.layout_node))
+                    .collect();
+                if let Some(parent_lnode) = arena.nodes.get(parent_id).map(|n| n.layout_node) {
+                    if let Some(node) = arena.nodes.get_mut(parent_id) {
+                        node.children = next_children;
+                    }
+                    arena.layout.set_children(parent_lnode, &child_lnodes);
+                    arena.layout.mark_dirty(parent_lnode);
+                }
+            },
+        );
+
+        let bind_signal = Box::new(move |q: DirtyQueue, id: WidgetId| {
+            create_effect(move || {
+                let _ = items.try_with(|_| ());
+                push_dirty(
+                    &q,
+                    id,
+                    DirtyFlags {
+                        state: true,
+                        layout: true,
+                        paint: true,
+                    },
+                );
+            })
+        });
+
+        Self {
+            layout: LayoutStyle::default(),
+            reconcile,
+            bind_signal,
+        }
+    }
+
+    pub fn direction(mut self, dir: FlexDir) -> Self {
+        self.layout.direction = dir;
+        self
+    }
+
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.layout.gap = gap;
+        self
+    }
+
+    pub fn flex_grow(mut self, g: f32) -> Self {
+        self.layout.flex_grow = g;
+        self
+    }
+}
+
+impl IntoElement for ForEach {
+    fn into_element(self) -> Element {
+        Element::ForEach(self)
+    }
+}
+
 pub struct Divider {
     color: Color,
 }
@@ -1084,6 +1639,20 @@ struct CustomSurfaceState {
     handle: Option<TextureHandle>,
     view: Option<wgpu::TextureView>,
     size: (u32, u32),
+    rendered_once: bool,
+}
+
+struct ImageState {
+    source_key: Option<usize>,
+    image: Option<Arc<DecodedImage>>,
+    handle: Option<TextureHandle>,
+    width: u32,
+    height: u32,
+}
+
+struct IconState {
+    image: Option<DecodedImage>,
+    handle: Option<TextureHandle>,
 }
 
 struct VirtualRowSlot {
@@ -1111,15 +1680,37 @@ enum WidgetPayload {
         material: Rc<Cell<Material>>,
         radius: Rc<Cell<f32>>,
         is_drag_region: bool,
+        hover_fill: Option<Color>,
+        on_click: Option<Box<dyn FnMut()>>,
     },
     Text {
         block: TextBlock,
         pending: Option<Rc<RefCell<String>>>,
+        tone: TextTone,
     },
     Button {
         label: TextBlock,
+        label_empty: bool,
         accent: bool,
+        variant: ButtonVariant,
+        icon_state: RefCell<IconState>,
+        icon_size: f32,
+        pill: bool,
         on_click: Option<Box<dyn FnMut()>>,
+    },
+    Image {
+        state: RefCell<ImageState>,
+        radius: f32,
+        tint: Color,
+        shadow: Option<Shadow>,
+        fit: ImageFit,
+        on_click: Option<Box<dyn FnMut()>>,
+    },
+    Icon {
+        state: RefCell<IconState>,
+        tone: TextTone,
+        color: Color,
+        size: f32,
     },
     Switch {
         signal: Signal<bool>,
@@ -1128,6 +1719,10 @@ enum WidgetPayload {
         signal: Signal<f32>,
         min: f32,
         max: f32,
+    },
+    ProgressBar {
+        signal: Signal<f32>,
+        color: Option<Color>,
     },
     TextInput {
         signal: Signal<String>,
@@ -1168,6 +1763,19 @@ enum WidgetPayload {
     VirtualizedList {
         state: RefCell<VirtualListState>,
     },
+    Switcher {
+        signal: Signal<usize>,
+        children: Vec<WidgetId>,
+    },
+    Show {
+        condition: Signal<bool>,
+        active: bool,
+        when_true: Option<Box<dyn FnMut() -> Element>>,
+        when_false: Option<Box<dyn FnMut() -> Element>>,
+    },
+    ForEach {
+        reconcile: ForEachReconcile,
+    },
     Tabs {
         signal: Signal<usize>,
         items: Vec<String>,
@@ -1188,6 +1796,7 @@ enum WidgetPayload {
     CustomGpuSurface {
         radius: Rc<Cell<f32>>,
         animate_signal: Option<Signal<bool>>,
+        resolution_scale: f32,
         state: RefCell<CustomSurfaceState>,
     },
     TrafficLights {
@@ -1208,6 +1817,9 @@ struct WidgetNode {
     tooltip: Option<String>,
     context_menu: Vec<MenuItem>,
     payload: WidgetPayload,
+    parent: Option<WidgetId>,
+    is_relayout_boundary: bool,
+    dirty_layout_queued: bool,
 }
 
 pub struct WidgetArena {
@@ -1223,7 +1835,13 @@ pub struct WidgetArena {
     custom_surface_ids: Vec<WidgetId>,
     split_ids: Vec<WidgetId>,
     virtual_list_ids: Vec<WidgetId>,
-    needs_layout: bool,
+    switcher_ids: Vec<WidgetId>,
+    pending_texture_releases: Vec<TextureHandle>,
+    dirty_layout_roots: Vec<WidgetId>,
+    rect_buf: Vec<(LayoutNode, Rect)>,
+    decoded_tex_cache: HashMap<usize, (TextureHandle, usize)>,
+    svg_tex_cache: HashMap<(u64, u32, u32), (TextureHandle, usize)>,
+    needs_full_layout: bool,
 }
 
 impl WidgetArena {
@@ -1241,7 +1859,13 @@ impl WidgetArena {
             custom_surface_ids: Vec::new(),
             split_ids: Vec::new(),
             virtual_list_ids: Vec::new(),
-            needs_layout: true,
+            switcher_ids: Vec::new(),
+            pending_texture_releases: Vec::new(),
+            dirty_layout_roots: Vec::new(),
+            rect_buf: Vec::new(),
+            decoded_tex_cache: HashMap::new(),
+            svg_tex_cache: HashMap::new(),
+            needs_full_layout: true,
         }
     }
 
@@ -1249,14 +1873,71 @@ impl WidgetArena {
         self.clear();
         let root_id = self.mount_node(element, text);
         self.root = Some(root_id);
-        self.needs_layout = true;
+        self.needs_full_layout = true;
         root_id
     }
 
     pub fn clear(&mut self) {
+        let mut released: std::collections::HashSet<TextureHandle> =
+            std::collections::HashSet::new();
+        for (_, (handle, _)) in self.decoded_tex_cache.drain() {
+            if released.insert(handle) {
+                self.pending_texture_releases.push(handle);
+            }
+        }
+        for (_, (handle, _)) in self.svg_tex_cache.drain() {
+            if released.insert(handle) {
+                self.pending_texture_releases.push(handle);
+            }
+        }
+
         for (_, node) in self.nodes.drain() {
             for eff in node.owned_effects {
                 dispose_effect(eff);
+            }
+            match node.payload {
+                WidgetPayload::CustomGpuSurface { state, .. } => {
+                    if let Some(handle) = state.into_inner().handle
+                        && released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                }
+                WidgetPayload::Image { state, .. } => {
+                    let st = state.into_inner();
+                    if let Some(handle) = st.handle {
+                        let should_release = if let Some(key) = st.source_key {
+                            if let Some((_, refs)) = self.decoded_tex_cache.get_mut(&key) {
+                                *refs = refs.saturating_sub(1);
+                                if *refs == 0 {
+                                    self.decoded_tex_cache.remove(&key);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        };
+                        if should_release && released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                    }
+                }
+                WidgetPayload::Icon { state, .. } => {
+                    if let Some(handle) = state.into_inner().handle
+                        && released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                }
+                WidgetPayload::Button { icon_state, .. } => {
+                    if let Some(handle) = icon_state.into_inner().handle
+                        && released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                }
+                _ => {}
             }
             self.layout.remove(node.layout_node);
         }
@@ -1268,8 +1949,450 @@ impl WidgetArena {
         self.custom_surface_ids.clear();
         self.split_ids.clear();
         self.virtual_list_ids.clear();
+        self.switcher_ids.clear();
+        for &id in &self.dirty_layout_roots {
+            if let Some(n) = self.nodes.get_mut(id) {
+                n.dirty_layout_queued = false;
+            }
+        }
+        self.dirty_layout_roots.clear();
         self.focus = FocusManager::new();
         self.root = None;
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn unmount_subtree(&mut self, id: WidgetId) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        let children = node.children.clone();
+        for child in children {
+            self.unmount_subtree(child);
+        }
+
+        let Some(node) = self.nodes.remove(id) else {
+            return;
+        };
+
+        for eff in node.owned_effects {
+            dispose_effect(eff);
+        }
+
+        let mut released: std::collections::HashSet<TextureHandle> =
+            std::collections::HashSet::new();
+        match node.payload {
+            WidgetPayload::CustomGpuSurface { state, .. } => {
+                if let Some(handle) = state.into_inner().handle
+                    && released.insert(handle) {
+                        self.pending_texture_releases.push(handle);
+                    }
+            }
+            WidgetPayload::Image { state, .. } => {
+                let st = state.into_inner();
+                if let Some(handle) = st.handle {
+                    let should_release = if let Some(key) = st.source_key {
+                        if let Some((_, refs)) = self.decoded_tex_cache.get_mut(&key) {
+                            *refs = refs.saturating_sub(1);
+                            if *refs == 0 {
+                                self.decoded_tex_cache.remove(&key);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if should_release && released.insert(handle) {
+                        self.pending_texture_releases.push(handle);
+                    }
+                }
+            }
+            WidgetPayload::Icon { state, .. } => {
+                if let Some(handle) = state.into_inner().handle
+                    && released.insert(handle) {
+                        self.pending_texture_releases.push(handle);
+                    }
+            }
+            WidgetPayload::Button { icon_state, .. } => {
+                if let Some(handle) = icon_state.into_inner().handle
+                    && released.insert(handle) {
+                        self.pending_texture_releases.push(handle);
+                    }
+            }
+            _ => {}
+        }
+
+        self.layout_to_widget.remove(&node.layout_node);
+        self.layout.remove(node.layout_node);
+        self.scroll_ids.retain(|&x| x != id);
+        self.tab_ids.retain(|&x| x != id);
+        self.traffic_ids.retain(|&x| x != id);
+        self.custom_surface_ids.retain(|&x| x != id);
+        self.split_ids.retain(|&x| x != id);
+        self.virtual_list_ids.retain(|&x| x != id);
+        self.switcher_ids.retain(|&x| x != id);
+        self.dirty_layout_roots.retain(|&x| x != id);
+    }
+
+    pub fn bench_layout_pass(&mut self, width: f32, height: f32, text: &mut TextEngine) {
+        let Some(root) = self.root else {
+            return;
+        };
+        let root_lnode = self.nodes[root].layout_node;
+        let mut rstyle = self.nodes[root].layout_style;
+        rstyle.width = Length::Px(width);
+        rstyle.height = Length::Px(height);
+        self.layout.set_style(root_lnode, rstyle);
+
+        let nodes = &mut self.nodes;
+        let lmap = &self.layout_to_widget;
+        let text_engine = text;
+        self.layout
+            .compute_with_measure(root_lnode, width, height, |lnode, _, _, avail_w, _| {
+                let Some(&wid) = lmap.get(&lnode) else {
+                    return (0.0, 0.0);
+                };
+                let Some(node) = nodes.get_mut(wid) else {
+                    return (0.0, 0.0);
+                };
+                match &mut node.payload {
+                    WidgetPayload::Text { block, .. } => block.measure(text_engine, avail_w),
+                    WidgetPayload::TextArea { text_block, .. } => {
+                        text_block.measure(text_engine, avail_w.map(|w| (w - 20.0).max(1.0)))
+                    }
+                    WidgetPayload::Button {
+                        label,
+                        label_empty,
+                        icon_state,
+                        icon_size,
+                        ..
+                    } => {
+                        let (w, _) = label.measure(text_engine, None);
+                        let has_icon = icon_state.borrow().handle.is_some()
+                            || icon_state.borrow().image.is_some();
+                        if has_icon && *label_empty {
+                            (30.0, 30.0)
+                        } else if has_icon {
+                            (w + 28.0 + *icon_size, 30.0)
+                        } else {
+                            (w + 28.0, 30.0)
+                        }
+                    }
+                    _ => (0.0, 0.0),
+                }
+            });
+
+        let rects = self.layout.collect_logical_rects(root_lnode);
+        for (lnode, rect) in rects {
+            if let Some(&wid) = self.layout_to_widget.get(&lnode)
+                && let Some(node) = self.nodes.get_mut(wid)
+            {
+                node.bounds = rect;
+            }
+        }
+        self.needs_full_layout = false;
+        for &id in &self.dirty_layout_roots {
+            if let Some(n) = self.nodes.get_mut(id) {
+                n.dirty_layout_queued = false;
+            }
+        }
+        self.dirty_layout_roots.clear();
+    }
+
+    pub fn bench_sync_and_layout(&mut self, width: f32, height: f32, text: &mut TextEngine) {
+        let dirty_batch: Vec<(WidgetId, DirtyFlags)> =
+            std::mem::take(&mut *self.dirty_queue.borrow_mut());
+        let mut foreach_dirty: Vec<WidgetId> = Vec::new();
+        let mut show_dirty: Vec<WidgetId> = Vec::new();
+        for (id, flags) in dirty_batch {
+            let Some(node) = self.nodes.get(id) else { continue; };
+            let layout_node = node.layout_node;
+            let is_foreach = matches!(node.payload, WidgetPayload::ForEach { .. });
+            let is_show = matches!(node.payload, WidgetPayload::Show { .. });
+
+            if flags.layout {
+                self.layout.mark_dirty(layout_node);
+                let mut cur = id;
+                while let Some(n) = self.nodes.get(cur) {
+                    if n.is_relayout_boundary || n.parent.is_none() {
+                        break;
+                    }
+                    if let Some(p) = n.parent {
+                        cur = p;
+                    } else {
+                        break;
+                    }
+                }
+                if Some(cur) == self.root {
+                    self.needs_full_layout = true;
+                } else if let Some(n) = self.nodes.get_mut(cur)
+                    && !n.dirty_layout_queued
+                {
+                    n.dirty_layout_queued = true;
+                    self.dirty_layout_roots.push(cur);
+                }
+            }
+
+            if is_foreach && (flags.state || flags.layout) {
+                foreach_dirty.push(id);
+            }
+            if is_show && (flags.state || flags.layout) {
+                show_dirty.push(id);
+            }
+            if let Some(node) = self.nodes.get_mut(id) {
+                    match &mut node.payload {
+                        WidgetPayload::Text {
+                            block,
+                            pending: Some(cell),
+                            ..
+                        } => {
+                            let text_val = cell.borrow().clone();
+                            block.set_text(text, &text_val);
+                        }
+                        WidgetPayload::TextInput {
+                            signal,
+                            cursor,
+                            selection,
+                            text_block,
+                            char_offsets,
+                            last_synced_text,
+                            ..
+                        } => {
+                            let text_val = signal.try_get().unwrap_or_default();
+                            if *last_synced_text != text_val {
+                                *last_synced_text = text_val.clone();
+                                *cursor = snap_char_boundary(&text_val, *cursor);
+                                *selection = normalize_selection(&text_val, *selection);
+                                text_block.set_text(text, &text_val);
+                                text_block.collect_char_offsets(char_offsets);
+                            }
+                        }
+                        WidgetPayload::TextArea {
+                            signal,
+                            cursor,
+                            selection,
+                            text_block,
+                            last_synced_text,
+                            ..
+                        } => {
+                            let text_val = signal.try_get().unwrap_or_default();
+                            if *last_synced_text != text_val {
+                                *last_synced_text = text_val.clone();
+                                *cursor = snap_char_boundary(&text_val, *cursor);
+                                *selection = normalize_selection(&text_val, *selection);
+                                text_block.set_text(text, &text_val);
+                            }
+                        }
+                        _ => {}
+                }
+            }
+        }
+
+        for id in show_dirty {
+            let (cond, active, mut when_true, mut when_false) =
+                if let Some(node) = self.nodes.get_mut(id) {
+                    if let WidgetPayload::Show {
+                        condition,
+                        active,
+                        when_true,
+                        when_false,
+                    } = &mut node.payload
+                    {
+                        (*condition, *active, when_true.take(), when_false.take())
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+            let next = cond.try_get().unwrap_or(false);
+            if next != active {
+                let old_children: Vec<WidgetId> = self
+                    .nodes
+                    .get(id)
+                    .map(|n| n.children.clone())
+                    .unwrap_or_default();
+                for child in old_children {
+                    self.unmount_subtree(child);
+                }
+                let new_child = if next {
+                    when_true.as_mut().map(|f| self.mount_node(f(), text))
+                } else {
+                    when_false.as_mut().map(|f| self.mount_node(f(), text))
+                };
+                let children: Vec<WidgetId> = new_child.into_iter().collect();
+                for &child in &children {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
+                let child_lnodes: Vec<LayoutNode> = children
+                    .iter()
+                    .filter_map(|cid| self.nodes.get(*cid).map(|n| n.layout_node))
+                    .collect();
+                if let Some(node) = self.nodes.get_mut(id) {
+                    node.children = children;
+                    let lnode = node.layout_node;
+                    if let WidgetPayload::Show {
+                        active,
+                        when_true: wt,
+                        when_false: wf,
+                        ..
+                    } = &mut node.payload
+                    {
+                        *active = next;
+                        *wt = when_true;
+                        *wf = when_false;
+                    }
+                    self.layout.set_children(lnode, &child_lnodes);
+                    self.layout.mark_dirty(lnode);
+                }
+                self.needs_full_layout = true;
+            } else if let Some(node) = self.nodes.get_mut(id)
+                && let WidgetPayload::Show {
+                    when_true: wt,
+                    when_false: wf,
+                    ..
+                } = &mut node.payload
+            {
+                *wt = when_true;
+                *wf = when_false;
+            }
+        }
+
+        for id in foreach_dirty {
+            let reconcile_fn = if let Some(node) = self.nodes.get_mut(id) {
+                if let WidgetPayload::ForEach { reconcile } = &mut node.payload {
+                    Some(std::mem::replace(reconcile, Box::new(|_, _, _| {})))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(mut reconcile_fn) = reconcile_fn {
+                reconcile_fn(self, text, id);
+                if let Some(node) = self.nodes.get_mut(id)
+                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
+                {
+                    *reconcile = reconcile_fn;
+                }
+                self.needs_full_layout = true;
+            }
+        }
+
+        if self.needs_full_layout || self.dirty_layout_roots.len() > 32 {
+            self.bench_layout_pass(width, height, text);
+        } else if !self.dirty_layout_roots.is_empty() {
+            let roots: Vec<WidgetId> = std::mem::take(&mut self.dirty_layout_roots);
+            for boundary_id in roots {
+                if let Some(n) = self.nodes.get_mut(boundary_id) {
+                    n.dirty_layout_queued = false;
+                }
+                let Some(boundary_node) = self.nodes.get(boundary_id) else {
+                    continue;
+                };
+                let boundary_lnode = boundary_node.layout_node;
+                let bw = boundary_node.bounds.width.max(1.0);
+                let bh = boundary_node.bounds.height.max(1.0);
+                let origin_x = boundary_node.bounds.x;
+                let origin_y = boundary_node.bounds.y;
+
+                let nodes = &mut self.nodes;
+                let lmap = &self.layout_to_widget;
+                let text_engine: &mut TextEngine = &mut *text;
+                self.layout.compute_subtree_with_measure(
+                    boundary_lnode,
+                    bw,
+                    bh,
+                    |lnode, _, _, avail_w, _| {
+                        let Some(&wid) = lmap.get(&lnode) else {
+                            return (0.0, 0.0);
+                        };
+                        let Some(node) = nodes.get_mut(wid) else {
+                            return (0.0, 0.0);
+                        };
+                        match &mut node.payload {
+                            WidgetPayload::Text { block, .. } => {
+                                block.measure(text_engine, avail_w)
+                            }
+                            WidgetPayload::TextArea { text_block, .. } => text_block
+                                .measure(text_engine, avail_w.map(|w| (w - 20.0).max(1.0))),
+                            WidgetPayload::Button {
+                                label,
+                                label_empty,
+                                icon_state,
+                                icon_size,
+                                ..
+                            } => {
+                                let (w, _) = label.measure(text_engine, None);
+                                let has_icon = icon_state.borrow().handle.is_some()
+                                    || icon_state.borrow().image.is_some();
+                                if has_icon && *label_empty {
+                                    (30.0, 30.0)
+                                } else if has_icon {
+                                    (w + 28.0 + *icon_size, 30.0)
+                                } else {
+                                    (w + 28.0, 30.0)
+                                }
+                            }
+                            _ => (0.0, 0.0),
+                        }
+                    },
+                );
+                let slice =
+                    self.layout
+                        .collect_logical_rects_into(boundary_lnode, origin_x, origin_y);
+                self.rect_buf.clear();
+                self.rect_buf.extend_from_slice(slice);
+                for i in 0..self.rect_buf.len() {
+                    let (lnode, rect) = self.rect_buf[i];
+                    if let Some(&wid) = self.layout_to_widget.get(&lnode)
+                        && let Some(node) = self.nodes.get_mut(wid)
+                    {
+                        node.bounds = rect;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn bench_scroll_virtual_step(&mut self, delta_y: f32, text: &mut TextEngine) {
+        for &vid in &self.virtual_list_ids {
+            if let Some(node) = self.nodes.get(vid)
+                && let WidgetPayload::VirtualizedList { state } = &node.payload
+            {
+                let mut st = state.borrow_mut();
+                let stride = st.item_height + st.gap;
+                let total_h = (st.item_count as f32 * stride - st.gap).max(0.0);
+                let max_scroll = (total_h - node.bounds.height).max(0.0);
+                let next = (st.scroll_y.value + delta_y) % max_scroll.max(1.0);
+                st.scroll_y.snap_to(next);
+
+                let first = (next / stride).floor().max(0.0) as usize;
+                let visible_n = (node.bounds.height / stride).ceil() as usize + 2;
+                let last = (first + visible_n).min(st.item_count);
+                let pool_len = st.pool.len().max(1);
+                for idx in first..last {
+                    let slot_idx = idx % pool_len;
+                    if st.pool[slot_idx].cached_index != Some(idx) {
+                        let row_data = (st.row_builder)(idx);
+                        let slot = &mut st.pool[slot_idx];
+                        slot.cached_index = Some(idx);
+                        slot.title.set_text(text, &row_data.title);
+                        slot.subtitle.set_text(text, &row_data.subtitle);
+                        slot.badge.set_text(text, &row_data.badge);
+                        slot.badge_width = slot.badge.measure(text, None).0;
+                    }
+                }
+            }
+        }
     }
 
     fn mount_node(&mut self, element: Element, text: &mut TextEngine) -> WidgetId {
@@ -1284,12 +2407,17 @@ impl WidgetArena {
                     .iter()
                     .map(|id| self.nodes[*id].layout_node)
                     .collect();
+                let is_boundary = matches!(c.layout.width, Length::Px(_))
+                    && matches!(c.layout.height, Length::Px(_));
                 let lnode = self.layout.new_container(c.layout, &child_layout_nodes);
                 let radius_cell = Rc::new(Cell::new(c.radius));
                 let material_cell = Rc::new(Cell::new(c.material));
 
                 let id = self.nodes.insert(WidgetNode {
-                    children: child_ids,
+                    parent: None,
+                    is_relayout_boundary: is_boundary,
+                    dirty_layout_queued: false,
+                    children: child_ids.clone(),
                     layout_node: lnode,
                     layout_style: c.layout,
                     bounds: Rect::default(),
@@ -1300,9 +2428,16 @@ impl WidgetArena {
                         material: material_cell.clone(),
                         radius: radius_cell.clone(),
                         is_drag_region: c.is_drag_region,
+                        hover_fill: c.hover_fill,
+                        on_click: c.on_click,
                     },
                 });
                 self.layout_to_widget.insert(lnode, id);
+                for &child in &child_ids {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
 
                 if let Some(sig) = c.radius_signal {
                     let q = self.dirty_queue.clone();
@@ -1344,6 +2479,88 @@ impl WidgetArena {
                 id
             }
             Element::Glass(g) => self.mount_node(Element::Container(g.inner), text),
+            Element::Image(img) => {
+                let (source_key, decoded) = match &img.source {
+                    ImageSource::File(p) => (None, load_image_file(p).ok().map(Arc::new)),
+                    ImageSource::Svg {
+                        data,
+                        width,
+                        height,
+                    } => (None, rasterize_svg(data, *width, *height).ok().map(Arc::new)),
+                    ImageSource::Decoded(d) => (Some(Arc::as_ptr(d) as usize), Some(d.clone())),
+                };
+                let lnode = self.layout.new_leaf(img.layout);
+                let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: img.layout,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: img.tooltip,
+                    context_menu: img.context_menu,
+                    payload: WidgetPayload::Image {
+                        state: RefCell::new(ImageState {
+                            source_key,
+                            width: decoded.as_ref().map(|d| d.width).unwrap_or(1),
+                            height: decoded.as_ref().map(|d| d.height).unwrap_or(1),
+                            image: decoded,
+                            handle: None,
+                        }),
+                        radius: img.radius,
+                        tint: img.tint,
+                        shadow: img.shadow,
+                        fit: img.fit,
+                        on_click: img.on_click,
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                if matches!(
+                    self.nodes[id].payload,
+                    WidgetPayload::Image {
+                        on_click: Some(_),
+                        ..
+                    }
+                ) {
+                    self.focus.focus_order.push(id);
+                }
+                id
+            }
+            Element::Icon(ic) => {
+                let px = (ic.size * 2.0).round().max(1.0) as u32;
+                let decoded = rasterize_svg(&ic.svg, px, px).ok();
+                let lstyle = LayoutStyle {
+                    width: Length::Px(ic.size),
+                    height: Length::Px(ic.size),
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+                let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: ic.tooltip,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::Icon {
+                        state: RefCell::new(IconState {
+                            image: decoded,
+                            handle: None,
+                        }),
+                        tone: ic.tone,
+                        color: ic.color,
+                        size: ic.size,
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                id
+            }
             Element::Text(t) => {
                 let lstyle = LayoutStyle::default();
                 let lnode = self.layout.new_leaf(lstyle);
@@ -1356,6 +2573,9 @@ impl WidgetArena {
                 let block = TextBlock::new(text, &initial, t.style);
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1370,6 +2590,7 @@ impl WidgetArena {
                         } else {
                             None
                         },
+                        tone: t.tone,
                     },
                 });
                 self.layout_to_widget.insert(lnode, id);
@@ -1397,27 +2618,35 @@ impl WidgetArena {
                 id
             }
             Element::Button(b) => {
+                let icon_image = b.svg_icon.as_ref().and_then(|svg| {
+                    let px = (b.icon_size * 2.0).round().max(1.0) as u32;
+                    rasterize_svg(svg, px, px).ok()
+                });
                 let label_block = TextBlock::new(
                     text,
                     &b.label,
                     TextStyle {
                         font_size: 13.0,
                         line_height: 18.0,
-                        color: if b.accent {
-                            Color::from_rgba8(255, 255, 255, 255)
-                        } else {
-                            Color::from_rgba8(29, 29, 31, 255)
-                        },
+                        color: Color::from_rgba8(29, 29, 31, 255),
                         weight: FontWeight::Medium,
                     },
                 );
                 let lstyle = LayoutStyle {
-                    height: Length::Px(30.0),
-                    padding: Edges::xy(14.0, 6.0),
+                    width: b.width,
+                    height: b.height,
+                    padding: if b.svg_icon.is_some() && b.label.is_empty() {
+                        Edges::all(0.0)
+                    } else {
+                        Edges::xy(14.0, 6.0)
+                    },
                     ..Default::default()
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1427,7 +2656,15 @@ impl WidgetArena {
                     context_menu: Vec::new(),
                     payload: WidgetPayload::Button {
                         label: label_block,
+                        label_empty: b.label.is_empty(),
                         accent: b.accent,
+                        variant: b.variant,
+                        icon_state: RefCell::new(IconState {
+                            image: icon_image,
+                            handle: None,
+                        }),
+                        icon_size: b.icon_size,
+                        pill: b.pill,
                         on_click: b.on_click,
                     },
                 });
@@ -1443,6 +2680,9 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1478,6 +2718,9 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1507,6 +2750,46 @@ impl WidgetArena {
                 self.nodes[id].owned_effects.push(eff);
                 self.layout_to_widget.insert(lnode, id);
                 self.focus.focus_order.push(id);
+                id
+            }
+            Element::ProgressBar(pb) => {
+                let lstyle = LayoutStyle {
+                    width: pb.width,
+                    height: Length::Px(pb.height),
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_leaf(lstyle);
+                let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: Vec::new(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::ProgressBar {
+                        signal: pb.signal,
+                        color: pb.color,
+                    },
+                });
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = pb.signal.try_get();
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: false,
+                            layout: false,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                self.layout_to_widget.insert(lnode, id);
                 id
             }
             Element::TextInput(ti) => {
@@ -1544,6 +2827,9 @@ impl WidgetArena {
                 );
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1611,6 +2897,9 @@ impl WidgetArena {
                     },
                 );
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1648,6 +2937,170 @@ impl WidgetArena {
                 self.focus.focus_order.push(id);
                 id
             }
+            Element::Switcher(sw) => {
+                let child_ids: Vec<WidgetId> = sw
+                    .children
+                    .into_iter()
+                    .map(|ch| self.mount_node(ch, text))
+                    .collect();
+                let child_layout_nodes: Vec<LayoutNode> = child_ids
+                    .iter()
+                    .map(|id| self.nodes[*id].layout_node)
+                    .collect();
+                let lstyle = LayoutStyle {
+                    flex_grow: 1.0,
+                    ..Default::default()
+                };
+                let lnode = self.layout.new_container(lstyle, &child_layout_nodes);
+                let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: child_ids.clone(),
+                    layout_node: lnode,
+                    layout_style: lstyle,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::Switcher {
+                        signal: sw.signal,
+                        children: child_ids.clone(),
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                for &child in &child_ids {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
+
+                let active = sw.signal.try_get().unwrap_or(0);
+                for (i, &cid) in child_ids.iter().enumerate() {
+                    if let Some(node) = self.nodes.get_mut(cid) {
+                        node.layout_style.hidden = i != active;
+                        let style = node.layout_style;
+                        let ln = node.layout_node;
+                        self.layout.set_style(ln, style);
+                    }
+                }
+
+                let q = self.dirty_queue.clone();
+                let children_for_eff = child_ids.clone();
+                let eff = create_effect(move || {
+                    let active = sw.signal.try_get().unwrap_or(0);
+                    // We'll mark layout dirty; actual hidden toggling happens in sync_switchers.
+                    let _ = active;
+                    let _ = &children_for_eff;
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: true,
+                            layout: true,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                self.switcher_ids.push(id);
+                id
+            }
+            Element::Show(mut sh) => {
+                let condition = sh.condition;
+                let initial = condition.try_get().unwrap_or(false);
+                let mut active_child = None;
+                let child_id = if initial {
+                    sh.when_true.as_mut().map(|f| {
+                        let cid = self.mount_node(f(), text);
+                        active_child = Some(cid);
+                        cid
+                    })
+                } else {
+                    sh.when_false.as_mut().map(|f| {
+                        let cid = self.mount_node(f(), text);
+                        active_child = Some(cid);
+                        cid
+                    })
+                };
+                let children: Vec<WidgetId> = child_id.into_iter().collect();
+                let child_lnodes: Vec<LayoutNode> = children
+                    .iter()
+                    .filter_map(|cid| self.nodes.get(*cid).map(|n| n.layout_node))
+                    .collect();
+                let lnode = self.layout.new_container(sh.layout, &child_lnodes);
+                let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: children.clone(),
+                    layout_node: lnode,
+                    layout_style: sh.layout,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::Show {
+                        condition,
+                        active: initial,
+                        when_true: sh.when_true,
+                        when_false: sh.when_false,
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                for &child in &children {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
+                let q = self.dirty_queue.clone();
+                let eff = create_effect(move || {
+                    let _ = condition.try_get();
+                    push_dirty(
+                        &q,
+                        id,
+                        DirtyFlags {
+                            state: true,
+                            layout: true,
+                            paint: true,
+                        },
+                    );
+                });
+                self.nodes[id].owned_effects.push(eff);
+                id
+            }
+            Element::ForEach(mut fe) => {
+                let lnode = self.layout.new_container(fe.layout, &[]);
+                let id = self.nodes.insert(WidgetNode {
+                    children: Vec::new(),
+                    parent: None,
+                    is_relayout_boundary: matches!(
+                        (fe.layout.width, fe.layout.height),
+                        (Length::Px(_), Length::Px(_))
+                    ),
+                    dirty_layout_queued: false,
+                    layout_node: lnode,
+                    layout_style: fe.layout,
+                    bounds: Rect::default(),
+                    owned_effects: Vec::new(),
+                    tooltip: None,
+                    context_menu: Vec::new(),
+                    payload: WidgetPayload::ForEach {
+                        reconcile: Box::new(|_, _, _| {}),
+                    },
+                });
+                self.layout_to_widget.insert(lnode, id);
+                let eff = (fe.bind_signal)(self.dirty_queue.clone(), id);
+                self.nodes[id].owned_effects.push(eff);
+                // Populate initial children immediately on mount!
+                (fe.reconcile)(self, text, id);
+                if let Some(node) = self.nodes.get_mut(id)
+                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
+                {
+                    *reconcile = fe.reconcile;
+                }
+                id
+            }
             Element::Tabs(tb) => {
                 let count = tb.items.len().max(1);
                 let lstyle = LayoutStyle {
@@ -1679,6 +3132,9 @@ impl WidgetArena {
 
                 let initial_tab = tb.signal.try_get().unwrap_or(0);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1766,6 +3222,9 @@ impl WidgetArena {
                 );
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1805,6 +3264,9 @@ impl WidgetArena {
                 let lnode = self.layout.new_leaf(cs.layout);
                 let radius_cell = Rc::new(Cell::new(cs.radius));
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: cs.layout,
@@ -1815,11 +3277,13 @@ impl WidgetArena {
                     payload: WidgetPayload::CustomGpuSurface {
                         radius: radius_cell.clone(),
                         animate_signal: cs.animate_signal,
+                        resolution_scale: cs.resolution_scale,
                         state: RefCell::new(CustomSurfaceState {
                             pass: cs.pass,
                             handle: None,
                             view: None,
                             size: (0, 0),
+                            rendered_once: false,
                         }),
                     },
                 });
@@ -1870,6 +3334,9 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -1902,7 +3369,10 @@ impl WidgetArena {
                 };
                 let content_lnode = self.layout.new_container(content_lstyle, &child_lnodes);
                 let content_id = self.nodes.insert(WidgetNode {
-                    children: child_ids,
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
+                    children: child_ids.clone(),
                     layout_node: content_lnode,
                     layout_style: content_lstyle,
                     bounds: Rect::default(),
@@ -1913,9 +3383,16 @@ impl WidgetArena {
                         material: Rc::new(Cell::new(Material::solid(Color::TRANSPARENT))),
                         radius: Rc::new(Cell::new(0.0)),
                         is_drag_region: false,
+                        hover_fill: None,
+                        on_click: None,
                     },
                 });
                 self.layout_to_widget.insert(content_lnode, content_id);
+                for &child in &child_ids {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(content_id);
+                    }
+                }
 
                 let viewport_lstyle = LayoutStyle {
                     direction: FlexDir::Column,
@@ -1925,6 +3402,9 @@ impl WidgetArena {
                 let viewport_lnode = self.layout.new_container(viewport_lstyle, &[content_lnode]);
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: vec![content_id],
                     layout_node: viewport_lnode,
                     layout_style: viewport_lstyle,
@@ -1939,6 +3419,9 @@ impl WidgetArena {
                     },
                 });
                 self.layout_to_widget.insert(viewport_lnode, id);
+                if let Some(node) = self.nodes.get_mut(content_id) {
+                    node.parent = Some(id);
+                }
                 self.scroll_ids.push(id);
                 id
             }
@@ -1985,6 +3468,9 @@ impl WidgetArena {
                 };
                 let div_lnode = self.layout.new_leaf(div_style);
                 let divider_id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: div_lnode,
                     layout_style: div_style,
@@ -2016,6 +3502,9 @@ impl WidgetArena {
                 let parent_lnode = self.layout.new_container(parent_style, &child_lnodes);
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: vec![first_id, divider_id, second_id],
                     layout_node: parent_lnode,
                     layout_style: parent_style,
@@ -2034,6 +3523,11 @@ impl WidgetArena {
                     },
                 });
                 self.layout_to_widget.insert(parent_lnode, id);
+                for &child in &[first_id, divider_id, second_id] {
+                    if let Some(node) = self.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
                 self.split_ids.push(id);
 
                 let q = self.dirty_queue.clone();
@@ -2097,6 +3591,9 @@ impl WidgetArena {
                     .collect();
 
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: true,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -2146,6 +3643,9 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -2165,6 +3665,9 @@ impl WidgetArena {
                 };
                 let lnode = self.layout.new_leaf(lstyle);
                 let id = self.nodes.insert(WidgetNode {
+                    parent: None,
+                    is_relayout_boundary: false,
+                    dirty_layout_queued: false,
                     children: Vec::new(),
                     layout_node: lnode,
                     layout_style: lstyle,
@@ -2212,6 +3715,8 @@ struct PaintCtx<'a, 'b> {
     focused: Option<WidgetId>,
     overlays: &'a mut Vec<OverlayRenderRecord>,
     a11y_records: Option<&'a mut Vec<A11yNodeRecord>>,
+    selection_scratch: &'a mut Vec<(f32, f32, f32)>,
+    decoded_tex_cache: &'a mut HashMap<usize, (TextureHandle, usize)>,
 }
 
 pub struct WidgetWindow<F> {
@@ -2236,6 +3741,7 @@ pub struct WidgetWindow<F> {
     start_instant: Instant,
     show_fps: bool,
     fps_block: Option<TextBlock>,
+    was_animating: bool,
     path_draw_fn: Option<PathDrawFn>,
     last_fps_update: Instant,
     last_cursor: (f32, f32),
@@ -2270,6 +3776,7 @@ where
             start_instant: Instant::now(),
             show_fps: false,
             fps_block: None,
+            was_animating: false,
             path_draw_fn: None,
             last_fps_update: Instant::now(),
             last_cursor: (0.0, 0.0),
@@ -2329,7 +3836,12 @@ where
             .focus
             .focused
             .and_then(|id| self.arena.nodes.get(id))
-            .is_some_and(|n| matches!(n.payload, WidgetPayload::TextInput { .. }));
+            .is_some_and(|n| {
+                matches!(
+                    n.payload,
+                    WidgetPayload::TextInput { .. } | WidgetPayload::TextArea { .. }
+                )
+            });
 
         if is_text_focused {
             self.caret_visible = true;
@@ -2403,6 +3915,27 @@ where
                 animating |= state.borrow_mut().scroll_y.step(dt);
             }
         }
+        for &sid in &self.arena.switcher_ids.clone() {
+            let (active, children) = if let Some(node) = self.arena.nodes.get(sid)
+                && let WidgetPayload::Switcher { signal, children } = &node.payload
+            {
+                (signal.try_get().unwrap_or(0), children.clone())
+            } else {
+                continue;
+            };
+            for (i, &cid) in children.iter().enumerate() {
+                let hidden = i != active;
+                if let Some(node) = self.arena.nodes.get_mut(cid)
+                    && node.layout_style.hidden != hidden
+                {
+                    node.layout_style.hidden = hidden;
+                    let style = node.layout_style;
+                    let ln = node.layout_node;
+                    self.arena.layout.set_style(ln, style);
+                    self.arena.needs_full_layout = true;
+                }
+            }
+        }
 
         let now = Instant::now();
         if let Some(blink_at) = self.next_blink_at
@@ -2419,6 +3952,7 @@ where
             self.tooltip_show_at = None;
         }
 
+        self.was_animating = animating;
         animating
     }
 
@@ -2466,44 +4000,9 @@ where
     fn on_scroll(&mut self, _delta_x: f32, delta_y: f32) -> bool {
         let mut handled = self.clear_tooltip();
         let (cx, cy) = self.last_cursor;
-
-        for &vid in &self.arena.virtual_list_ids {
-            if let Some(node) = self.arena.nodes.get(vid)
-                && node.bounds.contains(cx, cy)
-                && let WidgetPayload::VirtualizedList { state } = &node.payload
-            {
-                let mut st = state.borrow_mut();
-                let stride = st.item_height + st.gap;
-                let total_h = if st.item_count == 0 {
-                    0.0
-                } else {
-                    st.item_count as f32 * stride - st.gap
-                };
-                let max_scroll = (total_h - node.bounds.height).max(0.0);
-                if max_scroll > 0.0 {
-                    let next = (st.scroll_y.target - delta_y).clamp(0.0, max_scroll);
-                    st.scroll_y.set_target(next);
-                    return true;
-                }
-            }
-        }
-
-        for &sid in &self.arena.scroll_ids {
-            if let Some(node) = self.arena.nodes.get_mut(sid)
-                && node.bounds.contains(cx, cy)
-                && let WidgetPayload::ScrollView {
-                    scroll_y,
-                    content_height,
-                    ..
-                } = &mut node.payload
-            {
-                let max_scroll = (*content_height - node.bounds.height).max(0.0);
-                if max_scroll > 0.0 {
-                    let next = (scroll_y.target - delta_y).clamp(0.0, max_scroll);
-                    scroll_y.set_target(next);
-                    handled = true;
-                }
-            }
+        if let Some(root) = self.arena.root {
+            handled |=
+                dispatch_scroll_node(root, &mut self.arena.nodes, cx, cy, delta_y, (0.0, 0.0));
         }
         handled
     }
@@ -2678,23 +4177,33 @@ where
                     }
                     Key::ArrowLeft => {
                         *selection = None;
-                        if *cursor > 0 {
-                            *cursor = val[..*cursor]
+                        let next = if is_ctrl {
+                            word_prev(&val, *cursor)
+                        } else {
+                            val[..*cursor]
                                 .char_indices()
                                 .last()
                                 .map(|(i, _)| i)
-                                .unwrap_or(0);
+                                .unwrap_or(0)
+                        };
+                        if next != *cursor {
+                            *cursor = next;
                             handled = true;
                         }
                     }
                     Key::ArrowRight => {
                         *selection = None;
-                        if *cursor < val.len() {
-                            *cursor = val[*cursor..]
+                        let next = if is_ctrl {
+                            word_next(&val, *cursor)
+                        } else {
+                            val[*cursor..]
                                 .char_indices()
                                 .nth(1)
                                 .map(|(i, _)| *cursor + i)
-                                .unwrap_or(val.len());
+                                .unwrap_or(val.len())
+                        };
+                        if next != *cursor {
+                            *cursor = next;
                             handled = true;
                         }
                     }
@@ -2827,59 +4336,42 @@ where
                     }
                     Key::ArrowLeft => {
                         *selection = None;
-                        if *cursor > 0 {
-                            *cursor = val[..*cursor]
+                        let next = if is_ctrl {
+                            word_prev(&val, *cursor)
+                        } else {
+                            val[..*cursor]
                                 .char_indices()
                                 .last()
                                 .map(|(i, _)| i)
-                                .unwrap_or(0);
+                                .unwrap_or(0)
+                        };
+                        if next != *cursor {
+                            *cursor = next;
                             handled = true;
                         }
                     }
                     Key::ArrowRight => {
                         *selection = None;
-                        if *cursor < val.len() {
-                            *cursor = val[*cursor..]
+                        let next = if is_ctrl {
+                            word_next(&val, *cursor)
+                        } else {
+                            val[*cursor..]
                                 .char_indices()
                                 .nth(1)
                                 .map(|(i, _)| *cursor + i)
-                                .unwrap_or(val.len());
+                                .unwrap_or(val.len())
+                        };
+                        if next != *cursor {
+                            *cursor = next;
                             handled = true;
                         }
                     }
                     Key::ArrowUp | Key::ArrowDown => {
-                        let line = line_index_at(&val, *cursor);
-                        let target = if *key == Key::ArrowUp {
-                            line.saturating_sub(1)
-                        } else {
-                            line + 1
-                        };
-                        let (start, end) = line_range(&val, target);
-                        if start <= end && end <= val.len() {
-                            let desired_x = text_block.x_offset_for_byte(line, *cursor);
-                            let mut best = start;
-                            let mut best_dist = f32::MAX;
-                            let mut idx = start;
-                            loop {
-                                let dist =
-                                    (text_block.x_offset_for_byte(target, idx) - desired_x).abs();
-                                if dist < best_dist {
-                                    best_dist = dist;
-                                    best = idx;
-                                }
-                                if idx >= end {
-                                    break;
-                                }
-                                idx = val[idx..]
-                                    .char_indices()
-                                    .nth(1)
-                                    .map(|(i, _)| idx + i)
-                                    .unwrap_or(end);
-                            }
-                            *selection = None;
-                            *cursor = best;
-                            handled = true;
-                        }
+                        let delta = if *key == Key::ArrowUp { -1 } else { 1 };
+                        *selection = None;
+                        *cursor =
+                            snap_char_boundary(&val, text_block.move_vertical_byte(*cursor, delta));
+                        handled = true;
                     }
                     Key::Home => {
                         *selection = None;
@@ -2908,6 +4400,9 @@ where
         }
 
         if handled {
+            if matches!(node.payload, WidgetPayload::TextArea { .. }) {
+                ensure_textarea_caret_visible(node);
+            }
             self.reset_caret_blink();
         }
         handled
@@ -2965,17 +4460,16 @@ where
                 selection,
                 is_selecting,
                 text_block,
+                scroll_y,
                 ..
             } = &mut node.payload
             && *is_selecting
         {
             let val = signal.try_get().unwrap_or_default();
             let rel_x = x - (node.bounds.x + 10.0);
-            let rel_y = y - (node.bounds.y + 10.0);
-            let line = (rel_y / 18.0).floor().max(0.0) as usize;
-            let (start, end) = line_range(&val, line);
+            let rel_y = y - (node.bounds.y + 10.0) + *scroll_y;
             let anchor = snap_char_boundary(&val, selection.map(|s| s.0).unwrap_or(*cursor));
-            let idx = text_block.byte_index_at_x(line, rel_x).clamp(start, end);
+            let idx = text_block.global_byte_at_point(rel_x, rel_y);
             let new_cursor = snap_char_boundary(&val, idx);
             *cursor = new_cursor;
             *selection = if anchor != new_cursor {
@@ -3036,13 +4530,17 @@ where
         }
 
         for &vid in &self.arena.virtual_list_ids {
-            if let Some(node) = self.arena.nodes.get(vid)
+            let screen_bounds = self
+                .arena
+                .root
+                .and_then(|root| widget_screen_bounds(root, &self.arena.nodes, vid, (0.0, 0.0)));
+            if let (Some(screen), Some(node)) = (screen_bounds, self.arena.nodes.get(vid))
                 && let WidgetPayload::VirtualizedList { state } = &node.payload
             {
                 let mut st = state.borrow_mut();
-                let next_row = if node.bounds.contains(x, y) {
+                let next_row = if screen.contains(x, y) {
                     let stride = st.item_height + st.gap;
-                    let idx = ((y - node.bounds.y + st.scroll_y.value) / stride).floor() as isize;
+                    let idx = ((y - screen.y + st.scroll_y.value) / stride).floor() as isize;
                     if idx >= 0 && (idx as usize) < st.item_count {
                         Some(idx as usize)
                     } else {
@@ -3185,6 +4683,11 @@ where
         self.arena.focus.set_focus(Some(hit));
         let mut clicked = false;
         let mut capture_target = false;
+        let hit_screen = self
+            .arena
+            .root
+            .and_then(|root| widget_screen_bounds(root, &self.arena.nodes, hit, (0.0, 0.0)))
+            .unwrap_or_default();
 
         if let Some(node) = self.arena.nodes.get_mut(hit) {
             match &mut node.payload {
@@ -3205,6 +4708,18 @@ where
                     }
                     clicked = true;
                 }
+                WidgetPayload::Container {
+                    on_click: Some(cb), ..
+                } => {
+                    cb();
+                    clicked = true;
+                }
+                WidgetPayload::Image {
+                    on_click: Some(cb), ..
+                } => {
+                    cb();
+                    clicked = true;
+                }
                 WidgetPayload::Switch { signal } => {
                     signal.update(|v| *v = !*v);
                     clicked = true;
@@ -3220,7 +4735,7 @@ where
                 WidgetPayload::VirtualizedList { state } => {
                     let mut st = state.borrow_mut();
                     let stride = st.item_height + st.gap;
-                    let idx = ((y - node.bounds.y + st.scroll_y.value) / stride).floor() as isize;
+                    let idx = ((y - hit_screen.y + st.scroll_y.value) / stride).floor() as isize;
                     if idx >= 0 && (idx as usize) < st.item_count {
                         let i = idx as usize;
                         if let Some(sel) = st.selected {
@@ -3266,14 +4781,13 @@ where
                     selection,
                     is_selecting,
                     text_block,
+                    scroll_y,
                     ..
                 } => {
                     let val = signal.try_get().unwrap_or_default();
                     let rel_x = x - (node.bounds.x + 10.0);
-                    let rel_y = y - (node.bounds.y + 10.0);
-                    let line = (rel_y / 18.0).floor().max(0.0) as usize;
-                    let (start, end) = line_range(&val, line);
-                    let idx = text_block.byte_index_at_x(line, rel_x).clamp(start, end);
+                    let rel_y = y - (node.bounds.y + 10.0) + *scroll_y;
+                    let idx = text_block.global_byte_at_point(rel_x, rel_y);
                     *cursor = snap_char_boundary(&val, idx);
                     *selection = None;
                     *is_selecting = true;
@@ -3312,8 +4826,24 @@ where
         was
     }
 
+    fn on_window_focus(&mut self, focused: bool) -> bool {
+        if !focused {
+            self.captured = None;
+            self.hovered = None;
+            self.clear_tooltip();
+            self.caret_visible = false;
+            self.next_blink_at = None;
+            return true;
+        }
+        self.reset_caret_blink();
+        true
+    }
+
     fn render(&mut self, ctx: &mut FrameContext<'_>) {
         let frame_start = FrameProfiler::begin_timer();
+        for handle in self.arena.pending_texture_releases.drain(..) {
+            ctx.gpu_mut().release_texture(handle);
+        }
         self.profiler.record_cadence(ctx.frame_dt);
 
         let mode = self
@@ -3325,16 +4855,49 @@ where
         // Stage 1: Drain per-arena reactive dirty notifications
         let dirty_batch: Vec<(WidgetId, DirtyFlags)> =
             std::mem::take(&mut *self.arena.dirty_queue.borrow_mut());
+        let mut foreach_dirty: Vec<WidgetId> = Vec::new();
+        let mut show_dirty: Vec<WidgetId> = Vec::new();
         for (id, flags) in dirty_batch {
-            if let Some(node) = self.arena.nodes.get_mut(id) {
-                if flags.layout {
-                    self.arena.layout.mark_dirty(node.layout_node);
-                    self.arena.needs_layout = true;
+            let Some(node) = self.arena.nodes.get(id) else { continue; };
+            let lnode = node.layout_node;
+            let is_foreach = matches!(node.payload, WidgetPayload::ForEach { .. });
+            let is_show = matches!(node.payload, WidgetPayload::Show { .. });
+
+            if flags.layout {
+                self.arena.layout.mark_dirty(lnode);
+                let mut cur = id;
+                while let Some(n) = self.arena.nodes.get(cur) {
+                    if n.is_relayout_boundary || n.parent.is_none() {
+                        break;
+                    }
+                    if let Some(p) = n.parent {
+                        cur = p;
+                    } else {
+                        break;
+                    }
                 }
+                if Some(cur) == self.arena.root {
+                    self.arena.needs_full_layout = true;
+                } else if let Some(n) = self.arena.nodes.get_mut(cur)
+                    && !n.dirty_layout_queued
+                {
+                    n.dirty_layout_queued = true;
+                    self.arena.dirty_layout_roots.push(cur);
+                }
+            }
+
+            if is_foreach && (flags.state || flags.layout) {
+                foreach_dirty.push(id);
+            }
+            if is_show && (flags.state || flags.layout) {
+                show_dirty.push(id);
+            }
+            let node = self.arena.nodes.get_mut(id).unwrap();
                 match &mut node.payload {
                     WidgetPayload::Text {
                         block,
                         pending: Some(cell),
+                        ..
                     } => {
                         let text_val = cell.borrow().clone();
                         block.set_text(ctx.text_engine(), &text_val);
@@ -3375,6 +4938,103 @@ where
                     }
                     _ => {}
                 }
+        }
+
+        for id in show_dirty {
+            let (cond, active, mut when_true, mut when_false) =
+                if let Some(node) = self.arena.nodes.get_mut(id) {
+                    if let WidgetPayload::Show {
+                        condition,
+                        active,
+                        when_true,
+                        when_false,
+                    } = &mut node.payload
+                    {
+                        (*condition, *active, when_true.take(), when_false.take())
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+            let next = cond.try_get().unwrap_or(false);
+            if next != active {
+                let old_children: Vec<WidgetId> = self
+                    .arena
+                    .nodes
+                    .get(id)
+                    .map(|n| n.children.clone())
+                    .unwrap_or_default();
+                for child in old_children {
+                    self.arena.unmount_subtree(child);
+                }
+                let new_child = if next {
+                    when_true
+                        .as_mut()
+                        .map(|f| self.arena.mount_node(f(), ctx.text_engine()))
+                } else {
+                    when_false
+                        .as_mut()
+                        .map(|f| self.arena.mount_node(f(), ctx.text_engine()))
+                };
+                let children: Vec<WidgetId> = new_child.into_iter().collect();
+                for &child in &children {
+                    if let Some(node) = self.arena.nodes.get_mut(child) {
+                        node.parent = Some(id);
+                    }
+                }
+                let child_lnodes: Vec<LayoutNode> = children
+                    .iter()
+                    .filter_map(|cid| self.arena.nodes.get(*cid).map(|n| n.layout_node))
+                    .collect();
+                if let Some(node) = self.arena.nodes.get_mut(id) {
+                    node.children = children;
+                    let lnode = node.layout_node;
+                    if let WidgetPayload::Show {
+                        active,
+                        when_true: wt,
+                        when_false: wf,
+                        ..
+                    } = &mut node.payload
+                    {
+                        *active = next;
+                        *wt = when_true;
+                        *wf = when_false;
+                    }
+                    self.arena.layout.set_children(lnode, &child_lnodes);
+                    self.arena.layout.mark_dirty(lnode);
+                }
+                self.arena.needs_full_layout = true;
+            } else if let Some(node) = self.arena.nodes.get_mut(id)
+                && let WidgetPayload::Show {
+                    when_true: wt,
+                    when_false: wf,
+                    ..
+                } = &mut node.payload
+            {
+                *wt = when_true;
+                *wf = when_false;
+            }
+        }
+
+        for id in foreach_dirty {
+            let reconcile_fn = if let Some(node) = self.arena.nodes.get_mut(id) {
+                if let WidgetPayload::ForEach { reconcile } = &mut node.payload {
+                    Some(std::mem::replace(reconcile, Box::new(|_, _, _| {})))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(mut reconcile_fn) = reconcile_fn {
+                reconcile_fn(&mut self.arena, ctx.text_engine(), id);
+                if let Some(node) = self.arena.nodes.get_mut(id)
+                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
+                {
+                    *reconcile = reconcile_fn;
+                }
+                self.arena.needs_full_layout = true;
             }
         }
 
@@ -3409,20 +5069,20 @@ where
                     self.arena
                         .layout
                         .set_style(first_node.layout_node, first_node.layout_style);
-                    self.arena.needs_layout = true;
+                    self.arena.needs_full_layout = true;
                 }
             }
         }
 
         if (ctx.width, ctx.height) != self.last_size {
             self.last_size = (ctx.width, ctx.height);
-            self.arena.needs_layout = true;
+            self.arena.needs_full_layout = true;
         }
 
         // Stage 2: Incremental Taffy Layout + ScrollView content_height
         let layout_start = FrameProfiler::begin_timer();
         let mut did_layout = false;
-        if self.arena.needs_layout
+        if (self.arena.needs_full_layout || self.arena.dirty_layout_roots.len() > 32)
             && let Some(root) = self.arena.root
         {
             let root_lnode = self.arena.nodes[root].layout_node;
@@ -3451,9 +5111,23 @@ where
                         WidgetPayload::TextArea { text_block, .. } => {
                             text_block.measure(text_engine, avail_w.map(|w| (w - 20.0).max(1.0)))
                         }
-                        WidgetPayload::Button { label, .. } => {
+                        WidgetPayload::Button {
+                            label,
+                            label_empty,
+                            icon_state,
+                            icon_size,
+                            ..
+                        } => {
                             let (w, _) = label.measure(text_engine, None);
-                            (w + 28.0, 30.0)
+                            let has_icon = icon_state.borrow().handle.is_some()
+                                || icon_state.borrow().image.is_some();
+                            if has_icon && *label_empty {
+                                (30.0, 30.0)
+                            } else if has_icon {
+                                (w + 28.0 + *icon_size, 30.0)
+                            } else {
+                                (w + 28.0, 30.0)
+                            }
                         }
                         _ => (0.0, 0.0),
                     }
@@ -3487,7 +5161,88 @@ where
                 }
             }
 
-            self.arena.needs_layout = false;
+            self.arena.needs_full_layout = false;
+            for &id in &self.arena.dirty_layout_roots {
+                if let Some(n) = self.arena.nodes.get_mut(id) {
+                    n.dirty_layout_queued = false;
+                }
+            }
+            self.arena.dirty_layout_roots.clear();
+            did_layout = true;
+        } else if !self.arena.dirty_layout_roots.is_empty() {
+            let roots: Vec<WidgetId> = std::mem::take(&mut self.arena.dirty_layout_roots);
+            for boundary_id in roots {
+                if let Some(n) = self.arena.nodes.get_mut(boundary_id) {
+                    n.dirty_layout_queued = false;
+                }
+                let Some(boundary_node) = self.arena.nodes.get(boundary_id) else {
+                    continue;
+                };
+                let boundary_lnode = boundary_node.layout_node;
+                let bw = boundary_node.bounds.width.max(1.0);
+                let bh = boundary_node.bounds.height.max(1.0);
+                let origin_x = boundary_node.bounds.x;
+                let origin_y = boundary_node.bounds.y;
+
+                let nodes = &mut self.arena.nodes;
+                let lmap = &self.arena.layout_to_widget;
+                let text_engine = ctx.text_engine();
+
+                self.arena.layout.compute_subtree_with_measure(
+                    boundary_lnode,
+                    bw,
+                    bh,
+                    |lnode, _, _, avail_w, _| {
+                        let Some(&wid) = lmap.get(&lnode) else {
+                            return (0.0, 0.0);
+                        };
+                        let Some(node) = nodes.get_mut(wid) else {
+                            return (0.0, 0.0);
+                        };
+                        match &mut node.payload {
+                            WidgetPayload::Text { block, .. } => {
+                                block.measure(text_engine, avail_w)
+                            }
+                            WidgetPayload::TextArea { text_block, .. } => text_block
+                                .measure(text_engine, avail_w.map(|w| (w - 20.0).max(1.0))),
+                            WidgetPayload::Button {
+                                label,
+                                label_empty,
+                                icon_state,
+                                icon_size,
+                                ..
+                            } => {
+                                let (w, _) = label.measure(text_engine, None);
+                                let has_icon = icon_state.borrow().handle.is_some()
+                                    || icon_state.borrow().image.is_some();
+                                if has_icon && *label_empty {
+                                    (30.0, 30.0)
+                                } else if has_icon {
+                                    (w + 28.0 + *icon_size, 30.0)
+                                } else {
+                                    (w + 28.0, 30.0)
+                                }
+                            }
+                            _ => (0.0, 0.0),
+                        }
+                    },
+                );
+
+                let slice = self
+                    .arena
+                    .layout
+                    .collect_logical_rects_into(boundary_lnode, origin_x, origin_y);
+                self.arena.rect_buf.clear();
+                self.arena.rect_buf.extend_from_slice(slice);
+                for i in 0..self.arena.rect_buf.len() {
+                    let (lnode, rect) = self.arena.rect_buf[i];
+                    if let Some(&wid) = self.arena.layout_to_widget.get(&lnode)
+                        && let Some(node) = self.arena.nodes.get_mut(wid)
+                    {
+                        node.bounds = rect;
+                    }
+                }
+            }
             did_layout = true;
         }
         let layout_ms = layout_start.elapsed().as_secs_f32() * 1000.0;
@@ -3559,6 +5314,7 @@ where
             } else {
                 None
             };
+            let mut selection_scratch = Vec::new();
             let mut pctx = PaintCtx {
                 ctx,
                 theme: &theme,
@@ -3569,6 +5325,8 @@ where
                 focused: self.arena.focus.focused,
                 overlays: &mut overlay_records,
                 a11y_records: a11y_buf.as_mut(),
+                selection_scratch: &mut selection_scratch,
+                decoded_tex_cache: &mut self.arena.decoded_tex_cache,
             };
 
             paint_node(root, &self.arena.nodes, &mut pctx, (0.0, 0.0));
@@ -3616,7 +5374,7 @@ where
                     radii: CornerRadii::all(10.0).scale(scale),
                     tint: theme.popover_glass_tint,
                     border_color: theme.hairline,
-                    border_width: 1.0,
+                    border_width: 1.0 * scale,
                     frost: 0.42,
                     specular: 0.85,
                     ..Default::default()
@@ -3651,7 +5409,16 @@ where
                         } else {
                             &labels[i]
                         };
-                        ctx.push_text(block, row_rect.x + 10.0, row_rect.y + 6.0);
+                        ctx.push_text_colored(
+                            block,
+                            row_rect.x + 10.0,
+                            row_rect.y + 6.0,
+                            if is_sel {
+                                theme.text_on_accent
+                            } else {
+                                theme.text_primary
+                            },
+                        );
                     }
                 }
             }
@@ -3696,7 +5463,7 @@ where
                     radii: CornerRadii::all(10.0).scale(scale),
                     tint: theme.popover_glass_tint,
                     border_color: theme.hairline,
-                    border_width: 1.0,
+                    border_width: 1.0 * scale,
                     frost: 0.45,
                     specular: 0.85,
                     ..Default::default()
@@ -3716,7 +5483,16 @@ where
                             });
                         }
                         let blk = if is_hov { selected } else { normal };
-                        ctx.push_text(blk, row_rect.x + 10.0, row_rect.y + 5.0);
+                        ctx.push_text_colored(
+                            blk,
+                            row_rect.x + 10.0,
+                            row_rect.y + 5.0,
+                            if is_hov {
+                                theme.text_on_accent
+                            } else {
+                                theme.text_primary
+                            },
+                        );
                         cur_y += 28.0;
                     } else {
                         ctx.push_sdf(SdfQuad {
@@ -3756,31 +5532,33 @@ where
                     radii: CornerRadii::all(6.0).scale(scale),
                     fill: theme.panel_bg,
                     border_color: theme.hairline,
-                    border_width: 1.0,
+                    border_width: 1.0 * scale,
                     shadow_color: theme.shadow_soft,
                     shadow_offset: [0.0, 4.0 * scale],
                     shadow_blur: 12.0 * scale,
                     ..Default::default()
                 });
-                ctx.push_text(tb, tt_rect.x + 9.0, tt_rect.y + 5.0);
+                ctx.push_text_colored(tb, tt_rect.x + 9.0, tt_rect.y + 5.0, theme.text_primary);
             }
         }
 
         if self.show_fps {
             let m = self.profiler.metrics;
             let should_refresh = self.fps_block.is_none()
-                || self.last_fps_update.elapsed() >= Duration::from_millis(200);
+                || self.last_fps_update.elapsed() >= Duration::from_millis(150);
             if should_refresh {
                 self.last_fps_update = Instant::now();
-                let fps_val = if m.effective_fps > 1.0 {
-                    m.effective_fps
+                let label = if self.was_animating && m.effective_fps > 10.0 {
+                    format!(
+                        "{:.0} FPS  •  {:.2} ms (L:{:.2} P:{:.2})",
+                        m.effective_fps, m.frame_ms, m.layout_ms, m.paint_ms
+                    )
                 } else {
-                    m.fps
+                    format!(
+                        "Idle  •  {:.2} ms (L:{:.2} P:{:.2})",
+                        m.frame_ms, m.layout_ms, m.paint_ms
+                    )
                 };
-                let label = format!(
-                    "{:.0} FPS  •  {:.2} ms (L:{:.2} P:{:.2})",
-                    fps_val, m.frame_ms, m.layout_ms, m.paint_ms
-                );
                 let te = ctx.text_engine();
                 if let Some(blk) = &mut self.fps_block {
                     blk.set_text(te, &label);
@@ -3814,10 +5592,15 @@ where
                     radii: CornerRadii::all(6.0).scale(scale),
                     fill: theme.panel_bg,
                     border_color: theme.hairline,
-                    border_width: 1.0,
+                    border_width: 1.0 * scale,
                     ..Default::default()
                 });
-                ctx.push_text(blk, pill_rect.x + 8.0, pill_rect.y + 4.0);
+                ctx.push_text_colored(
+                    blk,
+                    pill_rect.x + 8.0,
+                    pill_rect.y + 4.0,
+                    theme.text_primary,
+                );
             }
         }
 
@@ -3918,47 +5701,245 @@ fn paint_node(
             toggled,
             focusable,
             clickable,
-            bounds,
+            bounds: bounds.scale(scale),
             children: node.children.clone(),
         });
     }
 
     match &node.payload {
         WidgetPayload::Container {
-            material, radius, ..
+            material,
+            radius,
+            hover_fill,
+            ..
         } => {
             render_material(pctx.ctx, bounds, material.get(), radius.get(), scale);
+            if is_hovered && let Some(fill) = *hover_fill {
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    radii: CornerRadii::all(radius.get()).scale(scale),
+                    fill,
+                    ..Default::default()
+                });
+            }
             for &child in &node.children {
                 paint_node(child, nodes, pctx, offset);
             }
         }
-        WidgetPayload::Text { block, .. } => {
-            pctx.ctx.push_text(block, bounds.x, bounds.y);
+        WidgetPayload::Switcher { .. }
+        | WidgetPayload::Show { .. }
+        | WidgetPayload::ForEach { .. } => {
+            for &child in &node.children {
+                paint_node(child, nodes, pctx, offset);
+            }
         }
-        WidgetPayload::Button { label, accent, .. } => {
-            let fill = if *accent {
-                theme.accent
-            } else if is_hovered {
-                theme.control_hover
-            } else {
-                theme.panel_bg
-            };
+        WidgetPayload::Text { block, tone, .. } => {
+            let color = tone.resolve(theme, block.style().color);
+            pctx.ctx.push_text_colored(block, bounds.x, bounds.y, color);
+        }
+        WidgetPayload::Image {
+            state,
+            radius,
+            tint,
+            shadow,
+            fit,
+            ..
+        } => {
+            if let Some(shadow) = shadow {
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    radii: CornerRadii::all(*radius).scale(scale),
+                    fill: Color::TRANSPARENT,
+                    shadow_color: shadow.color,
+                    shadow_offset: [shadow.offset[0] * scale, shadow.offset[1] * scale],
+                    shadow_blur: shadow.blur * scale,
+                    ..Default::default()
+                });
+            }
+            let mut st = state.borrow_mut();
+            if st.handle.is_none() {
+                if let Some(key) = st.source_key {
+                    if let Some((handle, refs)) = pctx.decoded_tex_cache.get_mut(&key) {
+                        *refs += 1;
+                        st.handle = Some(*handle);
+                        st.image = None;
+                    } else if let Some(img) = st.image.take() {
+                        let handle = pctx.ctx.gpu_mut().upload_image(img.as_ref());
+                        pctx.decoded_tex_cache.insert(key, (handle, 1));
+                        st.handle = Some(handle);
+                    }
+                } else if let Some(img) = st.image.take() {
+                    st.handle = Some(pctx.ctx.gpu_mut().upload_image(img.as_ref()));
+                }
+            }
+            if let Some(handle) = st.handle {
+                let uv = match fit {
+                    ImageFit::Cover => {
+                        cover_uv_rect(st.width, st.height, bounds.width, bounds.height)
+                    }
+                    ImageFit::Contain | ImageFit::Stretch => [0.0, 0.0, 1.0, 1.0],
+                };
+                pctx.ctx.push_image(ImageQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    uv_rect: uv,
+                    radii: CornerRadii::all(*radius).scale(scale),
+                    tint: *tint,
+                    texture: handle,
+                });
+            }
+        }
+        WidgetPayload::Icon {
+            state,
+            tone,
+            color,
+            size,
+        } => {
+            let mut st = state.borrow_mut();
+            if st.handle.is_none()
+                && let Some(img) = st.image.take()
+            {
+                st.handle = Some(pctx.ctx.gpu_mut().upload_image(&img));
+            }
+            if let Some(handle) = st.handle {
+                let tint = tone.resolve(theme, *color);
+                pctx.ctx.push_image(ImageQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    radii: CornerRadii::all(0.0),
+                    tint,
+                    texture: handle,
+                });
+            }
+            let _ = size;
+        }
+        WidgetPayload::ProgressBar { signal, color } => {
+            let v = signal.try_get().unwrap_or(0.0).clamp(0.0, 1.0);
+            let track = snap_rect_to_pixels(bounds, scale);
             pctx.ctx.push_sdf(SdfQuad {
-                rect: snap_rect_to_pixels(bounds, scale),
-                radii: CornerRadii::all(7.0).scale(scale),
-                fill,
-                border_color: if *accent {
+                rect: track,
+                radii: CornerRadii::all(bounds.height * 0.5).scale(scale),
+                fill: theme.hairline,
+                ..Default::default()
+            });
+            if v > 0.0 {
+                let fill_rect = Rect::new(bounds.x, bounds.y, bounds.width * v, bounds.height);
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(fill_rect, scale),
+                    radii: CornerRadii::all(bounds.height * 0.5).scale(scale),
+                    fill: color.unwrap_or(theme.accent),
+                    ..Default::default()
+                });
+            }
+        }
+        WidgetPayload::Button {
+            label,
+            label_empty,
+            accent,
+            variant,
+            icon_state,
+            icon_size,
+            pill,
+            ..
+        } => {
+            let r = if *pill { bounds.height * 0.5 } else { 7.0 };
+            let is_primary = *variant == ButtonVariant::Primary || *accent;
+            let is_glass = *variant == ButtonVariant::Glass;
+            let is_ghost = *variant == ButtonVariant::Ghost;
+            if is_glass {
+                pctx.ctx.push_glass(GlassQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    radii: CornerRadii::all(r).scale(scale),
+                    tint: if is_hovered {
+                        Color::from_rgba8(255, 255, 255, 34)
+                    } else {
+                        Color::from_rgba8(255, 255, 255, 24)
+                    },
+                    saturation: 1.0,
+                    frost: 0.22,
+                    liquid_ripple: 0.0,
+                    specular: 0.8,
+                    rim_angle: -1.309,
+                    sheen_progress: 0.0,
+                    conic_strength: 0.0,
+                    border_color: theme.hairline,
+                    border_width: 1.0 * scale,
+                });
+            } else {
+                let fill = if is_primary {
+                    theme.accent
+                } else if is_ghost {
+                    if is_hovered {
+                        theme.control_hover
+                    } else {
+                        Color::TRANSPARENT
+                    }
+                } else if is_hovered {
+                    theme.control_hover
+                } else {
+                    theme.panel_bg
+                };
+                let border_color = if is_primary || is_ghost {
                     Color::TRANSPARENT
                 } else {
                     theme.hairline
-                },
-                border_width: if *accent { 0.0 } else { 1.0 },
-                shadow_color: theme.shadow_soft,
-                shadow_offset: [0.0, 1.0 * scale],
-                shadow_blur: 3.0 * scale,
-                ..Default::default()
-            });
-            pctx.ctx.push_text(label, bounds.x + 14.0, bounds.y + 6.0);
+                };
+                let border_width = if is_primary || is_ghost {
+                    0.0
+                } else {
+                    1.0 * scale
+                };
+                pctx.ctx.push_sdf(SdfQuad {
+                    rect: snap_rect_to_pixels(bounds, scale),
+                    radii: CornerRadii::all(r).scale(scale),
+                    fill,
+                    border_color,
+                    border_width,
+                    shadow_color: if is_ghost {
+                        Color::TRANSPARENT
+                    } else {
+                        theme.shadow_soft
+                    },
+                    shadow_offset: [0.0, 1.0 * scale],
+                    shadow_blur: if is_ghost { 0.0 } else { 3.0 * scale },
+                    ..Default::default()
+                });
+            }
+
+            let mut st = icon_state.borrow_mut();
+            if st.handle.is_none()
+                && let Some(img) = st.image.take()
+            {
+                st.handle = Some(pctx.ctx.gpu_mut().upload_image(&img));
+            }
+            let has_icon = st.handle.is_some();
+            let text_color = if is_primary {
+                theme.text_on_accent
+            } else {
+                theme.text_primary
+            };
+            let icon_color = text_color;
+            let mut text_x = bounds.x + 14.0;
+            if let Some(handle) = st.handle {
+                let ix = if *label_empty {
+                    bounds.x + (bounds.width - *icon_size) * 0.5
+                } else {
+                    bounds.x + 10.0
+                };
+                let iy = bounds.y + (bounds.height - *icon_size) * 0.5;
+                pctx.ctx.push_image(ImageQuad {
+                    rect: snap_rect_to_pixels(Rect::new(ix, iy, *icon_size, *icon_size), scale),
+                    uv_rect: [0.0, 0.0, 1.0, 1.0],
+                    radii: CornerRadii::all(0.0),
+                    tint: icon_color,
+                    texture: handle,
+                });
+                text_x = ix + *icon_size + 8.0;
+            }
+            if !*label_empty {
+                pctx.ctx
+                    .push_text_colored(label, text_x, bounds.y + 6.0, text_color);
+            }
+            let _ = has_icon;
         }
         WidgetPayload::Switch { signal } => {
             let on = signal.try_get().unwrap_or(false);
@@ -3977,6 +5958,8 @@ fn paint_node(
                 rect: Rect::new(tx, bounds.y + 2.0, 18.0, 18.0).scale(scale),
                 radii: CornerRadii::all(9.0).scale(scale),
                 fill: theme.control_thumb,
+                border_color: theme.hairline,
+                border_width: 1.0 * scale,
                 shadow_color: theme.shadow_soft,
                 shadow_offset: [0.0, 1.0 * scale],
                 shadow_blur: 3.0 * scale,
@@ -4014,7 +5997,7 @@ fn paint_node(
                 radii: CornerRadii::all(8.0).scale(scale),
                 fill: theme.control_thumb,
                 border_color: theme.hairline,
-                border_width: 1.0,
+                border_width: 1.0 * scale,
                 shadow_color: theme.shadow_elevated,
                 shadow_offset: [0.0, 1.5 * scale],
                 shadow_blur: 4.0 * scale,
@@ -4060,8 +6043,8 @@ fn paint_node(
                 let s = snap_char_boundary(&val, start.min(end));
                 let e = snap_char_boundary(&val, start.max(end));
                 if s != e {
-                    let x1 = lookup_offset_x(char_offsets, s);
-                    let x2 = lookup_offset_x(char_offsets, e);
+                    let x1 = _lookup_offset_x(char_offsets, s);
+                    let x2 = _lookup_offset_x(char_offsets, e);
                     let sel_rect = Rect::new(text_x + x1, text_y - 1.0, (x2 - x1).max(2.0), 18.0);
                     pctx.ctx.push_sdf(SdfQuad {
                         rect: snap_rect_to_pixels(sel_rect, scale),
@@ -4073,14 +6056,16 @@ fn paint_node(
             }
 
             if val.is_empty() {
-                pctx.ctx.push_text(placeholder_block, text_x, text_y);
+                pctx.ctx
+                    .push_text_colored(placeholder_block, text_x, text_y, theme.text_tertiary);
             } else {
-                pctx.ctx.push_text(text_block, text_x, text_y);
+                pctx.ctx
+                    .push_text_colored(text_block, text_x, text_y, theme.text_primary);
             }
 
             if is_focused && pctx.caret_visible {
                 let safe_cursor = snap_char_boundary(&val, *cursor);
-                let caret_offset_x = lookup_offset_x(char_offsets, safe_cursor);
+                let caret_offset_x = _lookup_offset_x(char_offsets, safe_cursor);
                 let caret_x = text_x + caret_offset_x;
                 let caret_rect = Rect::new(caret_x, text_y + 1.0, 1.5, 16.0);
                 pctx.ctx.push_sdf(SdfQuad {
@@ -4130,48 +6115,31 @@ fn paint_node(
             if let Some((start, end)) = *selection {
                 let s = snap_char_boundary(&val, start.min(end));
                 let e = snap_char_boundary(&val, start.max(end));
-                if s < e {
-                    for line in line_index_at(&val, s)..=line_index_at(&val, e) {
-                        let (ls, le) = line_range(&val, line);
-                        let line_s = s.max(ls).min(le);
-                        let line_e = e.min(le).max(line_s);
-                        if line_s < line_e {
-                            let x1 = text_block.x_offset_for_byte(line, line_s);
-                            let x2 = text_block.x_offset_for_byte(line, line_e);
-                            let sel_rect = Rect::new(
-                                text_x + x1,
-                                text_y + text_block.line_y(line) - 2.0,
-                                (x2 - x1).max(2.0),
-                                18.0,
-                            );
-                            pctx.ctx.push_sdf(SdfQuad {
-                                rect: snap_rect_to_pixels(sel_rect, scale),
-                                radii: CornerRadii::all(3.0).scale(scale),
-                                fill: Color::rgba(
-                                    theme.accent.r,
-                                    theme.accent.g,
-                                    theme.accent.b,
-                                    0.28,
-                                ),
-                                ..Default::default()
-                            });
-                        }
-                    }
+                text_block.collect_selection_rects(s, e, pctx.selection_scratch);
+                for i in 0..pctx.selection_scratch.len() {
+                    let (sx, sy, sw) = pctx.selection_scratch[i];
+                    let sel_rect = Rect::new(text_x + sx, text_y + sy, sw, 18.0);
+                    pctx.ctx.push_sdf(SdfQuad {
+                        rect: snap_rect_to_pixels(sel_rect, scale),
+                        radii: CornerRadii::all(3.0).scale(scale),
+                        fill: Color::rgba(theme.accent.r, theme.accent.g, theme.accent.b, 0.28),
+                        ..Default::default()
+                    });
                 }
             }
 
             if val.is_empty() {
-                pctx.ctx.push_text(placeholder_block, text_x, text_y);
+                pctx.ctx
+                    .push_text_colored(placeholder_block, text_x, text_y, theme.text_tertiary);
             } else {
-                pctx.ctx.push_text(text_block, text_x, text_y);
+                pctx.ctx
+                    .push_text_colored(text_block, text_x, text_y, theme.text_primary);
             }
 
             if is_focused && pctx.caret_visible {
                 let safe_cursor = snap_char_boundary(&val, *cursor);
-                let line = line_index_at(&val, safe_cursor);
-                let caret_x = text_x + text_block.x_offset_for_byte(line, safe_cursor);
-                let caret_y = text_y + text_block.line_y(line) + 1.0;
-                let caret_rect = Rect::new(caret_x, caret_y, 1.5, 16.0);
+                let (cy, cx) = text_block.caret_pos_for_byte(safe_cursor);
+                let caret_rect = Rect::new(text_x + cx, text_y + cy + 1.0, 1.5, 16.0);
                 pctx.ctx.push_sdf(SdfQuad {
                     rect: snap_rect_to_pixels(caret_rect, scale),
                     fill: theme.accent,
@@ -4211,8 +6179,12 @@ fn paint_node(
             for (i, label) in labels.iter().enumerate() {
                 let item_cx = bounds.x + 2.0 + (i as f32 + 0.5) * tab_w;
                 let lw = label_widths.get(i).copied().unwrap_or(0.0);
-                pctx.ctx
-                    .push_text(label, item_cx - lw * 0.5, bounds.y + 6.0);
+                pctx.ctx.push_text_colored(
+                    label,
+                    item_cx - lw * 0.5,
+                    bounds.y + 6.0,
+                    theme.text_primary,
+                );
             }
         }
         WidgetPayload::Dropdown {
@@ -4230,10 +6202,19 @@ fn paint_node(
                 .unwrap_or(0)
                 .min(items.len().saturating_sub(1));
             if let Some(lbl) = labels.get(selected) {
-                pctx.ctx.push_text(lbl, bounds.x + 12.0, bounds.y + 7.0);
+                pctx.ctx.push_text_colored(
+                    lbl,
+                    bounds.x + 12.0,
+                    bounds.y + 7.0,
+                    theme.text_primary,
+                );
             }
-            pctx.ctx
-                .push_text(chevron, bounds.x + bounds.width - 20.0, bounds.y + 8.0);
+            pctx.ctx.push_text_colored(
+                chevron,
+                bounds.x + bounds.width - 20.0,
+                bounds.y + 8.0,
+                theme.text_secondary,
+            );
 
             if *is_open {
                 pctx.overlays.push(OverlayRenderRecord {
@@ -4244,10 +6225,16 @@ fn paint_node(
                 });
             }
         }
-        WidgetPayload::CustomGpuSurface { radius, state, .. } => {
+        WidgetPayload::CustomGpuSurface {
+            radius,
+            animate_signal,
+            resolution_scale,
+            state,
+            ..
+        } => {
             let snapped = snap_rect_to_pixels(bounds, scale);
-            let pw = (snapped.width as u32).max(1);
-            let ph = (snapped.height as u32).max(1);
+            let pw = ((snapped.width * *resolution_scale).round() as u32).max(1);
+            let ph = ((snapped.height * *resolution_scale).round() as u32).max(1);
             let mut st = state.borrow_mut();
 
             let gpu = pctx.ctx.gpu_mut();
@@ -4259,26 +6246,34 @@ fn paint_node(
                 st.view = Some(view);
                 st.handle = Some(handle);
                 st.size = (pw, ph);
+                st.rendered_once = false;
             }
 
+            let should_render = !st.rendered_once
+                || animate_signal
+                    .as_ref()
+                    .is_some_and(|s| s.try_get().unwrap_or(false));
             let view = st.view.clone();
             if let (Some(view), Some(handle)) = (view, st.handle) {
-                let mut encoder =
-                    gpu.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("SteelUI CustomGpuSurface Encoder"),
-                        });
-                st.pass.render(
-                    &gpu.device,
-                    &gpu.queue,
-                    &mut encoder,
-                    &view,
-                    ATLAS_FORMAT,
-                    pw,
-                    ph,
-                    pctx.time_secs,
-                );
-                gpu.queue.submit(std::iter::once(encoder.finish()));
+                if should_render {
+                    let mut encoder =
+                        gpu.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("Cadmium CustomGpuSurface Encoder"),
+                            });
+                    st.pass.render(
+                        &gpu.device,
+                        &gpu.queue,
+                        &mut encoder,
+                        &view,
+                        ATLAS_FORMAT,
+                        pw,
+                        ph,
+                        pctx.time_secs,
+                    );
+                    gpu.queue.submit(std::iter::once(encoder.finish()));
+                    st.rendered_once = true;
+                }
 
                 pctx.ctx.push_image(ImageQuad {
                     rect: snapped,
@@ -4377,7 +6372,7 @@ fn paint_node(
                     } else if is_hov {
                         theme.control_hover
                     } else {
-                        Color::from_rgba8(255, 255, 255, 215)
+                        theme.panel_bg
                     };
 
                     pctx.ctx.push_sdf(SdfQuad {
@@ -4385,24 +6380,32 @@ fn paint_node(
                         radii: CornerRadii::all(8.0).scale(scale),
                         fill,
                         border_color: if is_sel { theme.accent } else { theme.hairline },
-                        border_width: 1.0,
+                        border_width: 1.0 * scale,
                         ..Default::default()
                     });
 
-                    let slot = &mut st.pool[slot_idx];
-                    slot.title.set_color(if is_sel {
-                        theme.accent
-                    } else {
-                        theme.text_primary
-                    });
-                    pctx.ctx
-                        .push_text(&slot.title, row_rect.x + 14.0, row_rect.y + 7.0);
-                    pctx.ctx
-                        .push_text(&slot.subtitle, row_rect.x + 14.0, row_rect.y + 25.0);
-                    pctx.ctx.push_text(
+                    let slot = &st.pool[slot_idx];
+                    pctx.ctx.push_text_colored(
+                        &slot.title,
+                        row_rect.x + 14.0,
+                        row_rect.y + 7.0,
+                        if is_sel {
+                            theme.accent
+                        } else {
+                            theme.text_primary
+                        },
+                    );
+                    pctx.ctx.push_text_colored(
+                        &slot.subtitle,
+                        row_rect.x + 14.0,
+                        row_rect.y + 25.0,
+                        theme.text_secondary,
+                    );
+                    pctx.ctx.push_text_colored(
                         &slot.badge,
                         row_rect.x + row_rect.width - slot.badge_width - 14.0,
                         row_rect.y + (item_h - 16.0) * 0.5,
+                        theme.text_secondary,
                     );
                 }
             }
@@ -4410,8 +6413,9 @@ fn paint_node(
             pctx.ctx.pop_clip();
 
             if total_h > viewport.height {
-                let track_h = viewport.height - 8.0;
-                let thumb_h = ((viewport.height / total_h) * track_h).clamp(24.0, track_h);
+                let track_h = (viewport.height - 8.0).max(0.0);
+                let thumb_h =
+                    ((viewport.height / total_h) * track_h).clamp(24.0_f32.min(track_h), track_h);
                 let max_scroll = (total_h - viewport.height).max(1.0);
                 let thumb_t = (scroll_val / max_scroll).clamp(0.0, 1.0);
                 let thumb_y = viewport.y + 4.0 + thumb_t * (track_h - thumb_h);
@@ -4439,8 +6443,9 @@ fn paint_node(
             pctx.ctx.pop_clip();
 
             if *content_height > viewport.height {
-                let track_h = viewport.height - 8.0;
-                let thumb_h = ((viewport.height / *content_height) * track_h).clamp(24.0, track_h);
+                let track_h = (viewport.height - 8.0).max(0.0);
+                let thumb_h = ((viewport.height / *content_height) * track_h)
+                    .clamp(24.0_f32.min(track_h), track_h);
                 let max_scroll = (*content_height - viewport.height).max(1.0);
                 let thumb_t = (scroll_y.value / max_scroll).clamp(0.0, 1.0);
                 let thumb_y = viewport.y + 4.0 + thumb_t * (track_h - thumb_h);
@@ -4470,7 +6475,7 @@ fn paint_node(
                     radii: CornerRadii::all(rect.width * 0.5),
                     fill,
                     border_color: theme.traffic_border,
-                    border_width: 1.0,
+                    border_width: 1.0 * scale,
                     ..Default::default()
                 });
             }
@@ -4626,6 +6631,118 @@ fn find_context_menu_node(
     None
 }
 
+fn widget_screen_bounds(
+    wid: WidgetId,
+    nodes: &SlotMap<WidgetId, WidgetNode>,
+    target: WidgetId,
+    offset: (f32, f32),
+) -> Option<Rect> {
+    let node = nodes.get(wid)?;
+    let bounds = Rect::new(
+        node.bounds.x + offset.0,
+        node.bounds.y + offset.1,
+        node.bounds.width,
+        node.bounds.height,
+    );
+    if wid == target {
+        return Some(bounds);
+    }
+    let child_offset = match &node.payload {
+        WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
+        _ => offset,
+    };
+    for &child in &node.children {
+        if let Some(found) = widget_screen_bounds(child, nodes, target, child_offset) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn dispatch_scroll_node(
+    wid: WidgetId,
+    nodes: &mut SlotMap<WidgetId, WidgetNode>,
+    cx: f32,
+    cy: f32,
+    delta_y: f32,
+    offset: (f32, f32),
+) -> bool {
+    let Some(node) = nodes.get(wid) else {
+        return false;
+    };
+    let bounds = Rect::new(
+        node.bounds.x + offset.0,
+        node.bounds.y + offset.1,
+        node.bounds.width,
+        node.bounds.height,
+    );
+    if !bounds.contains(cx, cy) {
+        return false;
+    }
+
+    let child_offset = match &node.payload {
+        WidgetPayload::ScrollView { scroll_y, .. } => (offset.0, offset.1 - scroll_y.value),
+        _ => offset,
+    };
+
+    let children = node.children.clone();
+    for child in children.into_iter().rev() {
+        if dispatch_scroll_node(child, nodes, cx, cy, delta_y, child_offset) {
+            return true;
+        }
+    }
+
+    let Some(node) = nodes.get_mut(wid) else {
+        return false;
+    };
+    match &mut node.payload {
+        WidgetPayload::VirtualizedList { state } => {
+            let mut st = state.borrow_mut();
+            let stride = st.item_height + st.gap;
+            let total_h = if st.item_count == 0 {
+                0.0
+            } else {
+                st.item_count as f32 * stride - st.gap
+            };
+            let max_scroll = (total_h - bounds.height).max(0.0);
+            if max_scroll > 0.0 {
+                let next = (st.scroll_y.target - delta_y).clamp(0.0, max_scroll);
+                st.scroll_y.set_target(next);
+                return true;
+            }
+            false
+        }
+        WidgetPayload::ScrollView {
+            scroll_y,
+            content_height,
+            ..
+        } => {
+            let max_scroll = (*content_height - bounds.height).max(0.0);
+            if max_scroll > 0.0 {
+                let next = (scroll_y.target - delta_y).clamp(0.0, max_scroll);
+                scroll_y.set_target(next);
+                return true;
+            }
+            false
+        }
+        WidgetPayload::TextArea {
+            text_block,
+            scroll_y,
+            ..
+        } => {
+            let line_count = text_block.line_start_offsets().len().max(1);
+            let content_h = line_count as f32 * text_block.style().line_height;
+            let max_scroll = (content_h - (bounds.height - 20.0)).max(0.0);
+            if max_scroll > 0.0 {
+                *scroll_y = (*scroll_y - delta_y).clamp(0.0, max_scroll);
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 fn hit_test_node(
     wid: WidgetId,
     nodes: &SlotMap<WidgetId, WidgetNode>,
@@ -4693,10 +6810,19 @@ fn hit_test_node(
                 | WidgetPayload::Switch { .. }
                 | WidgetPayload::Slider { .. }
                 | WidgetPayload::TextInput { .. }
+                | WidgetPayload::TextArea { .. }
                 | WidgetPayload::Tabs { .. }
                 | WidgetPayload::Dropdown { .. }
                 | WidgetPayload::TrafficLights { .. }
                 | WidgetPayload::VirtualizedList { .. }
+                | WidgetPayload::Image {
+                    on_click: Some(_),
+                    ..
+                }
+                | WidgetPayload::Container {
+                    on_click: Some(_),
+                    ..
+                }
         )
     {
         return Some(wid);
@@ -4799,7 +6925,7 @@ fn render_material(
                 radii: CornerRadii::all(radius).scale(scale),
                 tint,
                 border_color,
-                border_width,
+                border_width: border_width * scale,
                 saturation: 1.35,
                 specular,
                 frost,
@@ -4835,7 +6961,7 @@ fn render_material(
                 radii: CornerRadii::all(radius).scale(scale),
                 tint,
                 border_color,
-                border_width,
+                border_width: border_width * scale,
                 saturation: 1.25,
                 specular,
                 frost,

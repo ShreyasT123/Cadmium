@@ -39,7 +39,8 @@ pub fn rasterize_svg(svg: &str, width: u32, height: u32) -> Result<DecodedImage,
 
     // Convert premultiplied tiny-skia RGBA to straight RGBA8
     let mut rgba = pixmap.take();
-    for px in rgba.as_chunks_mut::<4>().0 {
+    #[allow(clippy::chunks_exact_to_as_chunks)] // MSRV 1.85: as_chunks_mut requires Rust 1.88
+    for px in rgba.chunks_exact_mut(4) {
         let a = px[3];
         if a > 0 && a < 255 {
             let af = a as f32 / 255.0;

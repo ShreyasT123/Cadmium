@@ -34,7 +34,12 @@ impl FrameProfiler {
     }
 
     pub fn record_cadence(&mut self, frame_dt_secs: f32) {
-        if frame_dt_secs > 0.0005 && frame_dt_secs < 0.20 {
+        if frame_dt_secs >= 0.045 {
+            self.cadence_samples.clear();
+            self.metrics.effective_fps = 0.0;
+            return;
+        }
+        if frame_dt_secs > 0.001 {
             if self.cadence_samples.len() == self.max_samples {
                 self.cadence_samples.pop_front();
             }

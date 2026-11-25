@@ -108,16 +108,60 @@ impl Edges {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionMode {
+    Relative,
+    Absolute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Inset {
+    pub left: Length,
+    pub right: Length,
+    pub top: Length,
+    pub bottom: Length,
+}
+
+impl Inset {
+    pub const AUTO: Self = Self {
+        left: Length::Auto,
+        right: Length::Auto,
+        top: Length::Auto,
+        bottom: Length::Auto,
+    };
+
+    pub const fn all(v: Length) -> Self {
+        Self {
+            left: v,
+            right: v,
+            top: v,
+            bottom: v,
+        }
+    }
+}
+
+impl Default for Inset {
+    fn default() -> Self {
+        Self::AUTO
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutStyle {
+    pub hidden: bool,
+    pub position: PositionMode,
+    pub inset: Inset,
     pub direction: FlexDir,
     pub width: Length,
     pub height: Length,
     pub min_width: Length,
     pub min_height: Length,
+    pub max_width: Length,
+    pub max_height: Length,
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub padding: Edges,
+    pub margin: Edges,
     pub gap: f32,
     pub align_items: Option<AlignItems>,
     pub justify_content: Option<JustifyContent>,
@@ -126,14 +170,20 @@ pub struct LayoutStyle {
 impl Default for LayoutStyle {
     fn default() -> Self {
         Self {
+            hidden: false,
+            position: PositionMode::Relative,
+            inset: Inset::AUTO,
             direction: FlexDir::Column,
             width: Length::Auto,
             height: Length::Auto,
             min_width: Length::Auto,
             min_height: Length::Auto,
+            max_width: Length::Auto,
+            max_height: Length::Auto,
             flex_grow: 0.0,
             flex_shrink: 1.0,
             padding: Edges::ZERO,
+            margin: Edges::ZERO,
             gap: 0.0,
             align_items: None,
             justify_content: None,
@@ -145,7 +195,21 @@ impl From<LayoutStyle> for Style {
     fn from(s: LayoutStyle) -> Self {
         let base = Style::default();
         Style {
-            display: Display::Flex,
+            display: if s.hidden {
+                Display::None
+            } else {
+                Display::Flex
+            },
+            position: match s.position {
+                PositionMode::Relative => Position::Relative,
+                PositionMode::Absolute => Position::Absolute,
+            },
+            inset: taffy::Rect {
+                left: s.inset.left.into(),
+                right: s.inset.right.into(),
+                top: s.inset.top.into(),
+                bottom: s.inset.bottom.into(),
+            },
             flex_direction: match s.direction {
                 FlexDir::Row => FlexDirection::Row,
                 FlexDir::Column => FlexDirection::Column,
@@ -158,6 +222,10 @@ impl From<LayoutStyle> for Style {
                 width: s.min_width.into(),
                 height: s.min_height.into(),
             },
+            max_size: Size {
+                width: s.max_width.into(),
+                height: s.max_height.into(),
+            },
             flex_grow: s.flex_grow,
             flex_shrink: s.flex_shrink,
             padding: taffy::Rect {
@@ -165,6 +233,12 @@ impl From<LayoutStyle> for Style {
                 right: LengthPercentage::length(s.padding.right),
                 top: LengthPercentage::length(s.padding.top),
                 bottom: LengthPercentage::length(s.padding.bottom),
+            },
+            margin: taffy::Rect {
+                left: LengthPercentageAuto::length(s.margin.left),
+                right: LengthPercentageAuto::length(s.margin.right),
+                top: LengthPercentageAuto::length(s.margin.top),
+                bottom: LengthPercentageAuto::length(s.margin.bottom),
             },
             gap: Size {
                 width: LengthPercentage::length(s.gap),
@@ -182,12 +256,14 @@ impl From<LayoutStyle> for Style {
 
 pub struct LayoutEngine {
     tree: TaffyTree<()>,
+    rect_scratch: Vec<(LayoutNode, Rect)>,
 }
 
 impl LayoutEngine {
     pub fn new() -> Self {
         Self {
             tree: TaffyTree::new(),
+            rect_scratch: Vec::new(),
         }
     }
 
@@ -269,6 +345,55 @@ impl LayoutEngine {
                 )
             })
             .expect("Taffy layout computation");
+    }
+
+    /// Computes layout rooted at a relayout boundary (`boundary`) without walking ancestors.
+    pub fn compute_subtree_with_measure<F>(
+        &mut self,
+        boundary: LayoutNode,
+        width: f32,
+        height: f32,
+        measure: F,
+    ) where
+        F: FnMut(LayoutNode, Option<f32>, Option<f32>, Option<f32>, Option<f32>) -> (f32, f32),
+    {
+        self.compute_with_measure(boundary, width, height, measure);
+    }
+
+    /// Collects logical rects relative to `origin` into an internal reusable scratch buffer.
+    pub fn collect_logical_rects_into(
+        &mut self,
+        root: LayoutNode,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> &[(LayoutNode, Rect)] {
+        self.rect_scratch.clear();
+        let mut out = std::mem::take(&mut self.rect_scratch);
+        self.walk_rects_vec(root.0, origin_x, origin_y, &mut out);
+        self.rect_scratch = out;
+        &self.rect_scratch
+    }
+
+    fn walk_rects_vec(
+        &self,
+        node: NodeId,
+        parent_x: f32,
+        parent_y: f32,
+        out: &mut Vec<(LayoutNode, Rect)>,
+    ) {
+        if let Ok(layout) = self.tree.layout(node) {
+            let x = parent_x + layout.location.x;
+            let y = parent_y + layout.location.y;
+            out.push((
+                LayoutNode(node),
+                Rect::new(x, y, layout.size.width, layout.size.height),
+            ));
+            if let Ok(children) = self.tree.children(node) {
+                for child in children {
+                    self.walk_rects_vec(child, x, y, out);
+                }
+            }
+        }
     }
 
     pub fn collect_logical_rects(&self, root: LayoutNode) -> HashMap<LayoutNode, Rect> {

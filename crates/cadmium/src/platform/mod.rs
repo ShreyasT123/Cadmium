@@ -1,25 +1,49 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 use crate::core::SteelError;
 
+thread_local! {
+    static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+
 pub struct Clipboard;
 
 impl Clipboard {
+    fn with_instance<R>(
+        f: impl Fn(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
+    ) -> Result<R, SteelError> {
+        CLIPBOARD.with(|slot| {
+            let mut guard = slot.borrow_mut();
+            if guard.is_none() {
+                *guard = Some(
+                    arboard::Clipboard::new()
+                        .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?,
+                );
+            }
+            match f(guard.as_mut().expect("clipboard initialized")) {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    // Reconnect once if display server/clipboard owner reset
+                    *guard = Some(
+                        arboard::Clipboard::new()
+                            .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?,
+                    );
+                    f(guard.as_mut().expect("clipboard reinitialized"))
+                        .map_err(|e| SteelError::Platform(format!("Clipboard op: {e}")))
+                }
+            }
+        })
+    }
+
     pub fn get_text() -> Result<String, SteelError> {
-        let mut cb = arboard::Clipboard::new()
-            .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?;
-        cb.get_text()
-            .map_err(|e| SteelError::Platform(format!("Clipboard read: {e}")))
+        Self::with_instance(|cb| cb.get_text())
     }
 
     pub fn set_text(text: &str) -> Result<(), SteelError> {
-        let mut cb = arboard::Clipboard::new()
-            .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?;
-        cb.set_text(text)
-            .map_err(|e| SteelError::Platform(format!("Clipboard write: {e}")))
+        Self::with_instance(|cb| cb.set_text(text))
     }
 }
-
 pub struct FileDialog;
 
 impl FileDialog {

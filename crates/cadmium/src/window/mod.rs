@@ -88,6 +88,16 @@ impl<'a> FrameContext<'a> {
     ) {
         self.draw_list.push_stroke_path(path, color, width);
     }
+    pub fn push_text_colored(
+        &mut self,
+        block: &crate::text::TextBlock,
+        logical_x: f32,
+        logical_y: f32,
+        color: Color,
+    ) {
+        self.draw_list
+            .push_text_colored(self.gpu, block, logical_x, logical_y, Some(color));
+    }
 
     pub fn push_clip(&mut self, rect: crate::core::Rect) {
         self.draw_list.push_clip(rect);
@@ -124,6 +134,7 @@ pub trait WindowDelegate: 'static {
     fn on_pointer_up(&mut self) -> bool {
         false
     }
+
     fn on_scroll(&mut self, _delta_x: f32, _delta_y: f32) -> bool {
         false
     }
@@ -144,6 +155,9 @@ pub trait WindowDelegate: 'static {
         false
     }
     fn render(&mut self, ctx: &mut FrameContext<'_>);
+    fn on_window_focus(&mut self, _focused: bool) -> bool {
+        false
+    }
 }
 
 pub struct WindowSpec {
@@ -169,6 +183,7 @@ struct WindowContext {
     last_tick: Instant,
     last_present: Instant,
     last_cursor: CursorIcon,
+    is_animating: bool,
     scheduled_redraw: Option<Instant>,
     delegate: Box<dyn WindowDelegate>,
 }
@@ -253,12 +268,16 @@ impl WindowContext {
         self.last_tick = now;
         let animating = self.delegate.tick(dt);
 
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+        let (frame, was_suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                drop(frame);
-                self.handle_surface_fault(gpu);
-                return;
+                let size = self.window.inner_size();
+                if size.width != self.config.width || size.height != self.config.height {
+                    drop(frame);
+                    self.handle_surface_fault(gpu);
+                    return;
+                }
+                (frame, true)
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.handle_surface_fault(gpu);
@@ -308,6 +327,9 @@ impl WindowContext {
         );
 
         gpu.queue.present(frame);
+        if was_suboptimal {
+            self.handle_surface_fault(gpu);
+        }
         self.last_present = Instant::now();
 
         if self.a11y_active
@@ -317,7 +339,8 @@ impl WindowContext {
                 .update_if_active(|| accessibility::to_accesskit_update(&tree));
         }
 
-        if animating || atlas_overflowed {
+        self.is_animating = animating || atlas_overflowed;
+        if self.is_animating {
             self.scheduled_redraw = None;
             self.window.request_redraw();
         } else {
@@ -416,32 +439,53 @@ impl App {
         let accesskit = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, proxy);
         window.set_visible(true);
 
-        let instance = match gpu {
-            Some(ctx) => ctx.instance.clone(),
-            None => {
+        let (surface, created_gpu) = if let Some(ctx) = gpu.as_ref() {
+            (ctx.instance.create_surface(window.clone())?, None)
+        } else {
+            let make_instance = |backends: wgpu::Backends| {
                 let mut desc = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
                     event_loop.owned_display_handle(),
                 ));
                 if cfg!(not(debug_assertions)) {
                     desc.flags = wgpu::InstanceFlags::empty();
                 }
+                desc.backends = backends;
                 #[cfg(target_os = "windows")]
                 {
-                    desc.backends = wgpu::Backends::DX12;
                     desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
                 }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    desc.backends = wgpu::Backends::PRIMARY;
-                }
                 wgpu::Instance::new(desc)
+            };
+
+            #[cfg(target_os = "windows")]
+            let primary_backends = wgpu::Backends::DX12;
+            #[cfg(not(target_os = "windows"))]
+            let primary_backends = wgpu::Backends::PRIMARY;
+
+            let instance = make_instance(primary_backends);
+            let surface = instance.create_surface(window.clone())?;
+            match pollster::block_on(GpuContext::new(instance, Some(&surface))) {
+                Ok(ctx) => (surface, Some(ctx)),
+                Err(primary_err) => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        tracing::warn!("DX12 init failed ({primary_err}); falling back to Vulkan");
+                        drop(surface);
+                        let vk_instance = make_instance(wgpu::Backends::VULKAN);
+                        let vk_surface = vk_instance.create_surface(window.clone())?;
+                        let ctx =
+                            pollster::block_on(GpuContext::new(vk_instance, Some(&vk_surface)))?;
+                        (vk_surface, Some(ctx))
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        return Err(primary_err);
+                    }
+                }
             }
         };
 
-        let surface = instance.create_surface(window.clone())?;
-
-        if gpu.is_none() {
-            let ctx = pollster::block_on(GpuContext::new(instance, Some(&surface)))?;
+        if let Some(ctx) = created_gpu {
             *gpu = Some(ctx);
         }
 
@@ -506,6 +550,7 @@ impl App {
                 last_tick: Instant::now(),
                 last_present: Instant::now(),
                 last_cursor: CursorIcon::Default,
+                is_animating: false,
                 scheduled_redraw: None,
                 delegate: spec.delegate,
             },
@@ -615,6 +660,17 @@ impl ApplicationHandler<SteelEvent> for App {
                     super_key: state.super_key(),
                 };
             }
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.modifiers = Modifiers::default();
+                }
+                if let Some(win) = self.windows.get_mut(&id)
+                    && win.delegate.on_window_focus(focused)
+                {
+                    reactive::flush_effects();
+                    win.window.request_redraw();
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
@@ -624,7 +680,6 @@ impl ApplicationHandler<SteelEvent> for App {
                     && win.delegate.on_scroll(dx, dy)
                 {
                     reactive::flush_effects();
-                    win.last_tick = Instant::now();
                     win.window.request_redraw();
                 }
             }
@@ -640,7 +695,6 @@ impl ApplicationHandler<SteelEvent> for App {
                         && win.delegate.on_key(&steel_key, text, &self.modifiers)
                     {
                         reactive::flush_effects();
-                        win.last_tick = Instant::now();
                         win.window.request_redraw();
                     }
                 }
@@ -710,6 +764,7 @@ impl ApplicationHandler<SteelEvent> for App {
                         win.window.set_cursor(CursorIcon::Default);
                     }
                     if win.delegate.on_pointer_move(-1.0, -1.0) {
+                        reactive::flush_effects();
                         win.window.request_redraw();
                     }
                 }
@@ -724,7 +779,6 @@ impl ApplicationHandler<SteelEvent> for App {
                     && win.delegate.on_secondary_down(lx, ly)
                 {
                     reactive::flush_effects();
-                    win.last_tick = Instant::now();
                     win.window.request_redraw();
                 }
             }
@@ -780,7 +834,6 @@ impl ApplicationHandler<SteelEvent> for App {
                     }
                     WindowCommand::None => {
                         if redraw && let Some(win) = self.windows.get_mut(&id) {
-                            win.last_tick = Instant::now();
                             win.window.request_redraw();
                         }
                     }
@@ -795,7 +848,6 @@ impl ApplicationHandler<SteelEvent> for App {
                     && win.delegate.on_pointer_up()
                 {
                     reactive::flush_effects();
-                    win.last_tick = Instant::now();
                     win.window.request_redraw();
                 }
             }

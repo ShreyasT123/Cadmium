@@ -1,110 +1,133 @@
-# SteelUI & Magnum Roadmap
+# Cadmium & Magnum Roadmap to v1.0.0
 
 **Current Version:** 0.1.0  
-**Status:** Active Development (Spiral Model)  
-**Primary Graphics API:** `wgpu` (WGSL)  
-**Core Rendering Engine:** Magnum  
-
-This document outlines the phased development roadmap for SteelUI and its custom rendering engine, Magnum.
-
----
-
-## Design Tenets
-
-1. **GPU-Native & Custom:** No Chromium, Electron, WebViews, Skia wrappers, or native widget abstractions. The Magnum pipeline owns all GPU draws, batching, and shaders.
-2. **Three First-Class Visual Modes:**
-   - **Classic UI:** Clean native desktop styling, solid surfaces, 1px hairlines, and soft elevation shadows.
-   - **Frosted Glass:** Classic macOS translucent vibrancy via multi-pass Gaussian / Dual-Kawase blur.
-   - **Liquid Glass:** Advanced optical lens refraction, chromatic dispersion (prism RGB split), and directional specular highlights.
-3. **Predictable Rust Ownership:** Generational arena-backed retained widget trees (`slotmap`) and copyable `Signal<T>` handles. Zero borrow-checker fights for application developers.
-4. **Performance by Default:** Zero CPU/GPU redraws when idle. Sub-millisecond layout passes via Taffy, batched draw calls, and physical pixel snapping.
+**Target:** v1.0.0 Industry-Ready Release  
+**Graphics Backend:** `wgpu` 30 (Magnum Engine)  
+**Primary Validation Apps:**
+1. **Cadmium Music** (`apps/dogfood`) — Apple Music–inspired desktop player showcasing **Classic**, **Frosted Glass**, and **Liquid Glass** optical shaders, live audio/visualizer `CustomGpuSurface`, virtualized track libraries, and fluid spring motion.
+2. **Cadmium Zedis** (`apps/zedis` / benchmark suite) — Recreation of [`vicanso/zedis`](https://github.com/vicanso/zedis) (GPUI-based Redis GUI) to directly stress-test and benchmark Cadmium against GPUI, Iced, Slint, and Dioxus Native on real workstation workloads.
 
 ---
 
-## Milestones
+## Architectural Competitive Edge
 
-### Phase 1: Engine Foundation & Magnum Core (Completed)
-- [x] Multi-window runtime with shared process-wide `GpuContext`.
-- [x] Canonical offscreen render target (`Rgba8UnormSrgb`) with swapchain presentation blit.
-- [x] Instanced SDF primitive shader (`sdf.wgsl`) with anti-aliasing, rounded corners, linear gradients, and drop shadows.
-- [x] Multi-mip blur pyramid (`blur.wgsl`) for translucent backdrops.
-- [x] 2-texture Optical Liquid Glass shader (`glass.wgsl`) with convex bezel refraction and chromatic aberration.
-- [x] Glyph atlas text shaping and rendering (`cosmic-text` + `swash`).
-- [x] PNG/JPEG/WebP texture loading and SVG rasterization (`resvg`).
-- [x] Time-based spring physics engine (`Spring`).
-
-### Phase 2: Reactive Runtime & Widget Arena (Completed)
-- [x] Generational `WidgetArena` based on `slotmap::SlotMap`.
-- [x] Fine-grained reactive `Signal<T>` and `create_effect` dependency tracking.
-- [x] Three-stage dirty pipeline (`STATE` → `LAYOUT` → `PAINT`).
-- [x] Thread-safe `UiDispatcher` for async background workers.
-- [x] Taffy 0.15 layout wrapper with leaf measurement bridge and fractional DPI pixel snapping.
-- [x] Platform abstractions: Clipboard (`arboard`) and Native File Dialogs (`rfd`).
-- [x] Accessibility tree builder bridge (`accesskit`).
-- [x] Working dogfood workspace application (`apps/dogfood`).
-- [x] Interactive Liquid Glass showcase (`examples/liquid_glass`).
+Modern Rust GUI benchmarks highlight two critical bottlenecks in existing frameworks:
+- **Immediate & view-rebuilding models** (`egui`, `Iced` diffing, `GPUI` view notify) scale with **tree size** on localized edits unless heavily manual-memoized.
+- **Cadmium's bet** is **Generational Retained Arena (`slotmap`) + Run-Once Fine-Grained Signals (`O(change)`) + Relayout Boundaries + Subtree Display-List Caching + Batched Instanced SDF/Glass**.
 
 ---
 
-### Phase 3: Core Desktop Controls & Input Subsystems (Completed)
-- [x] **Unified `Material` System in Magnum:**
-  - Consolidate surface styling into `Material::Classic`, `Material::Frosted`, and `Material::Liquid`.
-  - Support setting material polymorphically on any container, card, or button.
-- [x] **Hardware Scissor Clipping & `ScrollView`:**
-  - Viewport scissor rect clipping (`wgpu::RenderPass::set_scissor_rect`).
-  - Mouse wheel delta listener (`WindowEvent::MouseWheel`) with inertia spring damping.
-  - Dynamic scroll boundary calculation and customizable scrollbar indicators.
-- [x] **Desktop `TextInput` Engine:**
-  - Single-line text input with blinking caret pulse (sleeping when idle).
-  - Keyboard navigation: Left/Right arrows, Home/End, word jumps (`Ctrl`/`Cmd` + Arrow).
-  - Text selection range and highlight box rendering.
-  - Backspace, Delete, and clipboard copy/cut/paste integration (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`).
-  - Placeholder text and disabled states.
-- [x] **Core Interactive Controls:** `Tabs`, `Dropdown`, and `TrafficLights`.
-- [ ] **Floating Overlays & Portals:**
-  - `Portal` layer rendering floating elements outside parent clipping hierarchies.
-  - Context menu and tooltip system.
+## v1.0.0 Industry Performance SLAs (Non-Negotiable Exit Gates)
 
-### Next (Planned)
-- [ ] Live `AccessKit` adapter wiring: publish incremental updates, route semantic actions, and synchronize focus/bounds.
-- [ ] Dynamic vector paths via `lyon`: animated Bezier paths, splines, charts, and node wires.
-- [ ] `CustomGpuSurface`: embed custom `wgpu` render passes inside rounded, clipped layouts.
-- [ ] IME and multiline `TextArea`: composition strings, candidate placement, wrapped editing, and undo/redo.
+Measured via automated Criterion + headless/GPU harnesses (see `BENCHMARKS.md`):
+
+| Metric | Target (v1.0.0) | Competitive Reference |
+|---|---|---|
+| **Idle CPU / GPU usage** | `0.0%` CPU, `0` GPU submits | Matches/beats Iced & Slint |
+| **Localized edit (10k-node tree)** | `< 0.25 ms` CPU (O(change)) | Faster than GPUI (~10ms) & Slint (~5ms) |
+| **Row selection (1k / 10k list)** | `< 0.15 ms` | Faster than GPUI & Slint; parity w/ Iced |
+| **100,000-row virtualized scroll** | `< 1.0 ms` CPU frame, locked 120–144 FPS | Smooth parity with GPUI Zedis |
+| **Frame pacing (p95 / p99, complex UI)** | `< 4.0 ms` / `< 7.5 ms` @ 120Hz | Beats Tauri (~28/45ms) & GPUI (~12/18ms) |
+| **Steady-state heap allocations** | `0` per idle frame; near-zero in steady scroll | Zero GC pauses |
+| **Resident RAM (Music / Zedis app)** | `< 90 MB` RSS baseline (no large media) | < 25% of Electron, < 50% of Tauri |
+| **Cross-platform parity** | Identical layout, typography & glass on Win/macOS/Linux (100%–250% DPI) | Automated golden-image diff CI |
 
 ---
 
-### Phase 4: Advanced Graphics, Motion & Typography Polish
-- [ ] **Dynamic Vector Geometry:**
-  - Wire dynamic arbitrary Bezier paths and spline curves (`lyon` tessellation into vertex buffers).
-  - Path animation support for interactive graphs, timeline curves, and custom icons.
-- [ ] **Custom GPU Surfaces (`CustomGpuSurface`):**
-  - Dedicated widget allowing applications to embed raw custom `wgpu` render passes (e.g. 3D viewports, video frames, shader scopes) inside rounded/clipped layouts.
-- [ ] **Typography & IME Expansion:**
-  - Rich text formatting with mixed font weights, inline links, and color spans.
-  - Input Method Editor (IME) support for CJK composition strings and OS candidate popup placement.
-- [ ] **Multiline Text Editor (`TextArea`):**
-  - Multiline text editing with line wrapping, vertical cursor movement, and undo/redo stacks.
+## Milestones & Phased Plan
+
+### Phase 3.5 — Engineering Hardening & Foundation Fixes *(Immediate)*
+Fix all Critical/High defects from the 2026-11-25 audit before expanding surface area:
+- [ ] **TextArea & TextEngine Fixes:**
+  - Wire `TextArea` into `hit_test_node()`, `reset_caret_blink()`, and vertical `on_scroll` / caret-follow.
+  - Fix line-relative vs. global byte offset conversion and soft-wrap line mapping in `TextArea`.
+  - Enable `db.load_system_fonts()` on Windows for color emoji and CJK fallback.
+- [ ] **Renderer & Lifecycle Fixes:**
+  - Release `CustomGpuSurface` textures on `WidgetArena::clear()`; add generational `TextureHandle`.
+  - Prevent `GlyphAtlas` infinite redraw loop at `MAX_ATLAS_SIZE` (multi-page or bounded reset).
+  - Cull `DrawBatch::Glass` blur passes when occluded by `active_scissor`.
+  - Uniformly DPI-scale `border_width` and pass `scale` in `GlobalsUniform` to `glass.wgsl`.
+  - Delete dead `vector.wgsl`; allow Vulkan fallback on Windows (`PRIMARY`).
+- [ ] **Reactivity, Motion, Platform & A11y Fixes:**
+  - Remove duplicate `wake_cb` from `ReactiveRuntime::notify_write()`.
+  - Lower `Spring::step()` thresholds to `0.001` / `0.005` for smooth `[0..1]` animations.
+  - Persist `arboard::Clipboard` instance across calls (fixes X11/Wayland clipboard loss).
+  - Scale `AccessKit` bounds to physical pixels (`bounds.scale(scale)`).
+  - Make widget colors theme-reactive at paint time so `ThemeMode::Dark` works everywhere.
+  - Green CI (`cargo fmt --all`, `clippy -D warnings`, resolve 1.85 vs 1.88 MSRV).
 
 ---
 
-### Phase 5: Workspace Widgets & Large-Scale Dogfood App
-- [ ] **Workspace Layout Components:**
-  - Resizable split panes (`SplitPane`) with drag handles.
-  - Tab bars and dockable workspace panels (`DockArea`).
-  - Multi-window panel tear-off (dragging an internal panel out into an independent native window).
-- [ ] **Viewport Virtualization:**
-  - `VirtualizedList` and `TreeView` capable of smoothly scrolling 100,000+ items at 120–144 FPS with O(visible) layout and memory cost.
-- [ ] **Expand Dogfood Application:**
-  - Build out a full-featured creative workstation / code & asset inspector stress-testing docking, tabs, virtualization, and custom shader viewports.
+### Phase 4 — Visual Primitives, Typography & Cadmium Music (Dogfood v1)
+**Goal:** Replace the placeholder dogfood app with **Cadmium Music**—an Apple Music–inspired desktop app built for LinkedIn/Medium showcases and daily dogfooding.
+
+#### Core Library Deliverables
+- [ ] **Media & Graphics Primitives:**
+  - `Image` widget (async off-thread decode + LRU GPU texture cache, `Cover`/`Contain` scaling, rounded corners).
+  - `Icon` widget (`resvg` DPI-aware SVG atlas with LRU eviction + tinting).
+  - `Stack` / `Overlay` / `Portal` containers + `Absolute` positioning (`LayoutStyle::position`, `inset`).
+  - Analytical rounded shader clip stack (for rounded `ScrollView` / album cards / `CustomGpuSurface`).
+  - `FillTessellator` + path geometry cache + edge AA for `lyon` dynamic paths.
+  - Premultiplied-alpha flag on `ImageQuad` for translucent `CustomGpuSurface` compositing.
+- [ ] **Tier 1 Controls Completion:**
+  - `ProgressBar` / `ScrubberBar` (interactive seek bar with hover thumb & time tooltip).
+  - `Checkbox`, `RadioButton`, `Badge`, `Popover`, `Modal` / `Dialog`.
+  - `Button` / `IconButton` variants (Ghost, Glass Pill, Accent, Secondary) + icon-leading buttons.
+  - `ScrollView` horizontal support + inner-first scroll capture + parent-offset hit-testing.
+- [ ] **Typography, IME & Input Polish:**
+  - `Text` alignment (`Left`/`Center`/`Right`), ellipsis truncation, font family/italic/letter-spacing, embedded font loading (`load_font_bytes`), and rich-text spans.
+  - Full IME support (`set_ime_allowed`, `set_ime_cursor_area`, `Ime::Preedit` underline, `Ime::Commit`).
+  - `TextArea` undo/redo stack; double-click word select; `FocusManager` focus scopes (trap `Tab` in modals/menus).
+  - `WindowEvent::Focused(false)` cleanup; OS `prefers_reduced_motion` & system theme detection.
+- [ ] **Animation & Theme Tokens:**
+  - Easing curves (`Tween`) + staggered transitions + `create_memo` derived signals.
+  - Complete `MacTheme` tokens (radii, spacing, typography scales) + `serde` serialization.
+
+#### Showcase App 1: **Cadmium Music** (`apps/dogfood`)
+- [ ] **Translucent Frosted Sidebar:** Playlists, Listen Now, Browse, Radio, Library sections with hover states and active pill indicators.
+- [ ] **Liquid Glass Floating Now-Playing Bar:** Persistent bottom/top floating `Material::Liquid` pill with album thumbnail, track title/artist, play/pause/next/prev controls, optical refraction & specular edge highlights scrolling over vibrant album art.
+- [ ] **Hero Album / Listen Now View:** Cover artwork cards with dynamic ambient color glow, `ScrollView` with rounded clipping, and `CustomGpuSurface` live audio-spectrum / shader visualizer.
+- [ ] **Virtualized 100k-Track Library Table:** Instant filtering via `TextInput`, smooth 120–144 FPS scrolling, column headers, row hover/selection, right-click `ContextMenu`, and Light/Dark runtime theme toggle.
 
 ---
 
-### Phase 6: Optimization, Visual Regression & 1.0 Stabilization
-- [ ] **Profiling & Allocations Audit:**
-  - Zero heap allocations during steady-state frame rendering.
-  - GPU draw-call batching optimizations across complex multi-window workloads.
-- [ ] **Automated Headless Visual Regression Suite:**
-  - Offscreen headless `wgpu` frame rendering compared against golden reference PNGs across Windows, Linux, and macOS.
-- [ ] **Public API Stabilization:**
-  - Finalize crate boundaries and documentation.
-  - Release SteelUI 1.0.
+### Phase 5 — Performance Architecture & Cadmium Zedis (Workstation Stress-Test)
+**Goal:** Achieve **O(change) UI updates**, full workspace widgets, and validate parity/superiority against GPUI via **Cadmium Zedis** (`vicanso/zedis` recreation).
+
+#### Core Library Deliverables
+- [ ] **O(change) Scaling Engine (Beats GPUI on Large Trees):**
+  - Relayout boundaries in `LayoutEngine` (`compute_subtree`) + zero-alloc rect sync into `WidgetArena`.
+  - Subtree `DisplayList` slice caching for `dirty_paint == false` subtrees.
+  - Keyed reactive control flow: `Show` (conditional) and `ForEach` (dynamic keyed list reconciliation without remounting).
+  - `LayoutStyle`: `Grid`, `max_width`/`max_height`, `margin`, `aspect_ratio`, `overflow`.
+- [ ] **Multi-Window & Device Resilience:**
+  - Dynamic runtime window creation (`WindowCommand::OpenWindow`) + `DockArea` panel tear-off.
+  - `wgpu` device-lost recovery (`GpuContext` rebuild) + Wayland `Suboptimal` guard.
+- [ ] **Tier 2 Workspace Widgets:**
+  - `TreeView` (virtualized expandable key/file tree with indent guides & keyboard nav).
+  - `Table` (virtualized multi-column resizable/sortable grid).
+  - `DockArea` (multi-pane docking, tab groups, tear-off windows).
+  - `CommandPalette` (`Cmd/Ctrl+K` fuzzy filter overlay), `MenuBar`, `Toolbar`, `Toast` / `Notification`, `SegmentedControl`, `SkeletonLoader`, `Avatar`.
+- [ ] **Full `AccessKit` Coverage:**
+  - All Tier 1 & Tier 2 roles, `disabled`/`expanded`/`selected` states, `SetValue`/`Increment`/`Decrement`, and incremental `TreeUpdate` deltas.
+
+#### Showcase App 2: **Cadmium Zedis** (`apps/zedis`)
+- [ ] Recreate [`vicanso/zedis`](https://github.com/vicanso/zedis) core workstation UI on Cadmium:
+  - Server/Cluster Connection Sidebar & Tabbed Sessions.
+  - Virtualized Redis Key Tree & Keyspace Browser (100,000+ keys, prefix grouping, instant search).
+  - Multi-format Value Inspector (String/JSON syntax-colored `TextArea`, Hash/List/Set/ZSet virtualized `Table`, TTL/Memory metrics).
+  - `Cmd/Ctrl+K` `CommandPalette`, `SplitPane` layouts, live telemetry sparklines via `lyon` paths, and Light/Dark themes.
+- [ ] Connect optional live Redis/mock benchmark driver to measure identical UI workloads side-by-side against GPUI Zedis.
+
+---
+
+### Phase 6 — Benchmarks, Visual Regression & `v1.0.0` Stabilization
+- [ ] **Automated Benchmark Suite (`benches/`):**
+  - Criterion + GPU harness implementing `BENCHMARKS.md` (1k/10k DOM-style benchmarks, 100k scroll, Zedis 50k-keyspace soak, idle 0% check, RSS tracking).
+- [ ] **Headless Visual Regression CI:**
+  - Offscreen `wgpu` (WARP/SwiftShader/Lavapipe + hardware) golden-image diff suite on Windows, Linux, and macOS.
+  - WGSL validation tests (`naga`) in CI for all shaders.
+- [ ] **Public API Lockdown (`v1.0.0`):**
+  - Change internal subsystems in `lib.rs` from `pub mod` to `mod` with clean curated `pub use` + controlled `gpu` escape-hatch module.
+  - Rename `SteelError` → `CadmiumError` and wrap `winit`/`cosmic-text`/`taffy`/`accesskit`/`arboard`/`rfd` completely.
+  - Complete `LICENSE-APACHE` full text, commit `Cargo.lock`, add MSRV CI check, reconcile `README.md` / `CHANGELOG.md` / `docs/`, and publish `v1.0.0`.

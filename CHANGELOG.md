@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to SteelUI and the Magnum rendering engine will be documented in this file.
+All notable changes to Cadmium and the Magnum rendering engine will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Custom GPU Surfaces:** `CustomGpuSurface` and `CustomGpuPass` let applications embed their own WGSL render passes inside rounded, clipped SteelUI layouts, with reactive radius binding and reusable render textures.
+- **Custom GPU Surfaces:** `CustomGpuSurface` and `CustomGpuPass` let applications embed their own WGSL render passes inside rounded, clipped Cadmium layouts, with reactive radius binding and reusable render textures.
 - **Unicode-Safe Text Editing:** `TextInput` now snaps cursor and selection offsets to UTF-8 character boundaries and uses measured glyph advances for click-to-caret positioning.
 - **Reactive Runtime Hardening:** Reentrancy-safe signal access, panic-safe effect execution, disposal cleanup, cycle diagnostics, and per-arena dirty queues for multi-window isolation.
 - **Renderer Reliability:** Persistent clip stack, exact scissor intersection, lazy glass/blur targets, safe glyph atlas growth, and explicit texture release/reuse.
@@ -53,5 +53,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Semantic accessibility tree builder (`accesskit` 0.25).
   - Built-in `FrameProfiler` recording frame time, layout latency, paint duration, and FPS telemetry.
 - **Applications & Examples:**
-  - `apps/dogfood` (SteelUI Studio): Multi-pane workspace testing declarative widget trees, live reactive signals, background async tasks, clipboard integration, and file dialogs.
+  - `apps/dogfood` (Cadmium Studio): Multi-pane workspace testing declarative widget trees, live reactive signals, background async tasks, clipboard integration, and file dialogs.
   - `examples/liquid_glass`: Interactive Liquid Glass menu demonstrating optical bezel refraction, draggable spring physics, SVG icons, and a dynamic conic-bordered glass button.

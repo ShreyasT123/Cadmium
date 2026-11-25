@@ -65,9 +65,6 @@ impl ReactiveRuntime {
                 }
             }
         }
-        if let Some(cb) = &self.wake_cb {
-            cb();
-        }
     }
 
     fn detach_deps(&mut self, eff: EffectId) {
@@ -337,6 +334,151 @@ impl UiDispatcher {
         if self.tx.send(Box::new(f)).is_ok() {
             (self.wake)();
         }
+    }
+}
+
+pub struct Selector<T: Eq + std::hash::Hash + Clone + 'static> {
+    inner: Rc<SelectorInner<T>>,
+}
+
+struct SelectorInner<T: Eq + std::hash::Hash + Clone + 'static> {
+    source: Signal<T>,
+    subs: Rc<RefCell<HashMap<T, Signal<bool>>>>,
+    _effect: EffectId,
+}
+
+impl<T: Eq + std::hash::Hash + Clone + 'static> Clone for Selector<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: Eq + std::hash::Hash + Clone + 'static> Selector<T> {
+    pub fn is_selected(&self, key: T) -> bool {
+        let sig = {
+            let mut subs = self.inner.subs.borrow_mut();
+            if let Some(&s) = subs.get(&key) {
+                s
+            } else {
+                let selected = RUNTIME
+                    .with(|rt| {
+                        let cell = rt.borrow().signals.get(self.inner.source.id).cloned();
+                        cell.and_then(|c| c.borrow().downcast_ref::<T>().map(|cur| *cur == key))
+                    })
+                    .unwrap_or(false);
+                let s = create_signal(selected);
+                subs.insert(key.clone(), s);
+                s
+            }
+        };
+        sig.get()
+    }
+
+    pub fn dispose(self) {
+        dispose_effect(self.inner._effect);
+        for (_, sig) in self.inner.subs.borrow_mut().drain() {
+            sig.dispose();
+        }
+    }
+}
+
+pub fn create_selector<T: Eq + std::hash::Hash + Clone + 'static>(
+    source: Signal<T>,
+) -> Selector<T> {
+    let subs: Rc<RefCell<HashMap<T, Signal<bool>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let subs_c = subs.clone();
+    let eff = create_effect(move || {
+        let cur = source.get();
+        let subs = subs_c.borrow();
+        for (k, &sig) in subs.iter() {
+            let is_sel = *k == cur;
+            let changed = RUNTIME
+                .with(|rt| {
+                    let cell = rt.borrow().signals.get(sig.id).cloned();
+                    cell.and_then(|c| {
+                        c.borrow()
+                            .downcast_ref::<bool>()
+                            .copied()
+                            .map(|v| v != is_sel)
+                    })
+                })
+                .unwrap_or(false);
+            if changed {
+                sig.set(is_sel);
+            }
+        }
+    });
+    Selector {
+        inner: Rc::new(SelectorInner {
+            source,
+            subs,
+            _effect: eff,
+        }),
+    }
+}
+
+pub struct Memo<T: 'static> {
+    signal: Signal<T>,
+    _effect: EffectId,
+}
+
+impl<T: 'static> Clone for Memo<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: 'static> Copy for Memo<T> {}
+
+impl<T: 'static> Memo<T> {
+    pub fn signal(self) -> Signal<T> {
+        self.signal
+    }
+
+    pub fn get(self) -> T
+    where
+        T: Clone,
+    {
+        self.signal.get()
+    }
+
+    pub fn try_get(self) -> Option<T>
+    where
+        T: Clone,
+    {
+        self.signal.try_get()
+    }
+
+    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
+        self.signal.with(f)
+    }
+
+    pub fn dispose(self) {
+        dispose_effect(self._effect);
+        self.signal.dispose();
+    }
+}
+
+pub fn create_memo<T: PartialEq + Clone + 'static>(mut f: impl FnMut() -> T + 'static) -> Memo<T> {
+    let initial = f();
+    let sig = create_signal(initial);
+    let mut first = true;
+    let eff = create_effect(move || {
+        let next = f();
+        if first {
+            first = false;
+            return;
+        }
+        let changed = sig.try_with(|cur| *cur != next).unwrap_or(false);
+        if changed {
+            sig.set(next);
+        }
+    });
+    Memo {
+        signal: sig,
+        _effect: eff,
     }
 }
 

@@ -1,6 +1,6 @@
-# Contributing to SteelUI
+# Contributing to cadmium
 
-Thank you for your interest in contributing to SteelUI!
+Thank you for your interest in contributing to cadmium!
 
 ## Development Philosophy
 

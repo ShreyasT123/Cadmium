@@ -33,3 +33,10 @@ slotmap.workspace = true
 pollster.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "gui_bench"
+harness = false

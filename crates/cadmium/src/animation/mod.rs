@@ -5,6 +5,8 @@ pub struct Spring {
     pub velocity: f32,
     pub stiffness: f32,
     pub damping: f32,
+    pos_eps: f32,
+    vel_eps: f32,
 }
 
 impl Spring {
@@ -15,7 +17,15 @@ impl Spring {
             velocity: 0.0,
             stiffness,
             damping,
+            pos_eps: 0.002,
+            vel_eps: 0.01,
         }
+    }
+
+    pub fn with_tolerance(mut self, pos_eps: f32, vel_eps: f32) -> Self {
+        self.pos_eps = pos_eps.max(1e-5);
+        self.vel_eps = vel_eps.max(1e-5);
+        self
     }
 
     pub fn set_target(&mut self, target: f32) {
@@ -39,7 +49,7 @@ impl Spring {
             self.value += self.velocity * sub_dt;
         }
 
-        if (self.target - self.value).abs() < 0.08 && self.velocity.abs() < 0.25 {
+        if (self.target - self.value).abs() < self.pos_eps && self.velocity.abs() < self.vel_eps {
             self.value = self.target;
             self.velocity = 0.0;
             return false;
@@ -62,5 +72,18 @@ mod tests {
             }
         }
         assert!((s.value - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn normalized_spring_does_not_snap_early() {
+        let mut s = Spring::new(0.0, 260.0, 24.0);
+        s.set_target(1.0);
+        // After a single frame it must still be animating, not snapped from 0.05..0.92
+        assert!(s.step(1.0 / 60.0));
+        assert!(s.value < 0.9);
+        for _ in 0..180 {
+            s.step(1.0 / 60.0);
+        }
+        assert_eq!(s.value, 1.0);
     }
 }
