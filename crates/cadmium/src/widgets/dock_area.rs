@@ -43,6 +43,7 @@ pub struct DockGroup {
     /// Tabs belonging to this pane group.
     pub tabs: Vec<DockTab>,
     /// Optional callback invoked when a closable tab's close button is clicked.
+    #[allow(clippy::type_complexity)]
     pub on_close_tab: Option<Arc<dyn Fn(usize, &str)>>,
 }
 

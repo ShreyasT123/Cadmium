@@ -658,6 +658,7 @@ fn paint_node(
         WidgetPayload::CustomGpuSurface {
             radius,
             animate_signal,
+            needs_redraw,
             resolution_scale,
             state,
             ..
@@ -676,10 +677,10 @@ fn paint_node(
                 st.view = Some(view);
                 st.handle = Some(handle);
                 st.size = (pw, ph);
-                st.rendered_once = false;
+                needs_redraw.set(true);
             }
 
-            let should_render = !st.rendered_once
+            let should_render = needs_redraw.get()
                 || animate_signal
                     .as_ref()
                     .is_some_and(|s| s.try_get().unwrap_or(false));
@@ -702,7 +703,7 @@ fn paint_node(
                         pctx.time_secs,
                     );
                     gpu.queue.submit(std::iter::once(encoder.finish()));
-                    st.rendered_once = true;
+                    needs_redraw.set(false);
                 }
 
                 pctx.ctx.push_image(ImageQuad {

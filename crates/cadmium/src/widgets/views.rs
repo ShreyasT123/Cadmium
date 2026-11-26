@@ -230,6 +230,8 @@ impl IntoElement for Dropdown {
     }
 }
 
+type SurfaceDirtyBinder = Box<dyn FnOnce(DirtyQueue, WidgetId, Rc<Cell<bool>>) -> EffectId>;
+
 /// A widget that renders a user-defined wgpu pass into its own texture.
 ///
 /// The surface allocates a render target sized to its laid-out bounds, calls
@@ -249,9 +251,9 @@ pub struct CustomGpuSurface {
     tooltip: Option<String>,
     context_menu: Vec<MenuItem>,
     resolution_scale: f32,
+    dirty_binders: Vec<SurfaceDirtyBinder>,
     pass: Box<dyn CustomGpuPass>,
 }
-
 impl CustomGpuSurface {
     /// Creates a surface driven by `pass`.
     pub fn new(pass: impl CustomGpuPass) -> Self {
@@ -263,6 +265,7 @@ impl CustomGpuSurface {
             tooltip: None,
             context_menu: Vec::new(),
             resolution_scale: 1.0,
+            dirty_binders: Vec::new(),
             pass: Box::new(pass),
         }
     }
@@ -306,7 +309,25 @@ impl CustomGpuSurface {
         self.animate_signal = Some(sig);
         self
     }
-
+/// Marks this surface dirty to re-render one frame whenever `sig` changes.
+    pub fn redraw_on<T: 'static>(mut self, sig: Signal<T>) -> Self {
+        self.dirty_binders.push(Box::new(move |q, id, flag| {
+            create_effect(move || {
+                let _ = sig.try_with(|_| ());
+                flag.set(true);
+                push_dirty(
+                    &q,
+                    id,
+                    DirtyFlags {
+                        state: false,
+                        layout: false,
+                        paint: true,
+                    },
+                );
+            })
+        }));
+        self
+    }
     /// Scales the backing texture relative to the widget's logical size.
     ///
     /// Values outside `0.1..=1.0` are clamped into that range; `1.0` renders
@@ -330,6 +351,7 @@ impl CustomGpuSurface {
         self.context_menu.extend(items);
         self
     }
+    
 }
 
 impl IntoElement for CustomGpuSurface {

@@ -3,7 +3,6 @@ struct CustomSurfaceState {
     handle: Option<TextureHandle>,
     view: Option<wgpu::TextureView>,
     size: (u32, u32),
-    rendered_once: bool,
 }
 
 struct ImageState {
@@ -163,6 +162,7 @@ enum WidgetPayload {
     CustomGpuSurface {
         radius: Rc<Cell<f32>>,
         animate_signal: Option<Signal<bool>>,
+        needs_redraw: Rc<Cell<bool>>,
         resolution_scale: f32,
         state: RefCell<CustomSurfaceState>,
     },
@@ -1732,6 +1732,7 @@ impl WidgetArena {
             Element::CustomGpuSurface(cs) => {
                 let lnode = self.layout.new_leaf(cs.layout);
                 let radius_cell = Rc::new(Cell::new(cs.radius));
+                let needs_redraw = Rc::new(Cell::new(true));
                 let id = self.nodes.insert(WidgetNode {
                     parent: None,
                     is_relayout_boundary: true,
@@ -1746,13 +1747,13 @@ impl WidgetArena {
                     payload: WidgetPayload::CustomGpuSurface {
                         radius: radius_cell.clone(),
                         animate_signal: cs.animate_signal,
+                        needs_redraw: needs_redraw.clone(),
                         resolution_scale: cs.resolution_scale,
                         state: RefCell::new(CustomSurfaceState {
                             pass: cs.pass,
                             handle: None,
                             view: None,
                             size: (0, 0),
-                            rendered_once: false,
                         }),
                     },
                 });
@@ -1777,20 +1778,8 @@ impl WidgetArena {
                     });
                     self.nodes[id].owned_effects.push(eff);
                 }
-                if let Some(anim_sig) = cs.animate_signal {
-                    let q = self.dirty_queue.clone();
-                    let eff = create_effect(move || {
-                        let _ = anim_sig.try_get();
-                        push_dirty(
-                            &q,
-                            id,
-                            DirtyFlags {
-                                state: false,
-                                layout: false,
-                                paint: true,
-                            },
-                        );
-                    });
+                for binder in cs.dirty_binders {
+                    let eff = binder(self.dirty_queue.clone(), id, needs_redraw.clone());
                     self.nodes[id].owned_effects.push(eff);
                 }
                 id

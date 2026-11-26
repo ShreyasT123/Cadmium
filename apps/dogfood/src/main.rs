@@ -272,7 +272,12 @@ impl CustomGpuPass for BeatsStagePass {
 
         let idx = self.track_idx.try_get().unwrap_or(0) % self.color_pairs.len().max(1);
         let (ca, cb) = self.color_pairs[idx];
-        let win_w = self.viewport.try_get().map(|v| v.0).unwrap_or(1280.0).max(1.0);
+        let win_w = self
+            .viewport
+            .try_get()
+            .map(|v| v.0)
+            .unwrap_or(1280.0)
+            .max(1.0);
         let sb_w = if self.is_compact.try_get().unwrap_or(false) {
             60.0
         } else {
@@ -348,7 +353,14 @@ fn main() {
             explicit: false,
             color_a: [0.06, 0.14, 0.28],
             color_b: [0.22, 0.54, 0.88],
-            art: gen_art(1, [0.06, 0.14, 0.28], [0.22, 0.54, 0.88], [0.95, 0.88, 0.72], 160, 160),
+            art: gen_art(
+                1,
+                [0.06, 0.14, 0.28],
+                [0.22, 0.54, 0.88],
+                [0.95, 0.88, 0.72],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Snakeskin Boots",
@@ -358,7 +370,14 @@ fn main() {
             explicit: false,
             color_a: [0.55, 0.22, 0.12],
             color_b: [0.88, 0.52, 0.28],
-            art: gen_art(2, [0.55, 0.22, 0.12], [0.88, 0.52, 0.28], [0.96, 0.92, 0.84], 160, 160),
+            art: gen_art(
+                2,
+                [0.55, 0.22, 0.12],
+                [0.88, 0.52, 0.28],
+                [0.96, 0.92, 0.84],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Us Again",
@@ -368,7 +387,14 @@ fn main() {
             explicit: false,
             color_a: [0.18, 0.18, 0.22],
             color_b: [0.58, 0.58, 0.62],
-            art: gen_art(3, [0.18, 0.18, 0.22], [0.58, 0.58, 0.62], [0.92, 0.92, 0.94], 160, 160),
+            art: gen_art(
+                3,
+                [0.18, 0.18, 0.22],
+                [0.58, 0.58, 0.62],
+                [0.92, 0.92, 0.94],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Psycho Killer (2024)",
@@ -378,7 +404,14 @@ fn main() {
             explicit: false,
             color_a: [0.65, 0.10, 0.14],
             color_b: [0.18, 0.18, 0.20],
-            art: gen_art(4, [0.65, 0.10, 0.14], [0.18, 0.18, 0.20], [0.96, 0.86, 0.82], 160, 160),
+            art: gen_art(
+                4,
+                [0.65, 0.10, 0.14],
+                [0.18, 0.18, 0.20],
+                [0.96, 0.86, 0.82],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Draw You Out",
@@ -388,7 +421,14 @@ fn main() {
             explicit: false,
             color_a: [0.12, 0.34, 0.26],
             color_b: [0.32, 0.66, 0.52],
-            art: gen_art(5, [0.12, 0.34, 0.26], [0.32, 0.66, 0.52], [0.88, 0.95, 0.86], 160, 160),
+            art: gen_art(
+                5,
+                [0.12, 0.34, 0.26],
+                [0.32, 0.66, 0.52],
+                [0.88, 0.95, 0.86],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Why Don't You Say So",
@@ -398,7 +438,14 @@ fn main() {
             explicit: false,
             color_a: [0.48, 0.28, 0.14],
             color_b: [0.82, 0.64, 0.36],
-            art: gen_art(6, [0.48, 0.28, 0.14], [0.82, 0.64, 0.36], [0.98, 0.92, 0.82], 160, 160),
+            art: gen_art(
+                6,
+                [0.48, 0.28, 0.14],
+                [0.82, 0.64, 0.36],
+                [0.98, 0.92, 0.82],
+                160,
+                160,
+            ),
         },
         Track {
             title: "HELEN KELLER",
@@ -408,7 +455,14 @@ fn main() {
             explicit: false,
             color_a: [0.20, 0.08, 0.12],
             color_b: [0.92, 0.24, 0.32],
-            art: gen_art(7, [0.20, 0.08, 0.12], [0.92, 0.24, 0.32], [0.96, 0.96, 0.98], 160, 160),
+            art: gen_art(
+                7,
+                [0.20, 0.08, 0.12],
+                [0.92, 0.24, 0.32],
+                [0.96, 0.96, 0.98],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Man In The Box",
@@ -418,7 +472,14 @@ fn main() {
             explicit: true,
             color_a: [0.26, 0.20, 0.14],
             color_b: [0.64, 0.52, 0.38],
-            art: gen_art(8, [0.26, 0.20, 0.14], [0.64, 0.52, 0.38], [0.90, 0.86, 0.80], 160, 160),
+            art: gen_art(
+                8,
+                [0.26, 0.20, 0.14],
+                [0.64, 0.52, 0.38],
+                [0.90, 0.86, 0.80],
+                160,
+                160,
+            ),
         },
         Track {
             title: "HONEYMOON NIGHT",
@@ -428,7 +489,14 @@ fn main() {
             explicit: true,
             color_a: [0.58, 0.12, 0.34],
             color_b: [0.92, 0.44, 0.68],
-            art: gen_art(9, [0.58, 0.12, 0.34], [0.92, 0.44, 0.68], [0.98, 0.90, 0.94], 160, 160),
+            art: gen_art(
+                9,
+                [0.58, 0.12, 0.34],
+                [0.92, 0.44, 0.68],
+                [0.98, 0.90, 0.94],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Close To Me (Solo)",
@@ -438,7 +506,14 @@ fn main() {
             explicit: false,
             color_a: [0.44, 0.32, 0.12],
             color_b: [0.88, 0.72, 0.36],
-            art: gen_art(10, [0.44, 0.32, 0.12], [0.88, 0.72, 0.36], [0.98, 0.96, 0.88], 160, 160),
+            art: gen_art(
+                10,
+                [0.44, 0.32, 0.12],
+                [0.88, 0.72, 0.36],
+                [0.98, 0.96, 0.88],
+                160,
+                160,
+            ),
         },
         Track {
             title: "Moving at Light Speed",
@@ -448,7 +523,14 @@ fn main() {
             explicit: false,
             color_a: [0.16, 0.08, 0.24],
             color_b: [0.96, 0.48, 0.12],
-            art: gen_art(11, [0.16, 0.08, 0.24], [0.96, 0.48, 0.12], [0.98, 0.84, 0.28], 160, 160),
+            art: gen_art(
+                11,
+                [0.16, 0.08, 0.24],
+                [0.96, 0.48, 0.12],
+                [0.98, 0.84, 0.28],
+                160,
+                160,
+            ),
         },
         Track {
             title: "The Myth",
@@ -458,13 +540,41 @@ fn main() {
             explicit: true,
             color_a: [0.12, 0.10, 0.10],
             color_b: [0.62, 0.28, 0.18],
-            art: gen_art(12, [0.12, 0.10, 0.10], [0.62, 0.28, 0.18], [0.88, 0.84, 0.78], 160, 160),
+            art: gen_art(
+                12,
+                [0.12, 0.10, 0.10],
+                [0.62, 0.28, 0.18],
+                [0.88, 0.84, 0.78],
+                160,
+                160,
+            ),
         },
     ];
-    let hero_arts = vec![
-        gen_art(101, [0.06, 0.08, 0.14], [0.18, 0.52, 0.96], [0.96, 0.96, 0.98], 320, 190),
-        gen_art(102, [0.96, 0.22, 0.08], [0.98, 0.80, 0.10], [0.12, 0.16, 0.28], 320, 190),
-        gen_art(103, [0.22, 0.22, 0.24], [0.58, 0.58, 0.62], [0.88, 0.76, 0.62], 320, 190),
+    let hero_arts = [
+        gen_art(
+            101,
+            [0.06, 0.08, 0.14],
+            [0.18, 0.52, 0.96],
+            [0.96, 0.96, 0.98],
+            320,
+            190,
+        ),
+        gen_art(
+            102,
+            [0.96, 0.22, 0.08],
+            [0.98, 0.80, 0.10],
+            [0.12, 0.16, 0.28],
+            320,
+            190,
+        ),
+        gen_art(
+            103,
+            [0.22, 0.22, 0.24],
+            [0.58, 0.58, 0.62],
+            [0.88, 0.76, 0.62],
+            320,
+            190,
+        ),
     ];
     let color_pairs: Vec<([f32; 3], [f32; 3])> =
         tracks.iter().map(|t| (t.color_a, t.color_b)).collect();
@@ -488,11 +598,19 @@ fn main() {
     let viewport = create_signal((1280.0_f32, 800.0_f32));
     let breakpoint = create_memo(move || Breakpoint::from_width(viewport.get().0));
     let sidebar_open = create_signal(false);
-    let is_compact = create_memo(move || breakpoint.get() == Breakpoint::Compact && !sidebar_open.get());
+    let is_compact =
+        create_memo(move || breakpoint.get() == Breakpoint::Compact && !sidebar_open.get());
     let stage_active = create_memo(move || active_nav.get() == 3);
     let bg_animating = create_memo(move || is_playing.get() && active_nav.get() == 3);
 
-    let avatar_art = gen_art(77, [0.28, 0.20, 0.34], [0.68, 0.42, 0.52], [0.96, 0.88, 0.84], 128, 128);
+    let avatar_art = gen_art(
+        77,
+        [0.28, 0.20, 0.34],
+        [0.68, 0.42, 0.52],
+        [0.96, 0.88, 0.84],
+        128,
+        128,
+    );
 
     // Zero-wakeup playback timer thread (parks on Condvar when paused)
     let play_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -636,11 +754,12 @@ fn main() {
                 search_stage_mat.set(Material::solid(Color::from_rgba8(255, 255, 255, 242)));
             }
             ThemeMode::Dark => {
-                // Keep right canvas transparent on Stage (and translucent on browse) so album bleed continues smoothly
+                // Opaque on browse pages so the sidebar still gets full-window bleed
+                // without Stage waveforms peeking behind cards; Transparent on Stage (3).
                 canvas_mat.set(if on_stage {
                     Material::solid(Color::TRANSPARENT)
                 } else {
-                    Material::solid(Color::from_rgba8(16, 16, 20, 215))
+                    Material::solid(Color::from_rgba8(16, 16, 20, 255))
                 });
                 sidebar_mat.set(Material::Frosted {
                     tint: Color::from_rgba8(18, 17, 22, 138),
@@ -1055,8 +1174,7 @@ fn main() {
 
         // Single Wrap across all 12 songs so 3->2->1 columns never leave orphan rows
         let mut song_grid = Wrap::new().padding(Edges::xy(28.0, 0.0)).gap(14.0);
-        for idx in 0..12 {
-            let tr = &tracks[idx];
+        for (idx, tr) in tracks.iter().enumerate().take(12) {
             let pi = play_index.clone();
             let t_title = tr.title;
             let t_artist = tr.artist;
@@ -1326,9 +1444,7 @@ fn main() {
                                 Text::reactive({
                                     let tr = tracks.clone();
                                     move || {
-                                        tr[(current_track.get() + 11) % tr.len()]
-                                            .album
-                                            .to_string()
+                                        tr[(current_track.get() + 11) % tr.len()].album.to_string()
                                     }
                                 })
                                 .size(11.0)
@@ -1338,9 +1454,7 @@ fn main() {
                                 Text::reactive({
                                     let tr = tracks.clone();
                                     move || {
-                                        tr[(current_track.get() + 11) % tr.len()]
-                                            .title
-                                            .to_string()
+                                        tr[(current_track.get() + 11) % tr.len()].title.to_string()
                                     }
                                 })
                                 .size(13.5)
@@ -1393,11 +1507,7 @@ fn main() {
                                     let tr = tracks.clone();
                                     move || {
                                         let t = &tr[current_track.get() % tr.len()];
-                                        format!(
-                                            "{} • {}",
-                                            t.artist,
-                                            format_mm_ss(t.duration_secs)
-                                        )
+                                        format!("{} • {}", t.artist, format_mm_ss(t.duration_secs))
                                     }
                                 })
                                 .size(11.5)
@@ -1881,7 +1991,9 @@ fn main() {
                 .width(Length::Percent(1.0))
                 .height(Length::Percent(1.0))
                 .radius(0.0)
-                .animate_when(bg_animating.signal()),
+                .animate_when(bg_animating.signal())
+                .redraw_on(active_nav)
+                .redraw_on(current_track),
             )
             .child(
                 Container::row()
