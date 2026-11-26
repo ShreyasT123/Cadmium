@@ -1,64 +1,34 @@
+//! Native platform services: system clipboard and file dialogs.
+//!
+//! [`Clipboard`] wraps `arboard` with a lazily initialized, per-thread connection,
+//! and [`FileDialog`] wraps `rfd` to present native modal pickers. Both require a
+//! desktop session with access to the platform's display server; calls made in a
+//! headless context may fail or block. Dialog functions return control only after
+//! the user confirms or cancels.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use cadmium::platform::{Clipboard, FileDialog};
+//!
+//! # fn platform_tasks() -> Result<(), cadmium::CadmiumError> {
+//! Clipboard::set_text("ready")?;
+//! let _text = Clipboard::get_text()?;
+//! if let Some(path) = FileDialog::pick_file("Open a file") {
+//!     println!("{path:?}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use crate::core::SteelError;
+use crate::core::CadmiumError;
 
 thread_local! {
     static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
 }
 
-pub struct Clipboard;
-
-impl Clipboard {
-    fn with_instance<R>(
-        f: impl Fn(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
-    ) -> Result<R, SteelError> {
-        CLIPBOARD.with(|slot| {
-            let mut guard = slot.borrow_mut();
-            if guard.is_none() {
-                *guard = Some(
-                    arboard::Clipboard::new()
-                        .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?,
-                );
-            }
-            match f(guard.as_mut().expect("clipboard initialized")) {
-                Ok(v) => Ok(v),
-                Err(_) => {
-                    // Reconnect once if display server/clipboard owner reset
-                    *guard = Some(
-                        arboard::Clipboard::new()
-                            .map_err(|e| SteelError::Platform(format!("Clipboard init: {e}")))?,
-                    );
-                    f(guard.as_mut().expect("clipboard reinitialized"))
-                        .map_err(|e| SteelError::Platform(format!("Clipboard op: {e}")))
-                }
-            }
-        })
-    }
-
-    pub fn get_text() -> Result<String, SteelError> {
-        Self::with_instance(|cb| cb.get_text())
-    }
-
-    pub fn set_text(text: &str) -> Result<(), SteelError> {
-        Self::with_instance(|cb| cb.set_text(text))
-    }
-}
-pub struct FileDialog;
-
-impl FileDialog {
-    pub fn pick_file(title: &str) -> Option<PathBuf> {
-        rfd::FileDialog::new().set_title(title).pick_file()
-    }
-
-    pub fn pick_folder(title: &str) -> Option<PathBuf> {
-        rfd::FileDialog::new().set_title(title).pick_folder()
-    }
-
-    pub fn save_file(title: &str, default_name: &str) -> Option<PathBuf> {
-        rfd::FileDialog::new()
-            .set_title(title)
-            .set_file_name(default_name)
-            .save_file()
-    }
-}
+include!("clipboard.rs");
+include!("dialog.rs");

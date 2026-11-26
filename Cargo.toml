@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cadmium",
     "apps/dogfood",
+    "apps/zedis",
     "examples/liquid_glass",
 ]
 

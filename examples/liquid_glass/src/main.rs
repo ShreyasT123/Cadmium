@@ -513,6 +513,8 @@ fn main() {
         title: "Liquid Glass Menu".into(),
         width: 1020.0,
         height: 760.0,
+        min_width: None,
+        min_height: None,
         borderless: true,
         clear_color: Color::from_rgba8(24, 28, 36, 255),
         delegate: Box::new(LiquidGlassScene::new()),

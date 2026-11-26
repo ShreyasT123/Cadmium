@@ -580,6 +580,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadmium_zedis"
+version = "0.1.0"
+dependencies = [
+ "cadmium",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "calloop"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

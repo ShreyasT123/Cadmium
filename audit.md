@@ -261,8 +261,8 @@ For typical UI trees (depth < 50) this is fine. For generated trees (recursive `
 - Internal implementation types (`WidgetArena`, `GlyphAtlas`, `LayoutEngine`, ...) are all public
 - **Fix**: make implementation modules `pub(crate)` and re-export only the intended public API
 
-#### L4: `SteelError` exposes `winit` types in public API
-- `SteelError::WindowCreation(winit::error::OsError)` leaks winit in the public error enum
+#### L4: `CadmiumError` exposes `winit` types in public API
+- `CadmiumError::WindowCreation(winit::error::OsError)` leaks winit in the public error enum
 - Callers must depend on winit just to match on this variant
 - **Fix**: wrap in a `Box<dyn Error + Send + Sync>` or opaque string
 

@@ -8,8 +8,12 @@ repository.workspace = true
 readme = "../../README.md"
 
 description = "A cross-platform Rust UI framework inspired by macOS design."
+documentation = "https://docs.rs/cadmium"
 keywords = ["gui", "ui", "graphics", "cross-platform"]
 categories = ["gui"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 wgpu.workspace = true

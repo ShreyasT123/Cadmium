@@ -10,17 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Custom GPU Surfaces:** `CustomGpuSurface` and `CustomGpuPass` let applications embed their own WGSL render passes inside rounded, clipped Cadmium layouts, with reactive radius binding and reusable render textures.
-- **Unicode-Safe Text Editing:** `TextInput` now snaps cursor and selection offsets to UTF-8 character boundaries and uses measured glyph advances for click-to-caret positioning.
-- **Reactive Runtime Hardening:** Reentrancy-safe signal access, panic-safe effect execution, disposal cleanup, cycle diagnostics, and per-arena dirty queues for multi-window isolation.
-- **Renderer Reliability:** Persistent clip stack, exact scissor intersection, lazy glass/blur targets, safe glyph atlas growth, and explicit texture release/reuse.
-- **Surface Resilience:** Zero-size surface guard, reconfiguration on DPI/size changes, and checked surface capability fallbacks.
+- **Modular Subsystem Architecture:** Split `cadmium` into dedicated, fully documented submodules (`accessibility`, `animation`, `assets`, `core`, `debug`, `events`, `layout`, `platform`, `reactive`, `renderer`, `style`, `text`, `widgets`, `window`) with `prelude` and generated `rustdoc`.
+- **Reactive Engine Upgrades:** Added `OwnedSignal<T>`, `create_memo`, `create_selector` (`O(1)` 10k-row selection down to `~110 µs`), and relayout boundary coalescing.
+- **Tier 1 & Tier 2 Widget Suite:** Added `Card`, `Badge`, `Avatar`, `Link`, `Checkbox`, `RadioButton`, `SegmentedControl`, `Accordion`, `Modal`, `Image`, `Icon`, `ProgressBar`, `CircularProgressIndicator`, `SplitPane`, `VirtualizedList`, `TreeView`, `Table`, `DockArea`, `MenuBar`, `Toolbar`, `CommandPalette`, `ToastHost`, `GridView`, `Switcher` (with animated transitions), `Show`, and `ForEach`.
+- **Live `AccessKit` Bridge & Dynamic Vector Paths:** Wired `accesskit_winit::Adapter` for screen readers and `lyon` stroke path rendering.
+- **Custom GPU Surfaces & Beats 01 Showcase:** `CustomGpuSurface` / `CustomGpuPass` and redesigned `apps/dogfood` (`Cadmium Music`) with Frosted sidebar, Liquid Glass player capsule, and Beats 01 live waveform stage.
+- **Automated Criterion Benchmarks (`benches/gui_bench.rs`):** Added `create_1k_rows`, `select_row_10k`, `update_every_10th_10k`, and `scroll_step_100k_virtual`.
 
-### Planned
-- **Live `AccessKit` Adapter Wiring:** Publish incremental `TreeUpdate`s, route semantic actions, and synchronize focus/bounds with native screen readers.
-- **Dynamic Vector Paths (`lyon`):** Tessellate animated Bezier paths, splines, charts, and node wires into cached GPU geometry.
-- **IME & Multiline `TextArea`:** Composition strings, OS candidate-window placement, wrapped vertical editing, and undo/redo stacks.
-
+### Planned (Before v1.0.0)
+- **Responsiveness & Tiling (`Phase 5C`):** `Wrap` layout, `Container::clip()`, `Text` ellipsis truncation, `ViewportMetrics` / `Breakpoint`, `min_inner_size`, and double-click titlebar maximize.
+- **IME, Focus Scopes & Multi-Window Tear-Off (`Phase 5D`):** `Ime::Preedit`/`Commit`, candidate cursor area, modal focus trapping, `WindowCommand::OpenWindow`, and `Cadmium Zedis`.
+- **Subtree `DisplayList` Caching & Visual Regression CI (`Phase 6`).**
 ---
 
 ## [0.1.0] - 2026-11-23

@@ -1,3 +1,61 @@
+//! Fine-grained reactive state for [`crate::widgets`] and [`crate::window`].
+//!
+//! Cadmium keeps a small dependency graph in **thread-local** storage. A
+//! [`Signal`] is a cheap `Copy` handle to a slot in that graph: reading it
+//! inside an effect (with [`Signal::get`], [`Signal::try_get`],
+//! [`Signal::with`], or [`Signal::try_with`]) records a dependency, while
+//! [`Signal::set`] and [`Signal::update`] mark dependent effects as dirty.
+//! Effects created with [`create_effect`] run immediately once, then re-run on
+//! the next [`flush_effects`] after one of their dependencies changes. They
+//! re-track dependencies on every run, so reads behind a branch that is no
+//! longer taken do not keep stale subscriptions. Because the runtime is
+//! thread-local, signals and effects must be created, read, written, and
+//! flushed on the thread that hosts the UI; [`UiDispatcher`] is the intended
+//! bridge from worker threads.
+//!
+//! [`create_memo`] derives a cached [`Memo`] from other signals. It computes
+//! its initial value immediately and, on later flushes, writes its backing
+//! signal only when the new value differs under `PartialEq`, so downstream
+//! subscribers are not woken for unchanged results. [`create_selector`]
+//! builds a [`Selector`] that maintains one lazily created boolean signal per
+//! key, which makes "which item is selected?" cheap to observe without
+//! invalidating widgets interested in other keys.
+//!
+//! [`crate::window::App`] flushes effects before rendering each frame and
+//! after draining asynchronous tasks, so application code normally does not
+//! call [`flush_effects`] itself; it is useful in tests and headless code.
+//! Widgets in [`crate::widgets`] subscribe by creating effects that read
+//! signals and push dirty flags into the widget arena; those flags drive
+//! layout invalidation through [`crate::layout`] and subsequent repainting.
+//! Effect ids returned by [`create_effect`] can be retained and cancelled with
+//! [`dispose_effect`]; [`Memo::dispose`] and [`Selector::dispose`] tear down
+//! their internal effects and signals, and [`OwnedSignal`] ties a signal
+//! slot's lifetime to a Rust value's scope.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::cell::Cell;
+//! use std::rc::Rc;
+//!
+//! use cadmium::reactive::{create_effect, create_memo, create_signal, flush_effects};
+//!
+//! let count = create_signal(1);
+//! let observed = Rc::new(Cell::new(0));
+//! let seen = observed.clone();
+//! create_effect(move || seen.set(count.get() * 10));
+//! assert_eq!(observed.get(), 10); // effects run once when created
+//!
+//! let doubled = create_memo(|| count.get() * 2);
+//! assert_eq!(doubled.get(), 2); // memos compute their initial value eagerly
+//!
+//! count.set(4); // marks subscribers dirty; no callback runs yet
+//! assert_eq!(observed.get(), 10);
+//! flush_effects(); // settles the effect and the memo
+//! assert_eq!(observed.get(), 40);
+//! assert_eq!(doubled.get(), 8);
+//! ```
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -9,559 +67,26 @@ use std::sync::mpsc::Sender;
 use slotmap::{SlotMap, new_key_type};
 
 new_key_type! {
+    /// Opaque identifier for a slot in the current thread's signal table.
+    ///
+    /// Handles of this type are embedded in [`Signal`] and are not normally
+    /// constructed by application code. Like other slotmap keys it is `Copy`,
+    /// `Eq`, `Hash`, and `Default`; the default value is a null key that
+    /// addresses no signal. A key is only meaningful to the thread-local
+    /// runtime that issued it.
     pub struct SignalId;
+    /// Opaque identifier for a registered effect.
+    ///
+    /// Returned by [`create_effect`] and accepted by [`dispose_effect`]. The
+    /// key is `Copy`, so it can be stored by a widget while other copies stay
+    /// in use. Use it on the same thread where the effect was created; a
+    /// different thread has a different runtime and will not find the effect.
     pub struct EffectId;
 }
 
-type SignalCell = Rc<RefCell<Box<dyn Any>>>;
-
-struct EffectEntry {
-    func: Option<Box<dyn FnMut()>>,
-    deps: Vec<SignalId>,
-}
-
-struct ReactiveRuntime {
-    signals: SlotMap<SignalId, SignalCell>,
-    subscribers: HashMap<SignalId, HashSet<EffectId>>,
-    effects: SlotMap<EffectId, EffectEntry>,
-    tracking_stack: Vec<EffectId>,
-    dirty_effects: Vec<EffectId>,
-    dirty_set: HashSet<EffectId>,
-    wake_cb: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl ReactiveRuntime {
-    fn new() -> Self {
-        Self {
-            signals: SlotMap::with_key(),
-            subscribers: HashMap::new(),
-            effects: SlotMap::with_key(),
-            tracking_stack: Vec::new(),
-            dirty_effects: Vec::new(),
-            dirty_set: HashSet::new(),
-            wake_cb: None,
-        }
-    }
-
-    fn record_read(&mut self, sig: SignalId) {
-        if let Some(&eff) = self.tracking_stack.last() {
-            if !self.effects.contains_key(eff) {
-                return;
-            }
-            self.subscribers.entry(sig).or_default().insert(eff);
-            if let Some(entry) = self.effects.get_mut(eff)
-                && !entry.deps.contains(&sig)
-            {
-                entry.deps.push(sig);
-            }
-        }
-    }
-
-    fn notify_write(&mut self, sig: SignalId) {
-        if let Some(subs) = self.subscribers.get(&sig) {
-            for &eff in subs {
-                if self.effects.contains_key(eff) && self.dirty_set.insert(eff) {
-                    self.dirty_effects.push(eff);
-                }
-            }
-        }
-    }
-
-    fn detach_deps(&mut self, eff: EffectId) {
-        if let Some(entry) = self.effects.get_mut(eff) {
-            let old_deps = std::mem::take(&mut entry.deps);
-            for sig in old_deps {
-                if let Some(subs) = self.subscribers.get_mut(&sig) {
-                    subs.remove(&eff);
-                }
-            }
-        }
-    }
-}
-
-thread_local! {
-    static RUNTIME: RefCell<ReactiveRuntime> = RefCell::new(ReactiveRuntime::new());
-}
-
-pub fn set_wake_callback(cb: Arc<dyn Fn() + Send + Sync>) {
-    RUNTIME.with(|rt| {
-        rt.borrow_mut().wake_cb = Some(cb);
-    });
-}
-
-pub struct Signal<T: 'static> {
-    id: SignalId,
-    _marker: PhantomData<T>,
-}
-
-impl<T: 'static> Clone for Signal<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T: 'static> Copy for Signal<T> {}
-
-impl<T: 'static> Signal<T> {
-    pub fn is_alive(self) -> bool {
-        RUNTIME.with(|rt| rt.borrow().signals.contains_key(self.id))
-    }
-
-    pub fn try_get(self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.try_with(Clone::clone)
-    }
-
-    pub fn get(self) -> T
-    where
-        T: Clone,
-    {
-        self.with(Clone::clone)
-    }
-
-    pub fn try_with<R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let cell = RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            if !rt.signals.contains_key(self.id) {
-                return None;
-            }
-            rt.record_read(self.id);
-            rt.signals.get(self.id).cloned()
-        })?;
-        let borrowed = cell.borrow();
-        let val = borrowed.downcast_ref::<T>().expect("Signal type mismatch");
-        Some(f(val))
-    }
-
-    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
-        self.try_with(f).expect("Signal accessed after disposal")
-    }
-
-    pub fn set(self, value: T) {
-        self.update(|slot| *slot = value);
-    }
-
-    pub fn update(self, f: impl FnOnce(&mut T)) {
-        let cell = RUNTIME.with(|rt| rt.borrow().signals.get(self.id).cloned());
-        if let Some(cell) = cell {
-            {
-                let mut borrowed = cell.borrow_mut();
-                let val = borrowed.downcast_mut::<T>().expect("Signal type mismatch");
-                f(val);
-            }
-            RUNTIME.with(|rt| {
-                rt.borrow_mut().notify_write(self.id);
-            });
-        }
-    }
-
-    pub fn dispose(self) {
-        RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            rt.signals.remove(self.id);
-            rt.subscribers.remove(&self.id);
-        });
-    }
-}
-
-/// RAII wrapper around a `Signal<T>` that automatically frees its slot on drop.
-pub struct OwnedSignal<T: 'static> {
-    inner: Signal<T>,
-}
-
-impl<T: 'static> OwnedSignal<T> {
-    pub fn new(initial: T) -> Self {
-        Self {
-            inner: create_signal(initial),
-        }
-    }
-
-    pub fn signal(&self) -> Signal<T> {
-        self.inner
-    }
-
-    pub fn get(&self) -> T
-    where
-        T: Clone,
-    {
-        self.inner.get()
-    }
-
-    pub fn set(&self, value: T) {
-        self.inner.set(value);
-    }
-
-    pub fn update(&self, f: impl FnOnce(&mut T)) {
-        self.inner.update(f);
-    }
-}
-
-impl<T: 'static> Drop for OwnedSignal<T> {
-    fn drop(&mut self) {
-        let _ = RUNTIME.try_with(|rt| {
-            let mut rt = rt.borrow_mut();
-            rt.signals.remove(self.inner.id);
-            rt.subscribers.remove(&self.inner.id);
-        });
-    }
-}
-
-pub fn create_signal<T: 'static>(initial: T) -> Signal<T> {
-    let cell: SignalCell = Rc::new(RefCell::new(Box::new(initial)));
-    let id = RUNTIME.with(|rt| rt.borrow_mut().signals.insert(cell));
-    Signal {
-        id,
-        _marker: PhantomData,
-    }
-}
-
-pub fn create_effect(f: impl FnMut() + 'static) -> EffectId {
-    let id = RUNTIME.with(|rt| {
-        rt.borrow_mut().effects.insert(EffectEntry {
-            func: Some(Box::new(f)),
-            deps: Vec::new(),
-        })
-    });
-    run_effect(id);
-    id
-}
-
-pub fn dispose_effect(id: EffectId) {
-    RUNTIME.with(|rt| {
-        let mut rt = rt.borrow_mut();
-        rt.detach_deps(id);
-        rt.effects.remove(id);
-        rt.dirty_set.remove(&id);
-        rt.dirty_effects.retain(|&e| e != id);
-    });
-}
-
-struct EffectRunGuard {
-    id: EffectId,
-    func: Option<Box<dyn FnMut()>>,
-}
-
-impl Drop for EffectRunGuard {
-    fn drop(&mut self) {
-        let func = self.func.take();
-        let id = self.id;
-        let _ = RUNTIME.try_with(|rt| {
-            let mut rt = rt.borrow_mut();
-            if rt.tracking_stack.last() == Some(&id) {
-                rt.tracking_stack.pop();
-            } else {
-                rt.tracking_stack.retain(|&e| e != id);
-            }
-            if let Some(entry) = rt.effects.get_mut(id) {
-                entry.func = func;
-            }
-        });
-    }
-}
-
-fn run_effect(id: EffectId) {
-    let func = RUNTIME.with(|rt| {
-        let mut rt = rt.borrow_mut();
-        if !rt.effects.contains_key(id) {
-            return None;
-        }
-        rt.detach_deps(id);
-        let func = rt.effects.get_mut(id).and_then(|e| e.func.take());
-        if func.is_some() {
-            rt.tracking_stack.push(id);
-        }
-        func
-    });
-
-    if let Some(f) = func {
-        let mut guard = EffectRunGuard { id, func: Some(f) };
-        if let Some(cb) = guard.func.as_mut() {
-            cb();
-        }
-    }
-}
-
-pub fn flush_effects() -> usize {
-    let mut executed = 0;
-    for wave in 0..64 {
-        let batch: Vec<EffectId> = RUNTIME.with(|rt| {
-            let mut rt = rt.borrow_mut();
-            rt.dirty_set.clear();
-            std::mem::take(&mut rt.dirty_effects)
-        });
-        if batch.is_empty() {
-            return executed;
-        }
-        for id in batch {
-            executed += 1;
-            run_effect(id);
-        }
-        if wave == 63 {
-            let remaining = RUNTIME.with(|rt| {
-                let mut rt = rt.borrow_mut();
-                let count = rt.dirty_effects.len();
-                rt.dirty_effects.clear();
-                rt.dirty_set.clear();
-                count
-            });
-            if remaining > 0 {
-                tracing::error!(
-                    "Reactive effect cycle detected after 64 waves; dropped {remaining} pending effects"
-                );
-            }
-        }
-    }
-    executed
-}
-
-#[derive(Clone)]
-pub struct UiDispatcher {
-    tx: Sender<Box<dyn FnOnce() + Send>>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl UiDispatcher {
-    pub(crate) fn new(
-        tx: Sender<Box<dyn FnOnce() + Send>>,
-        wake: Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
-        Self { tx, wake }
-    }
-
-    pub fn dispatch(&self, f: impl FnOnce() + Send + 'static) {
-        if self.tx.send(Box::new(f)).is_ok() {
-            (self.wake)();
-        }
-    }
-}
-
-pub struct Selector<T: Eq + std::hash::Hash + Clone + 'static> {
-    inner: Rc<SelectorInner<T>>,
-}
-
-struct SelectorInner<T: Eq + std::hash::Hash + Clone + 'static> {
-    source: Signal<T>,
-    subs: Rc<RefCell<HashMap<T, Signal<bool>>>>,
-    _effect: EffectId,
-}
-
-impl<T: Eq + std::hash::Hash + Clone + 'static> Clone for Selector<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<T: Eq + std::hash::Hash + Clone + 'static> Selector<T> {
-    pub fn is_selected(&self, key: T) -> bool {
-        let sig = {
-            let mut subs = self.inner.subs.borrow_mut();
-            if let Some(&s) = subs.get(&key) {
-                s
-            } else {
-                let selected = RUNTIME
-                    .with(|rt| {
-                        let cell = rt.borrow().signals.get(self.inner.source.id).cloned();
-                        cell.and_then(|c| c.borrow().downcast_ref::<T>().map(|cur| *cur == key))
-                    })
-                    .unwrap_or(false);
-                let s = create_signal(selected);
-                subs.insert(key.clone(), s);
-                s
-            }
-        };
-        sig.get()
-    }
-
-    pub fn dispose(self) {
-        dispose_effect(self.inner._effect);
-        for (_, sig) in self.inner.subs.borrow_mut().drain() {
-            sig.dispose();
-        }
-    }
-}
-
-pub fn create_selector<T: Eq + std::hash::Hash + Clone + 'static>(
-    source: Signal<T>,
-) -> Selector<T> {
-    let subs: Rc<RefCell<HashMap<T, Signal<bool>>>> = Rc::new(RefCell::new(HashMap::new()));
-    let subs_c = subs.clone();
-    let eff = create_effect(move || {
-        let cur = source.get();
-        let subs = subs_c.borrow();
-        for (k, &sig) in subs.iter() {
-            let is_sel = *k == cur;
-            let changed = RUNTIME
-                .with(|rt| {
-                    let cell = rt.borrow().signals.get(sig.id).cloned();
-                    cell.and_then(|c| {
-                        c.borrow()
-                            .downcast_ref::<bool>()
-                            .copied()
-                            .map(|v| v != is_sel)
-                    })
-                })
-                .unwrap_or(false);
-            if changed {
-                sig.set(is_sel);
-            }
-        }
-    });
-    Selector {
-        inner: Rc::new(SelectorInner {
-            source,
-            subs,
-            _effect: eff,
-        }),
-    }
-}
-
-pub struct Memo<T: 'static> {
-    signal: Signal<T>,
-    _effect: EffectId,
-}
-
-impl<T: 'static> Clone for Memo<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T: 'static> Copy for Memo<T> {}
-
-impl<T: 'static> Memo<T> {
-    pub fn signal(self) -> Signal<T> {
-        self.signal
-    }
-
-    pub fn get(self) -> T
-    where
-        T: Clone,
-    {
-        self.signal.get()
-    }
-
-    pub fn try_get(self) -> Option<T>
-    where
-        T: Clone,
-    {
-        self.signal.try_get()
-    }
-
-    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
-        self.signal.with(f)
-    }
-
-    pub fn dispose(self) {
-        dispose_effect(self._effect);
-        self.signal.dispose();
-    }
-}
-
-pub fn create_memo<T: PartialEq + Clone + 'static>(mut f: impl FnMut() -> T + 'static) -> Memo<T> {
-    let initial = f();
-    let sig = create_signal(initial);
-    let mut first = true;
-    let eff = create_effect(move || {
-        let next = f();
-        if first {
-            first = false;
-            return;
-        }
-        let changed = sig.try_with(|cur| *cur != next).unwrap_or(false);
-        if changed {
-            sig.set(next);
-        }
-    });
-    Memo {
-        signal: sig,
-        _effect: eff,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-
-    #[test]
-    fn signal_tracks_and_reruns_effects() {
-        let count = create_signal(1);
-        let observed = Rc::new(Cell::new(0));
-        let obs_clone = observed.clone();
-
-        let eff = create_effect(move || {
-            obs_clone.set(count.get() * 10);
-        });
-        assert_eq!(observed.get(), 10);
-
-        count.set(4);
-        assert_eq!(observed.get(), 10);
-        assert_eq!(flush_effects(), 1);
-        assert_eq!(observed.get(), 40);
-
-        dispose_effect(eff);
-        count.set(9);
-        assert_eq!(flush_effects(), 0);
-        assert_eq!(observed.get(), 40);
-        count.dispose();
-    }
-
-    #[test]
-    fn owned_signal_cleans_up_on_drop_and_try_get_is_safe() {
-        let handle = {
-            let owned = OwnedSignal::new(42);
-            let sig = owned.signal();
-            assert_eq!(sig.try_get(), Some(42));
-            assert!(sig.is_alive());
-            sig
-        };
-        assert!(!handle.is_alive());
-        assert_eq!(handle.try_get(), None);
-    }
-
-    #[test]
-    fn nested_reads_inside_update_and_with_do_not_panic() {
-        let a = create_signal(5);
-        let b = create_signal(10);
-        a.update(|v| *v += b.get());
-        assert_eq!(a.get(), 15);
-
-        let sum = a.with(|av| *av + b.get());
-        assert_eq!(sum, 25);
-        a.dispose();
-        b.dispose();
-    }
-
-    #[test]
-    fn effect_panic_restores_tracking_stack() {
-        let trigger = create_signal(0);
-        let clean_sig = create_signal(1);
-        let observed = Rc::new(Cell::new(0));
-
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            create_effect(move || {
-                let _ = trigger.get();
-                panic!("boom inside effect");
-            });
-        }));
-        assert!(res.is_err());
-
-        let obs = observed.clone();
-        let eff = create_effect(move || {
-            obs.set(clean_sig.get());
-        });
-        assert_eq!(observed.get(), 1);
-
-        clean_sig.set(7);
-        flush_effects();
-        assert_eq!(observed.get(), 7);
-
-        dispose_effect(eff);
-        trigger.dispose();
-        clean_sig.dispose();
-    }
-}
+include!("runtime.rs");
+include!("signal.rs");
+include!("effects.rs");
+include!("dispatcher.rs");
+include!("derived.rs");
+include!("tests.rs");
