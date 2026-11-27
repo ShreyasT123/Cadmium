@@ -1,15 +1,15 @@
-# Cadmium & Magnum Roadmap to v1.0.0
+# Cadmium & Xune Roadmap to v1.0.0
 
 **Current Version:** 0.1.0 (preparing `0.2.0` preview)  
 **Target:** v1.0.0 Industry-Ready Release  
-**Graphics Backend:** `wgpu` 30 (Magnum Engine)  
+**Graphics Backend:** `wgpu` 30 (Xune Engine)  
 **Primary Showcase & Dogfood App:** **Cadmium Music** (`apps/dogfood`)
 
 ---
 
 ## Completed Milestones
 
-### Phase 1–3.5: Magnum Engine, Reactive Core & Hardening (Completed)
+### Phase 1–3.5: Xune Engine, Reactive Core & Hardening (Completed)
 - [x] Multi-window `GpuContext` + `WindowRenderTarget` + lazy `GlassOffscreen` blur pyramid with dirty-region blur skipping.
 - [x] Instanced SDF (`sdf.wgsl`), 9-tap Dual-Kawase blur (`blur.wgsl`), 2-texture Liquid Glass (`glass.wgsl`), shelf glyph atlas (`text.wgsl`), textured quads (`textured.wgsl`), `lyon` paths (`path.wgsl`), and `CustomGpuSurface` (`animate_when` + `redraw_on`).
 - [x] Generational `WidgetArena` (`slotmap`), `Signal<T>`, `OwnedSignal<T>`, `create_memo`, `create_selector`, `ForEach`, `Show`, and animated `Switcher` with `DrawList` opacity stack.

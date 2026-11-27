@@ -46,7 +46,7 @@
 //! create_effect(move || seen.set(count.get() * 10));
 //! assert_eq!(observed.get(), 10); // effects run once when created
 //!
-//! let doubled = create_memo(|| count.get() * 2);
+//! let doubled = create_memo(move|| count.get() * 2);
 //! assert_eq!(doubled.get(), 2); // memos compute their initial value eagerly
 //!
 //! count.set(4); // marks subscribers dirty; no callback runs yet

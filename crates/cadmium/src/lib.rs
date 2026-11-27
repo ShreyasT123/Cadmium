@@ -52,7 +52,7 @@
 //! ```no_run
 //! use cadmium::{
 //!     create_signal, AlignItems, App, Button, Column, Edges, FontWeight,
-//!     MacTheme, Switch, Text, WidgetWindow, WindowSpec,
+//!     IntoElement, MacTheme, Switch, Text, WidgetWindow, WindowSpec,
 //! };
 //!
 //! fn main() -> Result<(), cadmium::CadmiumError> {
@@ -82,6 +82,8 @@
 //!             title: "Hello".into(),
 //!             width: 420.0,
 //!             height: 260.0,
+//!             min_width: None,
+//!             min_height: None,
 //!             borderless: false,
 //!             clear_color: theme.window_bg,
 //!             delegate: Box::new(delegate),

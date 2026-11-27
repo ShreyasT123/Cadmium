@@ -202,6 +202,8 @@ pub trait WindowDelegate: 'static {
 ///     title: "Settings".into(),
 ///     width: 640.0,
 ///     height: 480.0,
+///     min_width: None,
+///     min_height: None,
 ///     borderless: false,
 ///     clear_color: Color::rgba(1.0, 1.0, 1.0, 1.0),
 ///     delegate: Box::new(WidgetWindow::new(|| Text::new("Settings").into_element())),

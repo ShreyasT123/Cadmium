@@ -151,7 +151,7 @@ pub fn create_selector<T: Eq + std::hash::Hash + Clone + 'static>(
 /// use cadmium::reactive::{create_memo, create_signal, flush_effects, Memo};
 ///
 /// let count = create_signal(2);
-/// let doubled: Memo<i32> = create_memo(|| count.get() * 2);
+/// let doubled: Memo<i32> = create_memo(move || count.get() * 2);
 /// assert_eq!(doubled.get(), 4);
 ///
 /// count.set(5);
@@ -246,7 +246,7 @@ impl<T: 'static> Memo<T> {
 ///
 /// let width = create_signal(3);
 /// let height = create_signal(4);
-/// let area = create_memo(|| width.get() * height.get());
+/// let area = create_memo(move || width.get() * height.get());
 /// assert_eq!(area.get(), 12);
 ///
 /// width.set(5);

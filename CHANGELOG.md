@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Cadmium and the Magnum rendering engine will be documented in this file.
+All notable changes to Cadmium and the Xune rendering engine will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -28,4 +28,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-11-23
 
 ### Added
-- Initial Magnum `wgpu` 30 rendering engine (`sdf.wgsl`, `blur.wgsl`, `glass.wgsl`, `text.wgsl`, `textured.wgsl`), generational `WidgetArena`, `Signal<T>`, Taffy 0.15 layout integration, `Spring` physics, `TextInput`, `ScrollView`, `Tabs`, `Dropdown`, `TrafficLights`, and `examples/liquid_glass`.
+- Initial Xune `wgpu` 30 rendering engine (`sdf.wgsl`, `blur.wgsl`, `glass.wgsl`, `text.wgsl`, `textured.wgsl`), generational `WidgetArena`, `Signal<T>`, Taffy 0.15 layout integration, `Spring` physics, `TextInput`, `ScrollView`, `Tabs`, `Dropdown`, `TrafficLights`, and `examples/liquid_glass`.

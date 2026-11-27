@@ -122,6 +122,8 @@ fn main() {
         title: "Cadmium App".into(),
         width: 800.0,
         height: 500.0,
+        min_width: None,
+        min_height: None,
         borderless: false,
         clear_color: theme.window_bg,
         delegate: Box::new(window),

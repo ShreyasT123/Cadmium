@@ -61,6 +61,8 @@ struct PaintCtx<'a, 'b> {
 ///         title: "Counter".into(),
 ///         width: 320.0,
 ///         height: 240.0,
+///         min_width: None,
+///         min_height: None,
 ///         borderless: false,
 ///         clear_color: Color::rgba(1.0, 1.0, 1.0, 1.0),
 ///         delegate: Box::new(delegate),

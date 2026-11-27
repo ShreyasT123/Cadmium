@@ -20,6 +20,8 @@
 //!     title: "Hello".into(),
 //!     width: 480.0,
 //!     height: 320.0,
+//!     min_width: None,
+//!     min_height: None,
 //!     borderless: false,
 //!     clear_color: Color::rgba(1.0, 1.0, 1.0, 1.0),
 //!     delegate: Box::new(WidgetWindow::new(|| {
