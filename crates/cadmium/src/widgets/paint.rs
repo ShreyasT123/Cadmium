@@ -794,50 +794,144 @@ fn paint_node(
                     }
 
                     let row_y = viewport.y + idx as f32 * stride - scroll_val;
-                    let row_rect = Rect::new(viewport.x, row_y, viewport.width - 10.0, item_h);
+                    let row_rect = Rect::new(viewport.x, row_y, viewport.width - 12.0, item_h);
                     let is_sel = selected_idx == Some(idx);
                     let is_hov = hovered_idx == Some(idx);
+                    let active_accent = st.accent.unwrap_or(theme.accent);
 
-                    let fill = if is_sel {
-                        theme.accent_soft
-                    } else if is_hov {
-                        theme.control_hover
-                    } else {
-                        theme.panel_bg
-                    };
-
-                    pctx.ctx.push_sdf(SdfQuad {
-                        rect: snap_rect_to_pixels(row_rect, scale),
-                        radii: CornerRadii::all(8.0).scale(scale),
-                        fill,
-                        border_color: if is_sel { theme.accent } else { theme.hairline },
-                        border_width: 1.0 * scale,
-                        ..Default::default()
-                    });
-
-                    let slot = &st.pool[slot_idx];
-                    pctx.ctx.push_text_colored(
-                        &slot.title,
-                        row_rect.x + 14.0,
-                        row_rect.y + 7.0,
-                        if is_sel {
-                            theme.accent
+                    if st.flat {
+                        let fill = if is_sel {
+                            Color::rgba(active_accent.r, active_accent.g, active_accent.b, 0.14)
+                        } else if is_hov {
+                            theme.control_hover
+                        } else if idx % 2 == 1 {
+                            Color::rgba(
+                                theme.text_primary.r,
+                                theme.text_primary.g,
+                                theme.text_primary.b,
+                                0.026,
+                            )
                         } else {
-                            theme.text_primary
-                        },
-                    );
-                    pctx.ctx.push_text_colored(
-                        &slot.subtitle,
-                        row_rect.x + 14.0,
-                        row_rect.y + 25.0,
-                        theme.text_secondary,
-                    );
-                    pctx.ctx.push_text_colored(
-                        &slot.badge,
-                        row_rect.x + row_rect.width - slot.badge_width - 14.0,
-                        row_rect.y + (item_h - 16.0) * 0.5,
-                        theme.text_secondary,
-                    );
+                            Color::TRANSPARENT
+                        };
+
+                        if fill.a > 0.001 {
+                            pctx.ctx.push_sdf(SdfQuad {
+                                rect: snap_rect_to_pixels(row_rect, scale),
+                                radii: CornerRadii::all(6.0).scale(scale),
+                                fill,
+                                ..Default::default()
+                            });
+                        }
+                    } else {
+                        let fill = if is_sel {
+                            theme.accent_soft
+                        } else if is_hov {
+                            theme.control_hover
+                        } else {
+                            theme.panel_bg
+                        };
+
+                        pctx.ctx.push_sdf(SdfQuad {
+                            rect: snap_rect_to_pixels(row_rect, scale),
+                            radii: CornerRadii::all(8.0).scale(scale),
+                            fill,
+                            border_color: if is_sel { active_accent } else { theme.hairline },
+                            border_width: 1.0 * scale,
+                            ..Default::default()
+                        });
+                    }
+
+                    // Optional deduplicated row artwork thumbnail
+                    let mut text_start_x = row_rect.x + 14.0;
+                    if let Some(art_fn) = st.row_art.as_mut() {
+                        let art = art_fn(idx);
+                        let key = Arc::as_ptr(&art) as usize;
+                        let (handle, aw, ah) = if let Some(&cached) = st.art_cache.get(&key) {
+                            cached
+                        } else {
+                            let h = pctx.ctx.gpu_mut().upload_image(&art);
+                            let entry = (h, art.width, art.height);
+                            st.art_cache.insert(key, entry);
+                            entry
+                        };
+                        let thumb_sz = (item_h - 12.0).clamp(24.0, 38.0);
+                        let thumb_rect = Rect::new(
+                            row_rect.x + 12.0,
+                            row_rect.y + (item_h - thumb_sz) * 0.5,
+                            thumb_sz,
+                            thumb_sz,
+                        );
+                        pctx.ctx.push_image(ImageQuad {
+                            rect: snap_rect_to_pixels(thumb_rect, scale),
+                            uv_rect: cover_uv_rect(aw, ah, thumb_sz, thumb_sz),
+                            radii: CornerRadii::all(5.0).scale(scale),
+                            tint: Color::rgba(1.0, 1.0, 1.0, 1.0),
+                            texture: handle,
+                        });
+                        text_start_x = row_rect.x + 12.0 + thumb_sz + 12.0;
+                    }
+
+                    if st.columns_mode {
+                        let title_w = (row_rect.width * 0.44 - (text_start_x - row_rect.x)).max(60.0);
+                        let artist_x = row_rect.x + row_rect.width * 0.48;
+                        let artist_w = (row_rect.width * 0.40 - 16.0).max(40.0);
+                        let text_y = row_rect.y + (item_h - 18.0) * 0.5;
+                        let slot = &st.pool[slot_idx];
+
+                        pctx.ctx.push_clip(Rect::new(text_start_x, row_rect.y, title_w, item_h));
+                        pctx.ctx.push_text_colored(
+                            &slot.title,
+                            text_start_x,
+                            text_y,
+                            if is_sel {
+                                active_accent
+                            } else {
+                                theme.text_primary
+                            },
+                        );
+                        pctx.ctx.pop_clip();
+
+                        pctx.ctx.push_clip(Rect::new(artist_x, row_rect.y, artist_w, item_h));
+                        pctx.ctx.push_text_colored(
+                            &slot.subtitle,
+                            artist_x,
+                            text_y,
+                            theme.text_secondary,
+                        );
+                        pctx.ctx.pop_clip();
+
+                        pctx.ctx.push_text_colored(
+                            &slot.badge,
+                            row_rect.x + row_rect.width - slot.badge_width - 14.0,
+                            text_y,
+                            theme.text_tertiary,
+                        );
+                    } else {
+                        let slot = &st.pool[slot_idx];
+                        pctx.ctx.push_text_colored(
+                            &slot.title,
+                            text_start_x,
+                            row_rect.y + 6.0,
+                            if is_sel {
+                                active_accent
+                            } else {
+                                theme.text_primary
+                            },
+                        );
+                        pctx.ctx.push_text_colored(
+                            &slot.subtitle,
+                            text_start_x,
+                            row_rect.y + 24.0,
+                            theme.text_secondary,
+                        );
+                        pctx.ctx.push_text_colored(
+                            &slot.badge,
+                            row_rect.x + row_rect.width - slot.badge_width - 14.0,
+                            row_rect.y + (item_h - 16.0) * 0.5,
+                            theme.text_secondary,
+                        );
+                    }
                 }
             }
 
@@ -855,7 +949,12 @@ fn paint_node(
                 pctx.ctx.push_sdf(SdfQuad {
                     rect: snap_rect_to_pixels(thumb_rect, scale),
                     radii: CornerRadii::all(2.0).scale(scale),
-                    fill: Color::from_rgba8(0, 0, 0, 75),
+                    fill: Color::rgba(
+                        theme.text_tertiary.r,
+                        theme.text_tertiary.g,
+                        theme.text_tertiary.b,
+                        0.42,
+                    ),
                     ..Default::default()
                 });
             }

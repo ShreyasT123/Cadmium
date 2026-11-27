@@ -2,15 +2,15 @@
 resolver = "2"
 members = [
     "crates/cadmium",
-    "apps/dogfood",
-    "apps/zedis",
+    "examples/music",
+    "examples/zedis",
     "examples/liquid_glass",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 authors = ["Shreyas Thale"]
 repository = "https://github.com/ShreyasT123/cadmium"
 

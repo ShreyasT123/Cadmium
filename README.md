@@ -8,7 +8,7 @@
 **Early experimental prototype (`v0.1.0`) — active Phase 3 development.**
 
 [![CI](https://github.com/ShreyasT123/cadmium/actions/workflows/ci.yml/badge.svg)](https://github.com/ShreyasT123/cadmium/actions)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![GPU](https://img.shields.io/badge/graphics-wgpu%2030-purple.svg)](https://wgpu.rs)
 
@@ -141,10 +141,10 @@ Features elastic spring drag-and-drop, SVG icon rendering, crystal-clear optical
 cargo run -p liquid_glass
 ```
 
-### 2. Cadmium Studio (Dogfood App)
+### 2. Cadmium Studio (music App)
 Demonstrates the retained `WidgetArena`, reactive `Signal` updates, background worker dispatching via `UiDispatcher`, clipboard integration, and native file dialogs:
 ```powershell
-cargo run -p cadmium_dogfood
+cargo run -p cadmium_music
 ```
 
 ---
@@ -166,9 +166,6 @@ We welcome community contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.m
 
 ## License
 
-Cadmium is dual-licensed under either:
+Cadmium is licensed under the [Apache License, Version 2.0](LICENSE).
 
-* **MIT License** ([LICENSE-MIT](LICENSE-MIT))
-* **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
-
-at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you shall be dual-licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you shall be licensed under the Apache License, Version 2.0, without any additional terms or conditions.

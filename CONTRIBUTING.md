@@ -21,3 +21,7 @@ Thank you for your interest in contributing to cadmium!
    ```
 3. **Branching:** Create feature branches off `main` (e.g. `feat/bezier-paths` or `fix/swapchain-resize`).
 4. **Commit Messages:** Use clear, descriptive commit messages following standard conventional commit guidelines.
+
+## Licensing
+
+By contributing to cadmium, you agree that your contributions are licensed under the Apache License, Version 2.0, the project's sole license. See [LICENSE](LICENSE) for the full terms.

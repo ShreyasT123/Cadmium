@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -9,7 +10,7 @@ use cadmium::{
     Length, MacTheme, Material, MenuItem, ProgressBar, Row, ScrollView, Shadow, Show, Signal,
     Slider, Spacer, Stack, Switcher, Text, TextInput, TextTone, ThemeMode, TrafficLights,
     VirtualRow, VirtualizedList, WidgetWindow, WindowSpec, Wrap, create_effect, create_memo,
-    create_signal,
+    create_signal, load_image_file,
 };
 
 // ── Crisp SVG Vector Icons ───────────────────────────────────────────────────────
@@ -49,48 +50,83 @@ struct Track {
     art: Arc<DecodedImage>,
 }
 
-fn gen_art(
-    seed: usize,
-    c1: [f32; 3],
-    c2: [f32; 3],
-    c3: [f32; 3],
-    w: u32,
-    h: u32,
-) -> Arc<DecodedImage> {
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    let p = seed as f32 * 1.47;
-    for y in 0..h {
-        for x in 0..w {
-            let u = x as f32 / w as f32;
-            let v = y as f32 / h as f32;
-            let dx = u - 0.52;
-            let dy = v - 0.48;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let angle = dy.atan2(dx);
-            let swirl = (dist * 8.5 - angle * 2.0 + p).sin() * 0.5 + 0.5;
-            let stripe = ((u * 7.0 + v * 3.0 + p).cos() * 0.5 + 0.5) * 0.45;
-            let halo = (1.0 - (dist * 1.8).min(1.0)).powf(1.6) * 0.5;
-
-            let t1 = (u * 0.65 + v * 0.35 + swirl * 0.32).clamp(0.0, 1.0);
-            let t2 = (stripe + halo).clamp(0.0, 1.0);
-            let r = ((c1[0] * (1.0 - t1) + c2[0] * t1) * (1.0 - t2 * 0.45) + c3[0] * t2 * 0.6)
-                .clamp(0.0, 1.0);
-            let g = ((c1[1] * (1.0 - t1) + c2[1] * t1) * (1.0 - t2 * 0.45) + c3[1] * t2 * 0.6)
-                .clamp(0.0, 1.0);
-            let b = ((c1[2] * (1.0 - t1) + c2[2] * t1) * (1.0 - t2 * 0.45) + c3[2] * t2 * 0.6)
-                .clamp(0.0, 1.0);
-
-            rgba.push((r * 255.0) as u8);
-            rgba.push((g * 255.0) as u8);
-            rgba.push((b * 255.0) as u8);
-            rgba.push(255);
+fn load_asset_png(rel: &str) -> Arc<DecodedImage> {
+    let manifest_rel = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    let candidates = [Path::new(rel), manifest_rel.as_path()];
+    for path in candidates {
+        if path.exists() {
+            match load_image_file(path) {
+                Ok(img) => return Arc::new(img),
+                Err(err) => tracing::warn!("Failed to decode {}: {err}", path.display()),
+            }
         }
     }
+    tracing::warn!("Asset not found: {rel}; using 1x1 dark fallback");
     Arc::new(DecodedImage {
-        width: w,
-        height: h,
-        rgba,
+        width: 1,
+        height: 1,
+        rgba: vec![24, 24, 28, 255],
     })
+}
+
+fn srgb_u8_to_linear(v: u8) -> f32 {
+    let c = v as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Samples dominant left/right-half colors from a real album PNG for subtle stage bleed.
+fn extract_bleed_colors(img: &DecodedImage) -> ([f32; 3], [f32; 3]) {
+    let w = img.width.max(1) as usize;
+    let h = img.height.max(1) as usize;
+    let step_x = (w / 18).max(1);
+    let step_y = (h / 18).max(1);
+
+    let mut acc_a = [0.0f32; 3];
+    let mut w_a = 0.0f32;
+    let mut acc_b = [0.0f32; 3];
+    let mut w_b = 0.0f32;
+
+    for y in (0..h).step_by(step_y) {
+        for x in (0..w).step_by(step_x) {
+            let idx = (y * w + x) * 4;
+            if idx + 3 >= img.rgba.len() {
+                continue;
+            }
+            let r = srgb_u8_to_linear(img.rgba[idx]);
+            let g = srgb_u8_to_linear(img.rgba[idx + 1]);
+            let b = srgb_u8_to_linear(img.rgba[idx + 2]);
+            let max_c = r.max(g).max(b);
+            let min_c = r.min(g).min(b);
+            let weight = (max_c - min_c) * 2.0 + 0.15;
+
+            if x < w / 2 {
+                acc_a[0] += r * weight;
+                acc_a[1] += g * weight;
+                acc_a[2] += b * weight;
+                w_a += weight;
+            } else {
+                acc_b[0] += r * weight;
+                acc_b[1] += g * weight;
+                acc_b[2] += b * weight;
+                w_b += weight;
+            }
+        }
+    }
+
+    let norm = |acc: [f32; 3], wt: f32| {
+        if wt > 0.001 {
+            [acc[0] / wt, acc[1] / wt, acc[2] / wt]
+        } else {
+            [0.35, 0.20, 0.35]
+        }
+    };
+    (norm(acc_a, w_a), norm(acc_b, w_b))
 }
 
 const BEATS_STAGE_WGSL: &str = r#"
@@ -344,238 +380,124 @@ fn main() {
         .with_env_filter("info,wgpu=warn")
         .init();
 
+    // Load real PNG assets directly from `assets/`
+    let art_one = load_asset_png("examples/assets/albums/one.png");
+    let art_two = load_asset_png("examples/assets/albums/two.png");
+    let art_three = load_asset_png("examples/assets/albums/three.png");
+    let art_four = load_asset_png("examples/assets/albums/four.png");
+    let art_five = load_asset_png("examples/assets/albums/five.png");
+    let art_six = load_asset_png("examples/assets/albums/six.png");
+    let art_seven = load_asset_png("examples/assets/albums/seven.png");
+    let art_bg = load_asset_png("examples/assets/bg.png");
+
+    let make_track = |title, artist, album, duration_secs, explicit, art: Arc<DecodedImage>| {
+        let (color_a, color_b) = extract_bleed_colors(&art);
+        Track {
+            title,
+            artist,
+            album,
+            duration_secs,
+            explicit,
+            color_a,
+            color_b,
+            art,
+        }
+    };
+
     let tracks = vec![
-        Track {
-            title: "Cruel World",
-            artist: "Holly Humberstone",
-            album: "Cruel World",
-            duration_secs: 218,
-            explicit: false,
-            color_a: [0.06, 0.14, 0.28],
-            color_b: [0.22, 0.54, 0.88],
-            art: gen_art(
-                1,
-                [0.06, 0.14, 0.28],
-                [0.22, 0.54, 0.88],
-                [0.95, 0.88, 0.72],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Snakeskin Boots",
-            artist: "Miranda Lambert & Ella Langley",
-            album: "Single",
-            duration_secs: 194,
-            explicit: false,
-            color_a: [0.55, 0.22, 0.12],
-            color_b: [0.88, 0.52, 0.28],
-            art: gen_art(
-                2,
-                [0.55, 0.22, 0.12],
-                [0.88, 0.52, 0.28],
-                [0.96, 0.92, 0.84],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Us Again",
-            artist: "Gavin Adcock & Treaty Oak",
-            album: "Actin' Up",
-            duration_secs: 206,
-            explicit: false,
-            color_a: [0.18, 0.18, 0.22],
-            color_b: [0.58, 0.58, 0.62],
-            art: gen_art(
-                3,
-                [0.18, 0.18, 0.22],
-                [0.58, 0.58, 0.62],
-                [0.92, 0.92, 0.94],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Psycho Killer (2024)",
-            artist: "Talking Heads",
-            album: "77",
-            duration_secs: 261,
-            explicit: false,
-            color_a: [0.65, 0.10, 0.14],
-            color_b: [0.18, 0.18, 0.20],
-            art: gen_art(
-                4,
-                [0.65, 0.10, 0.14],
-                [0.18, 0.18, 0.20],
-                [0.96, 0.86, 0.82],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Draw You Out",
-            artist: "Noah Kahan",
-            album: "OST",
-            duration_secs: 232,
-            explicit: false,
-            color_a: [0.12, 0.34, 0.26],
-            color_b: [0.32, 0.66, 0.52],
-            art: gen_art(
-                5,
-                [0.12, 0.34, 0.26],
-                [0.32, 0.66, 0.52],
-                [0.88, 0.95, 0.86],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Why Don't You Say So",
-            artist: "Dexter and The Moonrocks",
-            album: "Western Space",
-            duration_secs: 185,
-            explicit: false,
-            color_a: [0.48, 0.28, 0.14],
-            color_b: [0.82, 0.64, 0.36],
-            art: gen_art(
-                6,
-                [0.48, 0.28, 0.14],
-                [0.82, 0.64, 0.36],
-                [0.98, 0.92, 0.82],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "HELEN KELLER",
-            artist: "Placebo",
-            album: "Never Let Me Go",
-            duration_secs: 210,
-            explicit: false,
-            color_a: [0.20, 0.08, 0.12],
-            color_b: [0.92, 0.24, 0.32],
-            art: gen_art(
-                7,
-                [0.20, 0.08, 0.12],
-                [0.92, 0.24, 0.32],
-                [0.96, 0.96, 0.98],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Man In The Box",
-            artist: "HARDY",
-            album: "Quit!!",
-            duration_secs: 244,
-            explicit: true,
-            color_a: [0.26, 0.20, 0.14],
-            color_b: [0.64, 0.52, 0.38],
-            art: gen_art(
-                8,
-                [0.26, 0.20, 0.14],
-                [0.64, 0.52, 0.38],
-                [0.90, 0.86, 0.80],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "HONEYMOON NIGHT",
-            artist: "Teezo Touchdown",
-            album: "How Do You Sleep",
-            duration_secs: 178,
-            explicit: true,
-            color_a: [0.58, 0.12, 0.34],
-            color_b: [0.92, 0.44, 0.68],
-            art: gen_art(
-                9,
-                [0.58, 0.12, 0.34],
-                [0.92, 0.44, 0.68],
-                [0.98, 0.90, 0.94],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Close To Me (Solo)",
-            artist: "Ellie Goulding & Diplo",
-            album: "Brightest Blue",
-            duration_secs: 189,
-            explicit: false,
-            color_a: [0.44, 0.32, 0.12],
-            color_b: [0.88, 0.72, 0.36],
-            art: gen_art(
-                10,
-                [0.44, 0.32, 0.12],
-                [0.88, 0.72, 0.36],
-                [0.98, 0.96, 0.88],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "Moving at Light Speed",
-            artist: "Thundercat",
-            album: "It Is What It Is",
-            duration_secs: 226,
-            explicit: false,
-            color_a: [0.16, 0.08, 0.24],
-            color_b: [0.96, 0.48, 0.12],
-            art: gen_art(
-                11,
-                [0.16, 0.08, 0.24],
-                [0.96, 0.48, 0.12],
-                [0.98, 0.84, 0.28],
-                160,
-                160,
-            ),
-        },
-        Track {
-            title: "The Myth",
-            artist: "DOWN",
-            album: "NOLA",
-            duration_secs: 252,
-            explicit: true,
-            color_a: [0.12, 0.10, 0.10],
-            color_b: [0.62, 0.28, 0.18],
-            art: gen_art(
-                12,
-                [0.12, 0.10, 0.10],
-                [0.62, 0.28, 0.18],
-                [0.88, 0.84, 0.78],
-                160,
-                160,
-            ),
-        },
+        make_track(
+            "Cruel World",
+            "Holly Humberstone",
+            "Cruel World",
+            218,
+            false,
+            art_one.clone(),
+        ),
+        make_track(
+            "Snakeskin Boots",
+            "Miranda Lambert & Ella Langley",
+            "Single",
+            194,
+            false,
+            art_two.clone(),
+        ),
+        make_track(
+            "Us Again",
+            "Gavin Adcock & Treaty Oak",
+            "Actin' Up",
+            206,
+            false,
+            art_three.clone(),
+        ),
+        make_track(
+            "Psycho Killer (2024)",
+            "Talking Heads",
+            "77",
+            261,
+            false,
+            art_four.clone(),
+        ),
+        make_track(
+            "Draw You Out",
+            "Noah Kahan",
+            "OST",
+            232,
+            false,
+            art_five.clone(),
+        ),
+        make_track(
+            "Why Don't You Say So",
+            "Dexter and The Moonrocks",
+            "Western Space",
+            185,
+            false,
+            art_six.clone(),
+        ),
+        make_track(
+            "HELEN KELLER",
+            "Placebo",
+            "Never Let Me Go",
+            210,
+            false,
+            art_seven.clone(),
+        ),
+        make_track(
+            "Man In The Box",
+            "HARDY",
+            "Quit!!",
+            244,
+            true,
+            art_two.clone(),
+        ),
+        make_track(
+            "HONEYMOON NIGHT",
+            "Teezo Touchdown",
+            "How Do You Sleep",
+            178,
+            true,
+            art_four.clone(),
+        ),
+        make_track(
+            "Close To Me (Solo)",
+            "Ellie Goulding & Diplo",
+            "Brightest Blue",
+            189,
+            false,
+            art_six.clone(),
+        ),
+        make_track(
+            "Moving at Light Speed",
+            "Thundercat",
+            "It Is What It Is",
+            226,
+            false,
+            art_three.clone(),
+        ),
+        make_track("The Myth", "DOWN", "NOLA", 252, true, art_five.clone()),
     ];
-    let hero_arts = [
-        gen_art(
-            101,
-            [0.06, 0.08, 0.14],
-            [0.18, 0.52, 0.96],
-            [0.96, 0.96, 0.98],
-            320,
-            190,
-        ),
-        gen_art(
-            102,
-            [0.96, 0.22, 0.08],
-            [0.98, 0.80, 0.10],
-            [0.12, 0.16, 0.28],
-            320,
-            190,
-        ),
-        gen_art(
-            103,
-            [0.22, 0.22, 0.24],
-            [0.58, 0.58, 0.62],
-            [0.88, 0.76, 0.62],
-            320,
-            190,
-        ),
-    ];
+
+    let hero_arts = [art_bg.clone(), art_two.clone(), art_seven.clone()];
+    let avatar_art = art_one.clone();
     let color_pairs: Vec<([f32; 3], [f32; 3])> =
         tracks.iter().map(|t| (t.color_a, t.color_b)).collect();
 
@@ -602,15 +524,6 @@ fn main() {
         create_memo(move || breakpoint.get() == Breakpoint::Compact && !sidebar_open.get());
     let stage_active = create_memo(move || active_nav.get() == 3);
     let bg_animating = create_memo(move || is_playing.get() && active_nav.get() == 3);
-
-    let avatar_art = gen_art(
-        77,
-        [0.28, 0.20, 0.34],
-        [0.68, 0.42, 0.52],
-        [0.96, 0.88, 0.84],
-        128,
-        128,
-    );
 
     // Zero-wakeup playback timer thread (parks on Condvar when paused)
     let play_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -675,11 +588,11 @@ fn main() {
         }
     });
 
-    // Theme-reactive materials (zero harsh white borders in Dark Mode; translucent frosted continuity)
-    let canvas_mat = create_signal(Material::solid(Color::TRANSPARENT));
+    // Theme-reactive materials (zero harsh white borders in Dark Mode; opaque browse canvas)
+    let canvas_mat = create_signal(Material::solid(Color::from_rgba8(16, 16, 20, 255)));
     let sidebar_mat = create_signal(Material::Frosted {
         tint: Color::from_rgba8(18, 17, 22, 138),
-        frost: 0.60,
+        frost: 0.62,
         specular: 0.0,
         border_color: Color::TRANSPARENT,
         border_width: 0.0,
@@ -687,19 +600,19 @@ fn main() {
     });
     let divider_mat = create_signal(Material::solid(Color::from_rgba8(255, 255, 255, 10)));
     let dock_mat = create_signal(Material::Liquid {
-        tint: Color::from_rgba8(24, 24, 28, 175),
+        tint: Color::from_rgba8(24, 24, 28, 178),
         frost: 0.42,
-        ripple: 0.42,
+        ripple: 0.40,
         specular: 0.16,
         rim_angle: -1.309,
         sheen_progress: 0.0,
         conic_strength: 0.0,
         border_color: Color::from_rgba8(255, 255, 255, 14),
         border_width: 1.0,
-        shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 150), 24.0, 10.0)),
+        shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 155), 24.0, 10.0)),
     });
     let popover_mat = create_signal(Material::Frosted {
-        tint: Color::from_rgba8(28, 28, 34, 215),
+        tint: Color::from_rgba8(28, 28, 34, 218),
         frost: 0.55,
         specular: 0.12,
         border_color: Color::from_rgba8(255, 255, 255, 14),
@@ -751,11 +664,9 @@ fn main() {
                     border_width: 1.0,
                     shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 44), 20.0, 8.0)),
                 });
-                search_stage_mat.set(Material::solid(Color::from_rgba8(255, 255, 255, 242)));
+                search_stage_mat.set(Material::solid(Color::from_rgba8(120, 120, 128, 22)));
             }
             ThemeMode::Dark => {
-                // Opaque on browse pages so the sidebar still gets full-window bleed
-                // without Stage waveforms peeking behind cards; Transparent on Stage (3).
                 canvas_mat.set(if on_stage {
                     Material::solid(Color::TRANSPARENT)
                 } else {
@@ -852,7 +763,7 @@ fn main() {
                 }))
         };
 
-        // ── 1. Frosted Left Sidebar (Full Height, Borderless, Bleeds Color) ──────
+        // ── 1. Frosted Left Sidebar ─────────────────────────────────────────────
         let pins_dropdown = Show::new(pins_open, {
             let tr = tracks.clone();
             let pi = play_index.clone();
@@ -1172,9 +1083,9 @@ fn main() {
                 0,
             ));
 
-        // Single Wrap across all 12 songs so 3->2->1 columns never leave orphan rows
         let mut song_grid = Wrap::new().padding(Edges::xy(28.0, 0.0)).gap(14.0);
-        for (idx, tr) in tracks.iter().enumerate().take(12) {
+        for idx in 0..12 {
+            let tr = &tracks[idx];
             let pi = play_index.clone();
             let t_title = tr.title;
             let t_artist = tr.artist;
@@ -1313,7 +1224,7 @@ fn main() {
             .child(new_week_row)
             .child(Container::new().height(Length::Px(88.0)));
 
-        // ── 3. View 3: Now-Playing Atmospheric Stage (Transparent over Full-Window Bleed!) ──
+        // ── 3. View 3: Now-Playing Atmospheric Stage ────────────────────────────
         let mut featured_shows = Row::new().gap(14.0);
         for i in 0..6 {
             let tr = &tracks[(i + 2) % 12];
@@ -1370,7 +1281,6 @@ fn main() {
             .flex_grow(1.0)
             .padding(Edges::xy(32.0, 18.0))
             .gap(12.0)
-            // Top bar: Back <, Forward >, Centered search pill, Close X
             .child(
                 Row::new()
                     .height(Length::Px(36.0))
@@ -1409,13 +1319,11 @@ fn main() {
             )
             // Breathing space where the single unbroken audio visualizer wave flows cleanly
             .child(Container::new().height(Length::Px(132.0)))
-            // Central 3-column stage: PREVIOUS TRACK | LIVE NOW ART | UPCOMING QUEUE
             .child(
                 Row::new()
                     .padding(Edges::xy(28.0, 0.0))
                     .gap(36.0)
                     .align(AlignItems::Center)
-                    // Left: Previous Track
                     .child(
                         Container::column()
                             .width(Length::Px(0.0))
@@ -1475,7 +1383,6 @@ fn main() {
                                 .color(Color::from_rgba8(156, 156, 166, 225)),
                             ),
                     )
-                    // Center: LIVE NOW + Bleed-backed Active Artwork
                     .child(
                         Column::new()
                             .width(Length::Px(216.0))
@@ -1514,7 +1421,6 @@ fn main() {
                                 .color(Color::from_rgba8(168, 168, 178, 230)),
                             ),
                     )
-                    // Right: Clean Upcoming Queue
                     .child(
                         Column::new()
                             .width(Length::Px(0.0))
@@ -1625,11 +1531,50 @@ fn main() {
             .child(featured_shows)
             .child(Container::new().height(Length::Px(72.0)));
 
-        // ── 4. Search, Home, and 100k Library Views ─────────────────────────────
+        // ── 4. Search, Home, and 100k Library Views (Apple Music Table Theme) ────
+        let songs_header_strip = |col1: &'static str, col2: &'static str| {
+            Column::new()
+                .gap(6.0)
+                .child(
+                    Row::new()
+                        .padding(Edges::xy(12.0, 0.0))
+                        .child(
+                            Container::row().width(Length::Percent(0.48)).child(
+                                Text::new(col1)
+                                    .size(11.5)
+                                    .weight(FontWeight::Medium)
+                                    .tone(TextTone::Tertiary),
+                            ),
+                        )
+                        .child(
+                            Text::new(col2)
+                                .size(11.5)
+                                .weight(FontWeight::Medium)
+                                .tone(TextTone::Tertiary),
+                        )
+                        .child(Spacer::flex())
+                        .child(
+                            Container::row().padding(Edges::xy(14.0, 0.0)).child(
+                                Text::new("Time")
+                                    .size(11.5)
+                                    .weight(FontWeight::Medium)
+                                    .tone(TextTone::Tertiary),
+                            ),
+                        ),
+                )
+                .child(
+                    Container::new()
+                        .width(Length::Percent(1.0))
+                        .height(Length::Px(1.0))
+                        .bind_material(divider_mat),
+                )
+        };
+
         let search_view = Column::new()
             .flex_grow(1.0)
-            .padding(Edges::all(28.0))
-            .gap(16.0)
+            .padding(Edges::xy(28.0, 12.0))
+            .gap(14.0)
+            .child(Container::new().height(Length::Px(10.0)).drag_region())
             .child(
                 Text::new("Search")
                     .size(30.0)
@@ -1637,21 +1582,35 @@ fn main() {
                     .tone(TextTone::Primary),
             )
             .child(
-                TextInput::new(search_query)
-                    .placeholder("Artists, Songs, Lyrics, and More...")
-                    .width(Length::Px(380.0)),
+                Container::new()
+                    .bind_material(search_stage_mat)
+                    .radius(10.0)
+                    .width(Length::Px(380.0))
+                    .child(
+                        TextInput::new(search_query)
+                            .placeholder("Artists, Songs, Lyrics, and More...")
+                            .width(Length::Px(380.0))
+                            .material(Material::solid(Color::TRANSPARENT)),
+                    ),
             )
+            .child(songs_header_strip("Title", "Artist • Album"))
             .child(
-                VirtualizedList::new(tracks.len(), 52.0, {
+                VirtualizedList::new(tracks.len(), 48.0, {
                     let tr = tracks.clone();
                     move |idx| {
                         let t = &tr[idx % tr.len()];
                         VirtualRow {
                             title: t.title.into(),
-                            subtitle: format!("{} • {}", t.artist, t.album),
+                            subtitle: format!("{} — {}", t.artist, t.album),
                             badge: format_mm_ss(t.duration_secs),
                         }
                     }
+                })
+                .columns_mode()
+                .accent(apple_pink)
+                .row_art({
+                    let tr = tracks.clone();
+                    move |idx| tr[idx % tr.len()].art.clone()
                 })
                 .selected(current_track)
                 .on_select({
@@ -1661,12 +1620,14 @@ fn main() {
                         active_nav.set(3);
                     }
                 }),
-            );
+            )
+            .child(Container::new().height(Length::Px(64.0)));
 
         let home_view = Column::new()
             .flex_grow(1.0)
-            .padding(Edges::all(28.0))
+            .padding(Edges::xy(28.0, 12.0))
             .gap(14.0)
+            .child(Container::new().height(Length::Px(10.0)).drag_region())
             .child(
                 Text::new("Home")
                     .size(30.0)
@@ -1679,14 +1640,24 @@ fn main() {
                     .weight(FontWeight::Bold)
                     .tone(TextTone::Primary),
             )
+            .child(songs_header_strip("Title", "Artist • Album"))
             .child(
-                VirtualizedList::new(12, 54.0, {
+                VirtualizedList::new(12, 48.0, {
                     let tr = tracks.clone();
-                    move |idx| VirtualRow {
-                        title: tr[idx % 12].title.into(),
-                        subtitle: format!("{} • {}", tr[idx % 12].artist, tr[idx % 12].album),
-                        badge: format_mm_ss(tr[idx % 12].duration_secs),
+                    move |idx| {
+                        let t = &tr[idx % tr.len()];
+                        VirtualRow {
+                            title: t.title.into(),
+                            subtitle: format!("{} — {}", t.artist, t.album),
+                            badge: format_mm_ss(t.duration_secs),
+                        }
                     }
+                })
+                .columns_mode()
+                .accent(apple_pink)
+                .row_art({
+                    let tr = tracks.clone();
+                    move |idx| tr[idx % tr.len()].art.clone()
                 })
                 .selected(current_track)
                 .on_select({
@@ -1696,29 +1667,100 @@ fn main() {
                         active_nav.set(3);
                     }
                 }),
-            );
+            )
+            .child(Container::new().height(Length::Px(64.0)));
 
+        let pi_play_all = play_index.clone();
+        let pi_shuffle_all = play_index.clone();
         let library_100k = Column::new()
             .flex_grow(1.0)
-            .padding(Edges::all(28.0))
+            .padding(Edges::xy(28.0, 12.0))
             .gap(14.0)
+            .child(Container::new().height(Length::Px(10.0)).drag_region())
             .child(
-                Text::new("Songs • 100,000 Tracks")
-                    .size(30.0)
-                    .weight(FontWeight::Bold)
-                    .tone(TextTone::Primary),
+                Row::new()
+                    .align(AlignItems::End)
+                    .gap(16.0)
+                    .child(
+                        Column::new()
+                            .gap(2.0)
+                            .child(
+                                Text::new("Songs")
+                                    .size(30.0)
+                                    .weight(FontWeight::Bold)
+                                    .tone(TextTone::Primary),
+                            )
+                            .child(
+                                Text::new("100,000 tracks • Lossless 24-bit/192kHz")
+                                    .size(12.0)
+                                    .tone(TextTone::Secondary),
+                            ),
+                    )
+                    .child(Spacer::flex())
+                    .child(
+                        Container::row()
+                            .height(Length::Px(32.0))
+                            .padding(Edges::xy(14.0, 0.0))
+                            .gap(6.0)
+                            .radius(16.0)
+                            .align(AlignItems::Center)
+                            .fill(apple_pink)
+                            .on_click(move || pi_play_all(0))
+                            .child(
+                                Icon::svg(ICO_PLAY, 13.0)
+                                    .color(Color::from_rgba8(255, 255, 255, 255)),
+                            )
+                            .child(
+                                Text::new("Play")
+                                    .size(12.5)
+                                    .weight(FontWeight::Semibold)
+                                    .color(Color::from_rgba8(255, 255, 255, 255)),
+                            ),
+                    )
+                    .child(
+                        Container::row()
+                            .height(Length::Px(32.0))
+                            .padding(Edges::xy(14.0, 0.0))
+                            .gap(6.0)
+                            .radius(16.0)
+                            .align(AlignItems::Center)
+                            .fill(Color::from_rgba8(120, 120, 128, 36))
+                            .hover_fill(hover_pill_fill)
+                            .on_click(move || {
+                                shuffle_on.set(true);
+                                pi_shuffle_all((current_track.get() + 5) % 12);
+                            })
+                            .child(Icon::svg(ICO_SHUFFLE, 13.0).color(apple_pink))
+                            .child(
+                                Text::new("Shuffle")
+                                    .size(12.5)
+                                    .weight(FontWeight::Semibold)
+                                    .tone(TextTone::Primary),
+                            ),
+                    ),
             )
+            .child(songs_header_strip("Title", "Artist • Album"))
             .child(
                 VirtualizedList::new(100_000, 48.0, {
                     let tr = tracks.clone();
                     move |idx| {
                         let t = &tr[idx % tr.len()];
                         VirtualRow {
-                            title: format!("{:05}  {}", idx + 1, t.title),
-                            subtitle: format!("{} • {}", t.artist, t.album),
+                            title: if t.explicit {
+                                format!("{}  [E]", t.title)
+                            } else {
+                                t.title.to_string()
+                            },
+                            subtitle: format!("{} — {}", t.artist, t.album),
                             badge: format_mm_ss(t.duration_secs),
                         }
                     }
+                })
+                .columns_mode()
+                .accent(apple_pink)
+                .row_art({
+                    let tr = tracks.clone();
+                    move |idx| tr[idx % tr.len()].art.clone()
                 })
                 .selected(current_track)
                 .on_select({
@@ -1728,7 +1770,8 @@ fn main() {
                         active_nav.set(3);
                     }
                 }),
-            );
+            )
+            .child(Container::new().height(Length::Px(64.0)));
 
         let content_switcher = Switcher::new(
             active_nav,
@@ -1972,7 +2015,6 @@ fn main() {
             .child(queue_popover)
             .child(player_capsule);
 
-        // Full-window Stack: Album-art bleed + waveform sits at Layer 0 behind Frosted Sidebar AND Stage
         Stack::new()
             .flex_grow(1.0)
             .child(

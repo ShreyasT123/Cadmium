@@ -358,11 +358,11 @@ cadmium is organized into decoupled internal subsystems (maintained as logical m
 
 ---
 
-# 21. Dogfood Validation Strategy
+# 21. music Validation Strategy
 
 Long-term architectural benchmarks include applications on the scale of **Notion, VS Code, Discord, and DaVinci Resolve**.
 
-To validate cadmium before v1.0 stabilization, development will drive a **multi-pane Workspace & Creative Inspector dogfood application** designed to stress-test all core bets simultaneously:
+To validate cadmium before v1.0 stabilization, development will drive a **multi-pane Workspace & Creative Inspector music application** designed to stress-test all core bets simultaneously:
 - **Multi-pane docking, splitters, and tabs** (including tearing off a panel into a second OS window).
 - **A virtualized file/node tree** (10,000+ rows, icons, keyboard navigation, selection).
 - **An inspector & document panel** (nested Taffy layouts, text editing, sliders, dropdowns, scrolling, async background updates).
@@ -398,10 +398,10 @@ To validate cadmium before v1.0 stabilization, development will drive a **multi-
 - Time-based animation engine (springs, easings, transitions, reduced-motion support).
 - **Milestone:** cadmium's signature visual identity, fluid motion, and complete editing experience.
 
-## Phase 5 — Advanced Workspace Widgets & Dogfood Application
+## Phase 5 — Advanced Workspace Widgets & music Application
 - Tier 2 widgets (`VirtualizedList`, `TreeView`, `Table`, `SplitPane`, `DockArea`, `CommandPalette`, `MenuBar`, `ColorPicker`, `Toast`).
 - Drag-and-drop and detached multi-window panel tear-off.
-- Build and iterate on the **Workspace & Creative Inspector dogfood app**.
+- Build and iterate on the **Workspace & Creative Inspector music app**.
 - **Milestone:** Real-world architectural stress-test completed across Windows, Linux, and macOS.
 
 ## Phase 6 — Optimization, Visual Regression & v1.0 Release
@@ -422,7 +422,7 @@ cadmium reaches v1.0 readiness when:
 5. Typography supports Unicode, emoji, wrapping, selection, clipboard, and IME composition reliably.
 6. Accessibility trees (`AccessKit`) and full keyboard navigation work across Tier 1 and Tier 2 widgets.
 7. Custom GPU surfaces composite cleanly beneath overlays, popovers, and rounded clips.
-8. The dogfood workspace application runs stably across all target platforms with automated benchmarks and visual regression tests passing.
+8. The music workspace application runs stably across all target platforms with automated benchmarks and visual regression tests passing.
 
 ---
 

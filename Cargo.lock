@@ -546,7 +546,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cadmium"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -569,8 +569,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "cadmium_dogfood"
-version = "0.1.0"
+name = "cadmium_music"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "cadmium",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "cadmium_zedis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cadmium",
  "tracing-subscriber",
@@ -1609,7 +1609,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "liquid_glass"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cadmium",
  "tracing",

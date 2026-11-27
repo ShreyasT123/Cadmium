@@ -1,5 +1,5 @@
 [package]
-name = "cadmium_dogfood"
+name = "cadmium_music"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -30,11 +30,16 @@ struct VirtualListState {
     item_count: usize,
     item_height: f32,
     gap: f32,
+    flat: bool,
+    columns_mode: bool,
+    accent: Option<Color>,
     scroll_y: Spring,
     hovered_row: Option<usize>,
     selected: Option<Signal<usize>>,
     on_select: Option<Box<dyn FnMut(usize)>>,
     row_builder: Box<dyn FnMut(usize) -> VirtualRow>,
+    row_art: Option<Box<dyn FnMut(usize) -> Arc<DecodedImage>>>,
+    art_cache: HashMap<usize, (TextureHandle, u32, u32)>,
     pool: Vec<VirtualRowSlot>,
 }
 
@@ -349,6 +354,13 @@ impl WidgetArena {
                         self.pending_texture_releases.push(handle);
                     }
                 }
+                WidgetPayload::VirtualizedList { state } => {
+                    for (_, (handle, _, _)) in state.into_inner().art_cache {
+                        if released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
+                    }
+                }
                 _ => {}
             }
             self.layout.remove(node.layout_node);
@@ -463,6 +475,13 @@ impl WidgetArena {
                         && released.insert(handle)
                     {
                         self.pending_texture_releases.push(handle);
+                    }
+                }
+                WidgetPayload::VirtualizedList { state } => {
+                    for (_, (handle, _, _)) in state.into_inner().art_cache {
+                        if released.insert(handle) {
+                            self.pending_texture_releases.push(handle);
+                        }
                     }
                 }
                 _ => {}
@@ -2064,11 +2083,16 @@ impl WidgetArena {
                             item_count: vl.item_count,
                             item_height: vl.item_height,
                             gap: vl.gap,
+                            flat: vl.flat,
+                            columns_mode: vl.columns_mode,
+                            accent: vl.accent,
                             scroll_y: Spring::new(0.0, 260.0, 24.0),
                             hovered_row: None,
                             selected: vl.selected,
                             on_select: vl.on_select,
                             row_builder: vl.row_builder,
+                            row_art: vl.row_art,
+                            art_cache: HashMap::new(),
                             pool,
                         }),
                     },

@@ -498,9 +498,13 @@ pub struct VirtualizedList {
     item_count: usize,
     item_height: f32,
     gap: f32,
+    flat: bool,
+    columns_mode: bool,
+    accent: Option<Color>,
     selected: Option<Signal<usize>>,
     on_select: Option<Box<dyn FnMut(usize)>>,
     row_builder: Box<dyn FnMut(usize) -> VirtualRow>,
+    row_art: Option<Box<dyn FnMut(usize) -> Arc<DecodedImage>>>,
 }
 
 impl VirtualizedList {
@@ -518,9 +522,13 @@ impl VirtualizedList {
             item_count,
             item_height: item_height.max(20.0),
             gap: 6.0,
+            flat: false,
+            columns_mode: false,
+            accent: None,
             selected: None,
             on_select: None,
             row_builder: Box::new(row_builder),
+            row_art: None,
         }
     }
 
@@ -533,6 +541,34 @@ impl VirtualizedList {
     /// Binds the highlighted row to a signal holding its index.
     pub fn selected(mut self, sig: Signal<usize>) -> Self {
         self.selected = Some(sig);
+        self
+    }
+
+    /// Renders rows as borderless Apple-Music-style list rows with subtle alternating
+    /// tint instead of boxed cards.
+    pub fn flat(mut self) -> Self {
+        self.flat = true;
+        self.gap = 0.0;
+        self
+    }
+
+    /// Lays out rows as a horizontal single-line media table (`[Art] Title | Subtitle | Time`).
+    pub fn columns_mode(mut self) -> Self {
+        self.columns_mode = true;
+        self.flat = true;
+        self.gap = 0.0;
+        self
+    }
+
+    /// Overrides the active selection highlight color (defaults to the theme accent).
+    pub fn accent(mut self, color: Color) -> Self {
+        self.accent = Some(color);
+        self
+    }
+
+    /// Supplies an optional album/thumbnail image per row index (deduplicated on GPU).
+    pub fn row_art(mut self, f: impl FnMut(usize) -> Arc<DecodedImage> + 'static) -> Self {
+        self.row_art = Some(Box::new(f));
         self
     }
 

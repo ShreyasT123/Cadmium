@@ -85,24 +85,18 @@ fn hit_test(r: Rect, x: f32, y: f32) -> bool {
 }
 
 fn load_bg_or_fallback() -> DecodedImage {
-    for candidate in [
-        "bg.png",
-        "assets/bg.png",
-        "apps/dogfood/assets/bg.png",
-        "examples/liquid_glass/bg.png",
-    ] {
-        if Path::new(candidate).exists() {
-            match load_image_file(candidate) {
-                Ok(img) => {
-                    tracing::info!(
-                        "Loaded background image from {candidate} ({}x{})",
-                        img.width,
-                        img.height
-                    );
-                    return img;
-                }
-                Err(e) => tracing::warn!("Failed to decode {candidate}: {e}"),
+    let bg = "examples/assets/bg.png";
+    if Path::new(bg).exists() {
+        match load_image_file(bg) {
+            Ok(img) => {
+                tracing::info!(
+                    "Loaded background image from {bg} ({}x{})",
+                    img.width,
+                    img.height
+                );
+                return img;
             }
+            Err(e) => tracing::warn!("Failed to decode {bg}: {e}"),
         }
     }
 

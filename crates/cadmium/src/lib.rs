@@ -119,13 +119,13 @@
 //! Cadmium builds on [`taffy`](https://docs.rs/taffy),
 //! [`cosmic-text`](https://docs.rs/cosmic-text), and
 //! [`wgpu`](https://docs.rs/wgpu). It is developed in the same workspace as
-//! the `cadmium_dogfood` and `liquid_glass` example applications.
+//! the `cadmium_music` and `liquid_glass` example applications.
 //!
 //! ## Additional resources
 //!
 //! - [Repository and examples](https://github.com/ShreyasT123/cadmium)
 //! - [Project README](https://github.com/ShreyasT123/cadmium#readme)
-//! - Dual-licensed under MIT or Apache-2.0, at your option.
+//! - Licensed under the Apache License, Version 2.0 (see `LICENSE` in the repository root).
 
 #![warn(missing_docs)]
 
