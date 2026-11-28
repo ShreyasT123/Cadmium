@@ -37,7 +37,7 @@
 //!
 //! The builder tree is not the live UI. [`WidgetArena`] owns the mounted
 //! widget nodes, their layout nodes, focus state, reactive effects, and cached
-//! GPU textures. [`WidgetArena::mount`] recursively converts an [`Element`]
+//! GPU textures. [`WidgetArena::mount`] iteratively converts an [`Element`]
 //! tree into arena nodes and returns the root [`WidgetId`]; replacing a tree
 //! with another call to `mount` discards the previous one and releases its
 //! resources. Most applications never call this directly: [`WidgetWindow`]
