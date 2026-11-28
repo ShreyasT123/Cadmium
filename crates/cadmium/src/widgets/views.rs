@@ -708,7 +708,8 @@ impl IntoElement for Show {
     }
 }
 
-type ForEachReconcile = Box<dyn FnMut(&mut WidgetArena, &mut TextEngine, WidgetId)>;
+type ForEachItem = (u64, Option<WidgetId>, Option<Element>);
+type ForEachBuild = Box<dyn FnMut(&mut HashMap<u64, WidgetId>) -> Vec<ForEachItem>>;
 
 /// A keyed, signal-driven container that reconciles its children in place.
 ///
@@ -723,7 +724,7 @@ type ForEachReconcile = Box<dyn FnMut(&mut WidgetArena, &mut TextEngine, WidgetI
 /// rows ambiguous.
 pub struct ForEach {
     layout: LayoutStyle,
-    reconcile: ForEachReconcile,
+    build: ForEachBuild,
     bind_signal: Box<dyn FnOnce(DirtyQueue, WidgetId) -> EffectId>,
 }
 
@@ -753,51 +754,21 @@ impl ForEach {
         mut key_fn: impl FnMut(&T) -> u64 + 'static,
         mut item_builder: impl FnMut(&T) -> Element + 'static,
     ) -> Self {
-        let mut mounted_keys: HashMap<u64, WidgetId> = HashMap::new();
-
-        let reconcile = Box::new(
-            move |arena: &mut WidgetArena, text: &mut TextEngine, parent_id: WidgetId| {
-                let mut next_children: Vec<WidgetId> = Vec::new();
-                let mut next_map: HashMap<u64, WidgetId> = HashMap::new();
-
-                let _ = items.try_with(|list| {
-                    next_children.reserve(list.len());
-                    next_map.reserve(list.len());
-                    for item in list.iter() {
-                        let k = key_fn(item);
-                        let child_id = if let Some(existing) = mounted_keys.remove(&k) {
-                            existing
-                        } else {
-                            let elem = item_builder(item);
-                            let cid = arena.mount_node(elem, text);
-                            if let Some(node) = arena.nodes.get_mut(cid) {
-                                node.parent = Some(parent_id);
-                            }
-                            cid
-                        };
-                        next_children.push(child_id);
-                        next_map.insert(k, child_id);
+        let build = Box::new(move |mounted_keys: &mut HashMap<u64, WidgetId>| {
+            let mut plan = Vec::new();
+            let _ = items.try_with(|list| {
+                plan.reserve(list.len());
+                for item in list.iter() {
+                    let key = key_fn(item);
+                    if let Some(id) = mounted_keys.remove(&key) {
+                        plan.push((key, Some(id), None));
+                    } else {
+                        plan.push((key, None, Some(item_builder(item))));
                     }
-                });
-
-                for (_, stale_id) in mounted_keys.drain() {
-                    arena.unmount_subtree(stale_id);
                 }
-                mounted_keys = next_map;
-
-                let child_lnodes: Vec<LayoutNode> = next_children
-                    .iter()
-                    .filter_map(|id| arena.nodes.get(*id).map(|n| n.layout_node))
-                    .collect();
-                if let Some(parent_lnode) = arena.nodes.get(parent_id).map(|n| n.layout_node) {
-                    if let Some(node) = arena.nodes.get_mut(parent_id) {
-                        node.children = next_children;
-                    }
-                    arena.layout.set_children(parent_lnode, &child_lnodes);
-                    arena.layout.mark_dirty(parent_lnode);
-                }
-            },
-        );
+            });
+            plan
+        });
 
         let bind_signal = Box::new(move |q: DirtyQueue, id: WidgetId| {
             create_effect(move || {
@@ -816,7 +787,7 @@ impl ForEach {
 
         Self {
             layout: LayoutStyle::default(),
-            reconcile,
+            build,
             bind_signal,
         }
     }

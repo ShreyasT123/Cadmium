@@ -145,7 +145,7 @@ enum WidgetPayload {
         when_false: Option<Box<dyn FnMut() -> Element>>,
     },
     ForEach {
-        reconcile: ForEachReconcile,
+        state: ForEachState,
     },
     Tabs {
         signal: Signal<usize>,
@@ -178,6 +178,32 @@ enum WidgetPayload {
         color: Color,
     },
     Spacer,
+}
+
+struct ForEachState {
+    build: ForEachBuild,
+    mounted_keys: HashMap<u64, WidgetId>,
+}
+
+enum MountTask {
+    Enter(Element),
+    FinishElement {
+        element: Element,
+        child_count: usize,
+        show_active: Option<bool>,
+        switcher_active: Option<usize>,
+    },
+    ReconcileForEach {
+        id: WidgetId,
+        returns_root: bool,
+    },
+    FinishForEach {
+        id: WidgetId,
+        keys: Vec<u64>,
+        children: Vec<Option<WidgetId>>,
+        new_count: usize,
+        returns_root: bool,
+    },
 }
 
 struct WidgetNode {
@@ -271,9 +297,9 @@ impl WidgetArena {
     /// Replaces the current tree with `element` and returns the new root id.
     ///
     /// The previous tree is cleared first: its effects are disposed, its
-    /// textures are queued for release, and focus is reset. Nodes are created
-    /// recursively in depth-first order, and the whole tree is marked for a
-    /// full layout pass before the next measurement.
+    /// textures are queued for release, and focus is reset.
+    /// Elements are traversed in depth-first order using an explicit worklist,
+    /// and the whole tree is marked for a full layout pass before measurement.
     ///
     /// The returned [`WidgetId`] identifies the root node in this arena. It is
     /// only valid until the next `mount`, `clear`, or unmount of that subtree.
@@ -745,24 +771,14 @@ impl WidgetArena {
         }
 
         for id in foreach_dirty {
-            let reconcile_fn = if let Some(node) = self.nodes.get_mut(id) {
-                if let WidgetPayload::ForEach { reconcile } = &mut node.payload {
-                    Some(std::mem::replace(reconcile, Box::new(|_, _, _| {})))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(mut reconcile_fn) = reconcile_fn {
-                reconcile_fn(self, text, id);
-                if let Some(node) = self.nodes.get_mut(id)
-                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
-                {
-                    *reconcile = reconcile_fn;
-                }
-                self.needs_full_layout = true;
-            }
+            self.run_mount_tasks(
+                vec![MountTask::ReconcileForEach {
+                    id,
+                    returns_root: false,
+                }],
+                text,
+            );
+            self.needs_full_layout = true;
         }
 
         if self.needs_full_layout || self.dirty_layout_roots.len() > 32 {
@@ -880,13 +896,247 @@ impl WidgetArena {
     }
 
     fn mount_node(&mut self, element: Element, text: &mut TextEngine) -> WidgetId {
+        self.run_mount_tasks(vec![MountTask::Enter(element)], text)
+            .pop()
+            .expect("mount task did not produce a root widget")
+    }
+
+    fn run_mount_tasks(
+        &mut self,
+        mut tasks: Vec<MountTask>,
+        text: &mut TextEngine,
+    ) -> Vec<WidgetId> {
+        let mut mounted = Vec::new();
+        while let Some(task) = tasks.pop() {
+            match task {
+                MountTask::Enter(element) => match element {
+                    Element::Container(mut container) => {
+                        let children = std::mem::take(&mut container.children);
+                        tasks.push(MountTask::FinishElement {
+                            element: Element::Container(container),
+                            child_count: children.len(),
+                            show_active: None,
+                            switcher_active: None,
+                        });
+                        tasks.extend(children.into_iter().rev().map(MountTask::Enter));
+                    }
+                    Element::Glass(glass) => {
+                        tasks.push(MountTask::Enter(Element::Container(glass.inner)));
+                    }
+                    Element::Switcher(mut switcher) => {
+                        let initial_active = switcher.signal.try_get().unwrap_or(0);
+                        let children = std::mem::take(&mut switcher.children);
+                        tasks.push(MountTask::FinishElement {
+                            element: Element::Switcher(switcher),
+                            child_count: children.len(),
+                            show_active: None,
+                            switcher_active: Some(initial_active),
+                        });
+                        tasks.extend(children.into_iter().rev().map(MountTask::Enter));
+                    }
+                    Element::Show(mut show) => {
+                        let active = show.condition.try_get().unwrap_or(false);
+                        let child = if active {
+                            show.when_true.as_mut().map(|build| build())
+                        } else {
+                            show.when_false.as_mut().map(|build| build())
+                        };
+                        tasks.push(MountTask::FinishElement {
+                            element: Element::Show(show),
+                            child_count: usize::from(child.is_some()),
+                            show_active: Some(active),
+                            switcher_active: None,
+                        });
+                        if let Some(child) = child {
+                            tasks.push(MountTask::Enter(child));
+                        }
+                    }
+                    Element::ForEach(for_each) => {
+                        let id = self.mount_foreach_node(for_each);
+                        tasks.push(MountTask::ReconcileForEach {
+                            id,
+                            returns_root: true,
+                        });
+                    }
+                    Element::ScrollView(mut scroll_view) => {
+                        let children = std::mem::take(&mut scroll_view.children);
+                        tasks.push(MountTask::FinishElement {
+                            element: Element::ScrollView(scroll_view),
+                            child_count: children.len(),
+                            show_active: None,
+                            switcher_active: None,
+                        });
+                        tasks.extend(children.into_iter().rev().map(MountTask::Enter));
+                    }
+                    Element::SplitPane(mut split_pane) => {
+                        let first = split_pane
+                            .first
+                            .take()
+                            .map(|child| *child)
+                            .unwrap_or_else(|| Spacer::flex().into_element());
+                        let second = split_pane
+                            .second
+                            .take()
+                            .map(|child| *child)
+                            .unwrap_or_else(|| Spacer::flex().into_element());
+                        tasks.push(MountTask::FinishElement {
+                            element: Element::SplitPane(split_pane),
+                            child_count: 2,
+                            show_active: None,
+                            switcher_active: None,
+                        });
+                        tasks.push(MountTask::Enter(second));
+                        tasks.push(MountTask::Enter(first));
+                    }
+                    leaf => mounted.push(self.mount_node_inner(
+                        leaf,
+                        text,
+                        Vec::new(),
+                        None,
+                        None,
+                    )),
+                },
+                MountTask::FinishElement {
+                    element,
+                    child_count,
+                    show_active,
+                    switcher_active,
+                } => {
+                    let start = mounted.len() - child_count;
+                    let child_ids = mounted.split_off(start);
+                    let id = self.mount_node_inner(
+                        element,
+                        text,
+                        child_ids,
+                        show_active,
+                        switcher_active,
+                    );
+                    mounted.push(id);
+                }
+                MountTask::ReconcileForEach { id, returns_root } => {
+                    let Some(node) = self.nodes.get_mut(id) else {
+                        continue;
+                    };
+                    let WidgetPayload::ForEach { state } = &mut node.payload else {
+                        continue;
+                    };
+                    let mut old_keys = std::mem::take(&mut state.mounted_keys);
+                    let plan = (state.build)(&mut old_keys);
+                    let stale_ids: Vec<WidgetId> = old_keys.into_values().collect();
+                    for stale_id in stale_ids {
+                        self.unmount_subtree(stale_id);
+                    }
+
+                    let mut keys = Vec::with_capacity(plan.len());
+                    let mut children = Vec::with_capacity(plan.len());
+                    let mut new_elements = Vec::new();
+                    for (key, existing, element) in plan {
+                        keys.push(key);
+                        children.push(existing);
+                        if let Some(element) = element {
+                            new_elements.push(element);
+                        }
+                    }
+                    let new_count = new_elements.len();
+                    tasks.push(MountTask::FinishForEach {
+                        id,
+                        keys,
+                        children,
+                        new_count,
+                        returns_root,
+                    });
+                    tasks.extend(new_elements.into_iter().rev().map(MountTask::Enter));
+                }
+                MountTask::FinishForEach {
+                    id,
+                    keys,
+                    children,
+                    new_count,
+                    returns_root,
+                } => {
+                    let start = mounted.len() - new_count;
+                    let mut new_ids = mounted.split_off(start).into_iter();
+                    let child_ids: Vec<WidgetId> = children
+                        .into_iter()
+                        .map(|existing| {
+                            existing.unwrap_or_else(|| {
+                                new_ids.next().expect("missing mounted ForEach child")
+                            })
+                        })
+                        .collect();
+                    debug_assert!(new_ids.next().is_none());
+
+                    let mut next_keys = HashMap::with_capacity(keys.len());
+                    for (&key, &child_id) in keys.iter().zip(&child_ids) {
+                        next_keys.insert(key, child_id);
+                        if let Some(child) = self.nodes.get_mut(child_id) {
+                            child.parent = Some(id);
+                        }
+                    }
+                    let child_layout_nodes: Vec<LayoutNode> = child_ids
+                        .iter()
+                        .filter_map(|child_id| {
+                            self.nodes.get(*child_id).map(|child| child.layout_node)
+                        })
+                        .collect();
+                    if let Some(node) = self.nodes.get_mut(id)
+                        && let WidgetPayload::ForEach { state } = &mut node.payload
+                    {
+                        node.children = child_ids;
+                        state.mounted_keys = next_keys;
+                        let layout_node = node.layout_node;
+                        self.layout.set_children(layout_node, &child_layout_nodes);
+                        self.layout.mark_dirty(layout_node);
+                    }
+                    self.needs_full_layout = true;
+                    if returns_root {
+                        mounted.push(id);
+                    }
+                }
+            }
+        }
+        mounted
+    }
+
+    fn mount_foreach_node(&mut self, for_each: ForEach) -> WidgetId {
+        let layout_node = self.layout.new_container(for_each.layout, &[]);
+        let id = self.nodes.insert(WidgetNode {
+            children: Vec::new(),
+            parent: None,
+            is_relayout_boundary: matches!(
+                (for_each.layout.width, for_each.layout.height),
+                (Length::Px(_), Length::Px(_))
+            ),
+            dirty_layout_queued: false,
+            layout_node,
+            layout_style: for_each.layout,
+            bounds: Rect::default(),
+            owned_effects: Vec::new(),
+            tooltip: None,
+            context_menu: Vec::new(),
+            payload: WidgetPayload::ForEach {
+                state: ForEachState {
+                    build: for_each.build,
+                    mounted_keys: HashMap::new(),
+                },
+            },
+        });
+        self.layout_to_widget.insert(layout_node, id);
+        let effect = (for_each.bind_signal)(self.dirty_queue.clone(), id);
+        self.nodes[id].owned_effects.push(effect);
+        id
+    }
+
+    fn mount_node_inner(
+        &mut self,
+        element: Element,
+        text: &mut TextEngine,
+        child_ids: Vec<WidgetId>,
+        show_active: Option<bool>,
+        switcher_active: Option<usize>,
+    ) -> WidgetId {
         match element {
             Element::Container(c) => {
-                let child_ids: Vec<WidgetId> = c
-                    .children
-                    .into_iter()
-                    .map(|ch| self.mount_node(ch, text))
-                    .collect();
                 let child_layout_nodes: Vec<LayoutNode> = child_ids
                     .iter()
                     .map(|id| self.nodes[*id].layout_node)
@@ -962,7 +1212,7 @@ impl WidgetArena {
                 }
                 id
             }
-            Element::Glass(g) => self.mount_node(Element::Container(g.inner), text),
+            Element::Glass(_) => unreachable!("glass elements are expanded by the mount worklist"),
             Element::Image(img) => {
                 let (source_key, decoded) = match &img.source {
                     ImageSource::File(p) => (None, load_image_file(p).ok().map(Arc::new)),
@@ -1426,12 +1676,8 @@ impl WidgetArena {
                 id
             }
             Element::Switcher(sw) => {
-                let initial_active = sw.signal.try_get().unwrap_or(0);
-                let child_ids: Vec<WidgetId> = sw
-                    .children
-                    .into_iter()
-                    .map(|ch| self.mount_node(ch, text))
-                    .collect();
+                let initial_active = switcher_active
+                    .expect("switcher activation is captured by the mount worklist");
                 let child_layout_nodes: Vec<LayoutNode> = child_ids
                     .iter()
                     .map(|id| self.nodes[*id].layout_node)
@@ -1494,25 +1740,10 @@ impl WidgetArena {
                 self.switcher_ids.push(id);
                 id
             }
-            Element::Show(mut sh) => {
+            Element::Show(sh) => {
                 let condition = sh.condition;
-                let initial = condition.try_get().unwrap_or(false);
-                let mut active_child = None;
-                let child_id = if initial {
-                    sh.when_true.as_mut().map(|f| {
-                        let cid = self.mount_node(f(), text);
-                        active_child = Some(cid);
-                        cid
-                    })
-                } else {
-                    sh.when_false.as_mut().map(|f| {
-                        let cid = self.mount_node(f(), text);
-                        active_child = Some(cid);
-                        cid
-                    })
-                };
-                let children: Vec<WidgetId> = child_id.into_iter().collect();
-                let child_lnodes: Vec<LayoutNode> = children
+                let initial = show_active.expect("Show activation is captured by the mount worklist");
+                let child_lnodes: Vec<LayoutNode> = child_ids
                     .iter()
                     .filter_map(|cid| self.nodes.get(*cid).map(|n| n.layout_node))
                     .collect();
@@ -1521,7 +1752,7 @@ impl WidgetArena {
                     parent: None,
                     is_relayout_boundary: false,
                     dirty_layout_queued: false,
-                    children: children.clone(),
+                    children: child_ids.clone(),
                     layout_node: lnode,
                     layout_style: sh.layout,
                     bounds: Rect::default(),
@@ -1536,7 +1767,7 @@ impl WidgetArena {
                     },
                 });
                 self.layout_to_widget.insert(lnode, id);
-                for &child in &children {
+                for &child in &child_ids {
                     if let Some(node) = self.nodes.get_mut(child) {
                         node.parent = Some(id);
                     }
@@ -1557,38 +1788,7 @@ impl WidgetArena {
                 self.nodes[id].owned_effects.push(eff);
                 id
             }
-            Element::ForEach(mut fe) => {
-                let lnode = self.layout.new_container(fe.layout, &[]);
-                let id = self.nodes.insert(WidgetNode {
-                    children: Vec::new(),
-                    parent: None,
-                    is_relayout_boundary: matches!(
-                        (fe.layout.width, fe.layout.height),
-                        (Length::Px(_), Length::Px(_))
-                    ),
-                    dirty_layout_queued: false,
-                    layout_node: lnode,
-                    layout_style: fe.layout,
-                    bounds: Rect::default(),
-                    owned_effects: Vec::new(),
-                    tooltip: None,
-                    context_menu: Vec::new(),
-                    payload: WidgetPayload::ForEach {
-                        reconcile: Box::new(|_, _, _| {}),
-                    },
-                });
-                self.layout_to_widget.insert(lnode, id);
-                let eff = (fe.bind_signal)(self.dirty_queue.clone(), id);
-                self.nodes[id].owned_effects.push(eff);
-                // Populate initial children immediately on mount!
-                (fe.reconcile)(self, text, id);
-                if let Some(node) = self.nodes.get_mut(id)
-                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
-                {
-                    *reconcile = fe.reconcile;
-                }
-                id
-            }
+            Element::ForEach(_) => unreachable!("ForEach elements are handled by the mount worklist"),
             Element::Tabs(tb) => {
                 let count = tb.items.len().max(1);
                 let lstyle = LayoutStyle {
@@ -1828,11 +2028,6 @@ impl WidgetArena {
                 id
             }
             Element::ScrollView(sv) => {
-                let child_ids: Vec<WidgetId> = sv
-                    .children
-                    .into_iter()
-                    .map(|ch| self.mount_node(ch, text))
-                    .collect();
                 let child_lnodes: Vec<LayoutNode> = child_ids
                     .iter()
                     .map(|id| self.nodes[*id].layout_node)
@@ -1903,17 +2098,9 @@ impl WidgetArena {
                 id
             }
             Element::SplitPane(sp) => {
-                let first_elem = sp
-                    .first
-                    .map(|b| *b)
-                    .unwrap_or_else(|| Spacer::flex().into_element());
-                let second_elem = sp
-                    .second
-                    .map(|b| *b)
-                    .unwrap_or_else(|| Spacer::flex().into_element());
-
-                let first_id = self.mount_node(first_elem, text);
-                let second_id = self.mount_node(second_elem, text);
+                let mut children = child_ids.into_iter();
+                let first_id = children.next().expect("SplitPane first child was not mounted");
+                let second_id = children.next().expect("SplitPane second child was not mounted");
 
                 let init_ratio = sp
                     .ratio

@@ -1084,8 +1084,7 @@ fn main() {
             ));
 
         let mut song_grid = Wrap::new().padding(Edges::xy(28.0, 0.0)).gap(14.0);
-        for idx in 0..12 {
-            let tr = &tracks[idx];
+        for (idx, tr) in tracks.iter().enumerate().take(12) {
             let pi = play_index.clone();
             let t_title = tr.title;
             let t_artist = tr.artist;

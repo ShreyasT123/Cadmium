@@ -1440,24 +1440,14 @@ where
         }
 
         for id in foreach_dirty {
-            let reconcile_fn = if let Some(node) = self.arena.nodes.get_mut(id) {
-                if let WidgetPayload::ForEach { reconcile } = &mut node.payload {
-                    Some(std::mem::replace(reconcile, Box::new(|_, _, _| {})))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(mut reconcile_fn) = reconcile_fn {
-                reconcile_fn(&mut self.arena, ctx.text_engine(), id);
-                if let Some(node) = self.arena.nodes.get_mut(id)
-                    && let WidgetPayload::ForEach { reconcile } = &mut node.payload
-                {
-                    *reconcile = reconcile_fn;
-                }
-                self.arena.needs_full_layout = true;
-            }
+            self.arena.run_mount_tasks(
+                vec![MountTask::ReconcileForEach {
+                    id,
+                    returns_root: false,
+                }],
+                ctx.text_engine(),
+            );
+            self.arena.needs_full_layout = true;
         }
 
         let mut split_syncs = Vec::new();
