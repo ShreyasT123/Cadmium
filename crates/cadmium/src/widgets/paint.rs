@@ -293,6 +293,7 @@ fn paint_node(
                     conic_strength: 0.0,
                     border_color: theme.hairline,
                     border_width: 1.0 * scale,
+                    ..Default::default()
                 });
             } else {
                 let fill = if is_primary {
@@ -1527,6 +1528,7 @@ fn render_material(
             rim_angle,
             sheen_progress,
             conic_strength,
+            optics,
             border_color,
             border_width,
             shadow,
@@ -1555,6 +1557,7 @@ fn render_material(
                 rim_angle,
                 sheen_progress,
                 conic_strength,
+                optics,
             });
         }
     }

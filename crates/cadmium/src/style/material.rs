@@ -1,3 +1,6 @@
+use crate::core::Color;
+use crate::renderer::GlassOptics;
+
 /// Parameters for a drop shadow behind a widget surface.
 ///
 /// Used by every variant of [`Material`]. The blur radius and offset are in logical
@@ -49,8 +52,10 @@ impl Shadow {
 ///   a Gaussian drop shadow.
 /// - [`Material::Frosted`] produces a [`crate::renderer::GlassQuad`] that blurs and tints
 ///   whatever is behind the widget, with an optional shadow pass underneath.
-/// - [`Material::Liquid`] produces the same glass quad with lens-like edge refraction,
-///   chromatic dispersion, ripple distortion, and an optional animated conic sheen.
+/// - [`Material::Liquid`] produces the same glass quad with a refracting lens: Snell's-law
+///   bending across a convex bevel, wavelength-dependent chromatic dispersion, ripple
+///   distortion, Fresnel/catchlight lighting and an optional animated conic sheen. The lens is
+///   described by [`GlassOptics`].
 ///
 /// The helper constructors [`Material::solid`], [`Material::frosted`], and
 /// [`Material::liquid`] provide sensible presets; the struct variants allow every field
@@ -98,8 +103,8 @@ pub enum Material {
         /// Optional drop shadow drawn behind the glass. `None` disables it.
         shadow: Option<Shadow>,
     },
-    /// "Liquid glass": a convex optical bezel that refracts the backdrop, splits red,
-    /// green, and blue samples for chromatic dispersion, adds a slow organic ripple, and
+    /// "Liquid glass": a convex optical bezel that refracts the backdrop with Snell's law, splits red,
+    /// green, and blue by wavelength-dependent index of refraction, adds a slow organic ripple, and
     /// can sweep a conic sheen around the rim. An optional shadow pass is drawn first.
     Liquid {
         /// Tint color blended over the refracted backdrop; alpha controls tint strength.
@@ -107,11 +112,11 @@ pub enum Material {
         /// Blend factor between sharp and blurred backdrop in the flat center. The lens
         /// bevel reduces this near the rim to keep refracted detail crisp.
         frost: f32,
-        /// Amplitude of the organic wave distortion applied to the backdrop; `0.0`
-        /// disables the ripple.
+        /// Amplitude of the organic wave distortion applied to the backdrop, in logical
+        /// pixels; `0.0` disables the ripple.
         ripple: f32,
-        /// Strength of the crisp specular highlight on the bezel. Used when the conic
-        /// sheen is disabled (see `conic_strength`).
+        /// Strength of the bevel catchlights. Cross-fades with the conic sheen as
+        /// `conic_strength` rises.
         specular: f32,
         /// Angle in radians of the dark arc around the bezel rim; `-1.309` is the preset
         /// used by [`Material::liquid`].
@@ -120,8 +125,12 @@ pub enum Material {
         /// to `1.0` to sweep the highlight; it has no effect while `conic_strength` is zero.
         sheen_progress: f32,
         /// Strength of the conic sheen and refraction ring. At `0.0` the shader uses the
-        /// simpler specular-bevel path instead.
+        /// bevel catchlights instead.
         conic_strength: f32,
+        /// Lens optics: index of refraction, dispersion, bevel width, refraction depth,
+        /// convexity and light direction. [`GlassOptics::LIQUID`] is the preset used by
+        /// [`Material::liquid`]; [`GlassOptics::FLAT`] turns the lens off.
+        optics: GlassOptics,
         /// Color of the glass edge highlight, including alpha.
         border_color: Color,
         /// Border thickness in logical pixels, scaled by the device-pixel ratio when drawn.
@@ -202,8 +211,9 @@ impl Material {
     ///
     /// Uses `frost: 0.12`, `ripple: 0.25`, `specular: 0.95`, `rim_angle: -1.309`,
     /// `sheen_progress: 0.0`, and `conic_strength: 0.0` (so the initial look is the
-    /// specular bevel), plus a one-logical-pixel translucent white border (alpha `65`)
-    /// and a soft black shadow (alpha `52`, blur `18.0`, vertical offset `8.0`).
+    /// bevel catchlights), the [`GlassOptics::LIQUID`] lens, plus a one-logical-pixel translucent
+    /// white border (alpha `65`) and a soft black shadow (alpha `52`, blur `18.0`, vertical
+    /// offset `8.0`).
     ///
     /// # Examples
     ///
@@ -213,10 +223,11 @@ impl Material {
     ///
     /// let material = Material::liquid(Color::from_rgba8(255, 255, 255, 40));
     /// match material {
-    ///     Material::Liquid { frost, ripple, conic_strength, .. } => {
+    ///     Material::Liquid { frost, ripple, conic_strength, optics, .. } => {
     ///         assert_eq!(frost, 0.12);
     ///         assert_eq!(ripple, 0.25);
     ///         assert_eq!(conic_strength, 0.0);
+    ///         assert!(optics.thickness > 0.0);
     ///     }
     ///     _ => unreachable!(),
     /// }
@@ -230,12 +241,35 @@ impl Material {
             rim_angle: -1.309,
             sheen_progress: 0.0,
             conic_strength: 0.0,
+            optics: GlassOptics::LIQUID,
             border_color: Color::from_rgba8(255, 255, 255, 65),
             border_width: 1.0,
             shadow: Some(Shadow::new(Color::from_rgba8(0, 0, 0, 52), 18.0, 8.0)),
         }
     }
+
+    /// Replaces the lens optics of a [`Material::Liquid`] surface.
+    ///
+    /// The other variants have no lens and are returned unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cadmium::core::Color;
+    /// use cadmium::renderer::GlassOptics;
+    /// use cadmium::style::Material;
+    ///
+    /// let lens = GlassOptics { dispersion: 0.30, ..GlassOptics::LIQUID };
+    /// let material = Material::liquid(Color::from_rgba8(255, 255, 255, 40)).with_optics(lens);
+    /// match material {
+    ///     Material::Liquid { optics, .. } => assert_eq!(optics.dispersion, 0.30),
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
+    pub fn with_optics(mut self, lens: GlassOptics) -> Self {
+        if let Self::Liquid { optics, .. } = &mut self {
+            *optics = lens;
+        }
+        self
+    }
 }
-
-use crate::core::Color;
-

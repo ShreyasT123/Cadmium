@@ -1,3 +1,12 @@
+/// Dual-Kawase ping-pong iterations (1/2 -> 1/4 -> 1/2 resolution) run after the initial
+/// full -> 1/2 downsample. With the offsets from `blur_pyramid_uniforms` each pair adds roughly
+/// 18 px² of variance (physical pixels), so 3 pairs give a sigma of about 7 px with no tap ghosting.
+const BLUR_PAIRS: usize = 3;
+
+/// Physical-pixel margin added around a glass rect when testing whether earlier draws invalidated
+/// the backdrop: covers the blur footprint and the ripple displacement outside the rect.
+const GLASS_REBLUR_MARGIN: f32 = 32.0;
+
 /// Per-window GPU buffers and render targets used to draw a frame.
 ///
 /// One target is created for each window by [`crate::window::App`]. It owns
@@ -113,7 +122,9 @@ impl WindowRenderTarget {
     /// Zero dimensions are clamped to one; unchanged dimensions are a no-op.
     /// Existing offscreen glass targets are discarded because their size no
     /// longer matches the surface, and will be recreated on the next frame
-    /// that needs them. Call this whenever the surface is reconfigured.
+    /// that needs them. The uniform keeps the current frame scale, so shader
+    /// effects measured in logical pixels survive a resize. Call this
+    /// whenever the surface is reconfigured.
     pub fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -126,7 +137,7 @@ impl WindowRenderTarget {
 
         let globals = GlobalsUniform {
             viewport_size: [width as f32, height as f32],
-            scale: 1.0,
+            scale: self.scale,
             _pad: 0.0,
         };
         gpu.queue
@@ -143,6 +154,11 @@ impl WindowRenderTarget {
     /// UI is drawn offscreen, the glass backdrop is blurred, and the result
     /// is blitted to `surface_view`. All commands are submitted to
     /// `gpu.queue` before this method returns.
+    ///
+    /// Glass quads are composited in draw order. The backdrop snapshot and
+    /// blur pyramid are rebuilt only when a primitive or an earlier glass
+    /// quad touched the area the next glass quad samples, so glass can
+    /// refract and blur other glass.
     ///
     /// Returns `true` when glyph rasterization had to skip glyphs because
     /// the atlas is full at its maximum size. Schedule another frame in that
@@ -371,8 +387,16 @@ impl WindowRenderTarget {
                         is_first_pass = false;
                     }
 
+                    // The glass reads the backdrop a blur radius (and a ripple amplitude) beyond its own
+                    // rect, so the staleness probe is padded.
+                    let probe = [
+                        glass_rect[0] - GLASS_REBLUR_MARGIN,
+                        glass_rect[1] - GLASS_REBLUR_MARGIN,
+                        glass_rect[2] + GLASS_REBLUR_MARGIN * 2.0,
+                        glass_rect[3] + GLASS_REBLUR_MARGIN * 2.0,
+                    ];
                     let need_reblur = !has_blur_pyramid
-                        || dirty_backdrop.is_some_and(|d| phys_rects_intersect(d, glass_rect));
+                        || dirty_backdrop.is_some_and(|d| phys_rects_intersect(d, probe));
 
                     if need_reblur {
                         if let Some((backdrop_tex, _)) = &go.liquid_backdrop {
@@ -397,6 +421,8 @@ impl WindowRenderTarget {
                             );
                         }
 
+                        // full -> 1/2, then BLUR_PAIRS x (1/2 -> 1/4 -> 1/2). Pass 1 and pass 2 use the
+                        // same param bind groups every iteration; the result always lands in mip1.
                         run_blur_pass(
                             &mut encoder,
                             blur_pipe,
@@ -404,20 +430,22 @@ impl WindowRenderTarget {
                             &go.blur_param_bgs[0],
                             &go.mip1_view,
                         );
-                        run_blur_pass(
-                            &mut encoder,
-                            blur_pipe,
-                            &go.mip1_bg,
-                            &go.blur_param_bgs[1],
-                            &go.mip2_view,
-                        );
-                        run_blur_pass(
-                            &mut encoder,
-                            blur_pipe,
-                            &go.mip2_bg,
-                            &go.blur_param_bgs[2],
-                            &go.mip1_view,
-                        );
+                        for _ in 0..BLUR_PAIRS {
+                            run_blur_pass(
+                                &mut encoder,
+                                blur_pipe,
+                                &go.mip1_bg,
+                                &go.blur_param_bgs[1],
+                                &go.mip2_view,
+                            );
+                            run_blur_pass(
+                                &mut encoder,
+                                blur_pipe,
+                                &go.mip2_bg,
+                                &go.blur_param_bgs[2],
+                                &go.mip1_view,
+                            );
+                        }
                         has_blur_pyramid = true;
                         dirty_backdrop = None;
                     }
@@ -440,6 +468,18 @@ impl WindowRenderTarget {
                             pass.draw(0..4, *idx..(*idx + 1));
                         }
                     }
+
+                    // The glass just wrote into the canonical target; any later glass overlapping it must
+                    // snapshot and blur the result, not the stale pre-glass copy.
+                    dirty_backdrop = union_opt_rect(
+                        dirty_backdrop,
+                        Rect::new(
+                            glass_rect[0] - 1.0,
+                            glass_rect[1] - 1.0,
+                            glass_rect[2] + 2.0,
+                            glass_rect[3] + 2.0,
+                        ),
+                    );
                     i += 1;
                 }
                 DrawBatch::Sdf(_)

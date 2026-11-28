@@ -163,7 +163,8 @@ pub use crate::reactive::{
     create_signal, flush_effects,
 };
 pub use crate::renderer::{
-    GlassQuad, GpuContext, ImageQuad, LyonPath, PathBuilder, PathVertex, SdfQuad, TextureHandle,
+    GlassOptics, GlassQuad, GpuContext, ImageQuad, LyonPath, PathBuilder, PathVertex, SdfQuad,
+    TextureHandle,
 };
 pub use crate::style::{MacTheme, Material, Shadow, ThemeMode};
 pub use crate::text::{FontWeight, TextBlock, TextEngine, TextStyle};

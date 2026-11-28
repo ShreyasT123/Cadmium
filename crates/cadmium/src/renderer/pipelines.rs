@@ -759,6 +759,16 @@ fn create_glass_pipeline(
                 shader_location: 8,
                 format: wgpu::VertexFormat::Float32x4,
             },
+            wgpu::VertexAttribute {
+                offset: 96,
+                shader_location: 9,
+                format: wgpu::VertexFormat::Float32x4,
+            },
+            wgpu::VertexAttribute {
+                offset: 112,
+                shader_location: 10,
+                format: wgpu::VertexFormat::Float32x4,
+            },
         ],
     };
 

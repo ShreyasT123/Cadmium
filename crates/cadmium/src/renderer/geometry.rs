@@ -70,6 +70,11 @@ impl From<ImageQuad> for RawImageInstance {
     }
 }
 
+/// GPU instance record for one glass quad: 128 bytes, eight 16-byte slots, no padding.
+///
+/// Field order and offsets must match `GlassIn` in `glass.wgsl` and the attributes in
+/// `create_glass_pipeline`. Only the two trailing `vec4` slots are new; the colour and
+/// border packing above them is unchanged.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RawGlassInstance {
@@ -82,10 +87,16 @@ struct RawGlassInstance {
     specular: f32,
     frost: f32,
     glass_fx: [f32; 4],
+    glass_lens: [f32; 4],
+    glass_light: [f32; 4],
 }
+
+const _: () = assert!(std::mem::size_of::<RawGlassInstance>() == 128);
+const _: () = assert!(std::mem::size_of::<RawGlassInstance>() % 16 == 0);
 
 impl From<GlassQuad> for RawGlassInstance {
     fn from(g: GlassQuad) -> Self {
+        let (glass_lens, glass_light) = g.pack_optics();
         Self {
             rect: [g.rect.x, g.rect.y, g.rect.width, g.rect.height],
             radii: g.radii.to_array(),
@@ -101,6 +112,8 @@ impl From<GlassQuad> for RawGlassInstance {
                 g.sheen_progress,
                 g.conic_strength,
             ],
+            glass_lens,
+            glass_light,
         }
     }
 }

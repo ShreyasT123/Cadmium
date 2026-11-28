@@ -177,6 +177,92 @@ impl ImageQuad {
     }
 }
 
+/// Direction toward the key light, as an angle in radians in screen space (`y` grows downwards):
+/// `-3π/4` puts the light in the upper-left, so catchlights land on the top-left and bottom-right rim.
+const LIGHT_UPPER_LEFT: f32 = -2.356_194_5;
+
+/// Optical description of a glass lens: how its beveled rim bends, splits and reflects light.
+///
+/// The glass shader builds a convex height field from the quad's rounded-box signed distance field:
+/// the plateau in the middle is flat and the outer [`Self::bevel_width`] ring tilts up to a rim angle
+/// set by [`Self::convexity`] following a monotone `x^1.5` profile. A vertical view ray is refracted
+/// at that tilt with Snell's law, travels [`Self::thickness`] through the glass, and samples the
+/// backdrop there. Red, green and blue use slightly different indices of refraction
+/// ([`Self::dispersion`]) and are integrated over seven spectral taps, so the prism split is smooth
+/// instead of banded.
+///
+/// The refraction depth is clamped inside the shader to the largest value that keeps the sample
+/// mapping strictly monotone, so large `thickness` values saturate instead of folding the image over
+/// itself. A lower `convexity` allows a larger displacement fraction of the bevel; a higher one gives
+/// a steeper, tighter rim.
+///
+/// [`GlassOptics::FLAT`] disables refraction (plain frosted glass) and is what
+/// [`GlassQuad::default`] uses; [`GlassOptics::LIQUID`] is the Liquid Glass lens preset.
+///
+/// # Examples
+///
+/// ```
+/// use cadmium::renderer::GlassOptics;
+///
+/// let lens = GlassOptics { bevel_width: 18.0, dispersion: 0.30, ..GlassOptics::LIQUID };
+/// assert_eq!(lens.ior, 1.5);
+/// assert_eq!(GlassOptics::FLAT.thickness, 0.0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlassOptics {
+    /// Index of refraction of the glass at the green wavelength. `1.0` is air (no bending); real
+    /// glass is about `1.5`. Values below `1.0` are clamped to `1.0`.
+    pub ior: f32,
+    /// Spread of the index of refraction between the blue and red ends of the spectrum (`n_blue -
+    /// n_red`), clamped to `0.0..=0.5`. `0.0` disables chromatic dispersion. Physical crown glass is
+    /// about `0.01`; UI-visible prism fringes need roughly `0.10..=0.25`.
+    pub dispersion: f32,
+    /// Width in logical pixels of the beveled rim that refracts. The shader limits it to 48% of the
+    /// smaller half-extent, so small widgets keep a flat plateau.
+    pub bevel_width: f32,
+    /// Distance in logical pixels from the glass surface to the backdrop plane it refracts. `0.0`
+    /// disables refraction. Values beyond the monotone limit (roughly one to two bevel widths) are
+    /// clamped in the shader.
+    pub thickness: f32,
+    /// Steepness of the rim in `0.0..=1.0`, mapped to a maximum surface tilt of `sin θ = 0.30..=0.95`.
+    /// The default is `0.45`.
+    pub convexity: f32,
+    /// Direction toward the key light in radians, in screen space where `y` grows downwards. The
+    /// default is `-3π/4` (upper-left). The opposite rim receives the counter catchlight.
+    pub light_angle: f32,
+    /// Gain of the Fresnel rim glow and of the edge hairline; `0.0` removes them. The default is `1.0`.
+    pub fresnel: f32,
+    /// Width in logical pixels of the crisp catchlight on the bevel. The default is `3.5`.
+    pub edge_width: f32,
+}
+
+impl GlassOptics {
+    /// No refraction, no dispersion: flat frosted glass with a rim catchlight.
+    pub const FLAT: Self = Self {
+        ior: 1.5,
+        dispersion: 0.0,
+        bevel_width: 26.0,
+        thickness: 0.0,
+        convexity: 0.45,
+        light_angle: LIGHT_UPPER_LEFT,
+        fresnel: 1.0,
+        edge_width: 3.5,
+    };
+
+    /// Liquid Glass lens: `ior` 1.5, a 26 px bevel, 48 px of refraction depth (the shader clamps it to
+    /// the monotone limit) and `0.16` of dispersion.
+    pub const LIQUID: Self = Self {
+        ior: 1.5,
+        dispersion: 0.16,
+        bevel_width: 26.0,
+        thickness: 48.0,
+        convexity: 0.45,
+        light_angle: LIGHT_UPPER_LEFT,
+        fresnel: 1.0,
+        edge_width: 3.5,
+    };
+}
+
 /// A translucent, blurred "glass" rectangle sampled from the frame backdrop.
 ///
 /// Glass quads are recorded in order with the rest of the draw list but are
@@ -187,7 +273,9 @@ impl ImageQuad {
 /// physical pixels.
 ///
 /// The default values approximate frosted glass: a translucent white tint,
-/// boosted saturation, a visible specular sheen and moderate frost.
+/// boosted saturation, a visible specular sheen and moderate frost, with no
+/// refraction ([`GlassOptics::FLAT`]). Use [`GlassQuad::liquid`] or set
+/// [`Self::optics`] to [`GlassOptics::LIQUID`] for a refracting lens.
 ///
 /// # Examples
 ///
@@ -222,23 +310,21 @@ pub struct GlassQuad {
     /// Border thickness in physical pixels; values at or below roughly
     /// `0.001` disable the border.
     pub border_width: f32,
-    /// Multiplier applied to backdrop saturation: `0.0` is grayscale, `1.0`
-    /// preserves the backdrop color, and values above `1.0` boost it until
-    /// channels clip. The default is `1.35`.
+    /// Multiplier applied to the backdrop's perceptual chroma (OKLab): `0.0` is grayscale, `1.0`
+    /// preserves the backdrop color, and values above `1.0` boost it with lightness-preserving gamut
+    /// compression instead of channel clipping. The default is `1.35`.
     pub saturation: f32,
-    /// Strength of the reflection band and, when [`Self::conic_strength`] is
-    /// zero, the opposing-corner bevel highlights. `0.0` disables them. The
-    /// default is `0.90`.
+    /// Strength of the reflection band and of the bevel catchlights. `0.0` disables them. The default
+    /// is `0.90`.
     pub specular: f32,
-    /// Mix between the sharp and blurred backdrop: `0.0` shows the sharp
-    /// copy and `1.0` the blurred one. Frost is reduced near the beveled
-    /// rim. Values below `0.30` also request an extra sharp-backdrop
-    /// snapshot for effects that distort the backdrop. The default is `0.45`.
+    /// Mix between the sharp and blurred backdrop in the flat body of the glass: `0.0` shows the sharp
+    /// copy and `1.0` the blurred one. Frost falls to 15% across the beveled rim so refracted detail
+    /// stays crisp there. Values below `0.30` also request an extra sharp-backdrop snapshot. The
+    /// default is `0.45`.
     pub frost: f32,
-    /// Amplitude of a smooth organic distortion applied to backdrop
-    /// sampling, in physical pixels before scaling. `0.0` (the default)
-    /// disables it; any value above `0.001` requests an extra sharp-backdrop
-    /// snapshot.
+    /// Amplitude of a smooth organic distortion applied to backdrop sampling, in logical pixels.
+    /// `0.0` (the default) disables it; any value above `0.001` requests an extra sharp-backdrop
+    /// snapshot. Values above `2.0` are clamped by the shader.
     pub liquid_ripple: f32,
     /// Angle in radians used to orient the conic rim arc. It only has an
     /// effect when [`Self::conic_strength`] is above `0.001`. The default is
@@ -248,10 +334,14 @@ pub struct GlassQuad {
     /// the band across the surface and only has an effect when
     /// [`Self::conic_strength`] is above `0.001`. The default is `0.0`.
     pub sheen_progress: f32,
-    /// Strength of the conic sheen and rim effect. At `0.0` (the default)
-    /// the regular specular bevel is used instead; any value above `0.001`
-    /// also requests an extra sharp-backdrop snapshot.
+    /// Strength of the conic sheen and rim effect in `0.0..=1.0`. It cross-fades with the regular
+    /// bevel catchlights: at `0.0` (the default) only the catchlights are used, at `1.0` only the
+    /// conic sheen. Any value above `0.001` also requests an extra sharp-backdrop snapshot.
     pub conic_strength: f32,
+    /// Lens optics: refraction depth, bevel, IOR, dispersion and light direction. The default is
+    /// [`GlassOptics::FLAT`]. A [`GlassOptics::thickness`] above `0.001` requests an extra
+    /// sharp-backdrop snapshot.
+    pub optics: GlassOptics,
 }
 
 impl Default for GlassQuad {
@@ -269,7 +359,67 @@ impl Default for GlassQuad {
             rim_angle: -1.309,
             sheen_progress: 0.0,
             conic_strength: 0.0,
+            optics: GlassOptics::FLAT,
         }
+    }
+}
+
+impl GlassQuad {
+    /// A Liquid Glass preset: a refracting, dispersing lens with little frost, a slow ripple and a
+    /// strong catchlight. Set [`Self::rect`] and [`Self::radii`] with struct update syntax.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cadmium::core::{CornerRadii, Rect};
+    /// use cadmium::renderer::GlassQuad;
+    ///
+    /// let card = GlassQuad {
+    ///     rect: Rect::new(0.0, 0.0, 320.0, 200.0),
+    ///     radii: CornerRadii::all(32.0),
+    ///     ..GlassQuad::liquid()
+    /// };
+    /// assert!(card.optics.thickness > 0.0);
+    /// ```
+    pub fn liquid() -> Self {
+        Self {
+            frost: 0.12,
+            liquid_ripple: 0.25,
+            specular: 0.95,
+            optics: GlassOptics::LIQUID,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this quad needs the extra full-resolution backdrop snapshot: low frost, ripple, the
+    /// conic effect, or any refraction all sample a backdrop that must stay sharp.
+    pub(crate) fn needs_sharp_backdrop(&self) -> bool {
+        self.frost < 0.30
+            || self.liquid_ripple > 0.001
+            || self.conic_strength > 0.001
+            || self.optics.thickness > 0.001
+    }
+
+    /// Packs [`Self::optics`] into the two `vec4` slots of [`RawGlassInstance`]:
+    /// `glass_lens = (ior, bevel_width, thickness, dispersion)` and
+    /// `glass_light = (light_angle, fresnel, convexity, edge_width)`. Pixel quantities stay logical;
+    /// the shader multiplies them by the frame scale.
+    pub(crate) fn pack_optics(&self) -> ([f32; 4], [f32; 4]) {
+        let o = &self.optics;
+        (
+            [
+                o.ior.max(1.0),
+                o.bevel_width.max(1.0),
+                o.thickness.max(0.0),
+                o.dispersion.clamp(0.0, 0.5),
+            ],
+            [
+                o.light_angle,
+                o.fresnel.max(0.0),
+                o.convexity.clamp(0.0, 1.0),
+                o.edge_width.max(0.25),
+            ],
+        )
     }
 }
 

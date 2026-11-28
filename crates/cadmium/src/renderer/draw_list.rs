@@ -156,8 +156,8 @@ impl DrawList {
     /// dropped. Every glass quad is drawn in its own batch so that it sees
     /// the backdrop produced by earlier batches.
     ///
-    /// Effects such as [`GlassQuad::liquid_ripple`],
-    /// [`GlassQuad::conic_strength`] above `0.001`, or
+    /// Effects such as [`GlassQuad::liquid_ripple`], refraction through
+    /// [`GlassQuad::optics`], [`GlassQuad::conic_strength`] above `0.001`, or
     /// [`GlassQuad::frost`] below `0.30` cause the renderer to allocate an
     /// extra sharp-backdrop snapshot for accurate distortion.
     pub fn push_glass(&mut self, mut glass: GlassQuad) {
@@ -181,9 +181,7 @@ impl DrawList {
                 return;
             }
         }
-        if glass.liquid_ripple > 0.001 || glass.conic_strength > 0.001 || glass.frost < 0.30 {
-            self.has_liquid_glass = true;
-        }
+        self.has_liquid_glass |= glass.needs_sharp_backdrop();
         let idx = self.glass_instances.len() as u32;
         self.glass_instances.push(RawGlassInstance::from(glass));
         self.batches.push(DrawBatch::Glass(idx));
